@@ -187,7 +187,7 @@ These are promises to users, whatever the wire looks like.
 How a drop is noticed:
 
 - **Clean drops** (the bridge process or the tunnel closes the socket) are seen at once.
-- **Silent drops** (laptop sleeps, Wi-Fi changes, a NAT forgets the connection) send no signal. TCP can look open for minutes. Keepalive pings catch these within about 45 s (`docs/wire.md` 4.2).
+- **Silent drops** (laptop sleeps, Wi-Fi changes, a NAT forgets the connection) send no signal, and server writes keep succeeding. So the bridge sends a heartbeat (an ack of what it has received) every 10 s. No heartbeat for 25 s → detached. The server also stops sending once too much is unacked (`docs/wire.md` 4.2).
 - Either way, the server only marks the link **detached**. It does not touch the agent.
 
 While detached:

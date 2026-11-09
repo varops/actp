@@ -63,19 +63,31 @@ Every frame is an object with a type field `t`:
 
 Unknown fields and unknown `t` values are ignored.
 
-### 4.1 Sequencing
+### 4.1 Sequencing and acks
 
 - Each side numbers its own `msg` frames from 1, increasing by 1, across sockets for the life of the link.
 - `ack` = highest `seq` received from the other side and processed. `0` = none.
+- Acks are **cumulative**: `ack: 120` confirms messages 1 to 120. So the bridge does not need one reply per message. It acks within 1 s of receiving, or after every 50 messages, whichever comes first.
 - Each side keeps sent messages until acked and resends unacked ones after a resume.
 - A `seq` already processed is dropped. A gap is an error (`sequence_gap`): the socket closes, the link survives, the bridge resumes.
-- Ack within 1 s of receiving, and at least every 50 messages.
 
-### 4.2 Keepalive
+### 4.2 Liveness
 
-A clean close is seen at once. A silent drop (sleep, Wi-Fi change, NAT timeout) is not: TCP can look open for minutes. So each side sends `ping` after 15 s without sending anything and answers `ping` with `pong`. Nothing received for 45 s → treat the socket as dropped. The 15 s ping also keeps Cloudflare (100 s idle limit) and most proxies from closing quiet sockets.
+A TCP write succeeds as soon as the data reaches the sender's own buffer, and behind a tunnel the server's socket goes to a local `cloudflared` that is always alive. So the server never trusts its own writes. It only trusts what comes back from the bridge.
 
-A dropped socket only detaches the link. The agent is not touched (`docs/design.md` 3.1).
+- **Bridge heartbeat.** The bridge sends something at least every 10 s: a `msg`, an `ack`, or a `ping`. When it has nothing else to say, it sends an `ack` with its current position, which is both a heartbeat and a confirmation.
+- **Server rule.** Nothing received from the bridge for 25 s (two missed heartbeats plus margin) → the link is **detached**. The server closes the socket.
+- **Send window.** The server stops writing to the socket when it has more than 1,000 messages or 4 MB unacked. It keeps buffering. Writing resumes as acks arrive. This stops the server from pushing into a dead connection, and it also slows a fast agent down to the speed of a slow client without losing anything.
+- **The other direction.** The server answers `ping` with `pong` and sends its own `ping` after 10 s of silence, so the bridge can spot a dead server the same way (nothing for 25 s → reconnect).
+- 10 s heartbeats also keep Cloudflare (100 s idle limit) and most proxies from closing quiet sockets.
+
+A detached link only stops sending. The agent is not touched (`docs/design.md` 3.1).
+
+### 4.3 What the server keeps
+
+- Every message the bridge has not acked, in order: in memory up to 8 MB, then on disk up to `spool_limit`.
+- The bridge's last ack. On resume, the bridge sends `Actp-Last-Seq`; the server replays everything after it, then continues live (section 5).
+- Acked messages are dropped. The bridge already has them.
 
 ## 5. Resume
 
