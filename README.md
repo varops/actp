@@ -25,6 +25,8 @@ What you get:
 - **Authentication** – tokens, scoped per client to agents and workspaces.
 - **Safe defaults** – files, terminals and processes stay on the agent's machine, inside allowed workspaces.
 
+v1 is built for chat-style clients: apps, bots and assistants that talk to an agent and show what it does. The files live on the agent's machine, so clients that edit files themselves (IDEs) are out of scope for now.
+
 ACTP is a tool, not a new standard. Its promises are the CLI, the config file, a small management API and its behaviour. The wire between bridge and server is internal, so it can follow ACP's own web transport as that matures.
 
 ## Why

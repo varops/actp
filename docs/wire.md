@@ -1,6 +1,6 @@
 # actp wire format (internal)
 
-Status: draft 2 (2026-11-09)
+Status: draft 3 (2026-11-09)
 
 > **Internal and subject to change.** This is how the `actp` bridge and server talk to each other today. It is not a public protocol. Users and apps depend on the public API in `docs/design.md` (CLI, config, management endpoints, and plain ACP on both ends), never on this. We will change or replace this format when there is a good reason, for example to adopt the official ACP web transport once it is stable.
 
@@ -26,12 +26,12 @@ The bridge sends a WebSocket upgrade to `GET /actp/v1/agents/{agentId}/link`:
 | Header | When | Meaning |
 | --- | --- | --- |
 | `Sec-WebSocket-Protocol` | always | Wire versions offered, for example `actp.v1`. |
-| `Authorization` | always* | `Bearer <token>` (*not needed on loopback if the server allows it). |
+| `Authorization` | always | `Bearer <token>`. No exception for local connections. |
 | `Actp-Client-Name` | optional | Name for logs and the tray, for example `bot-vps`. |
 | `Actp-Link-Id` | resume | The link to resume. |
 | `Actp-Last-Seq` | resume | Highest server `seq` the bridge has processed. |
 
-New link: the server starts an agent process and answers `101` with `Actp-Link-Id` (random, at least 128 bits, a secret bound to the token) and `Actp-Idle-Timeout` (seconds). The first message on a new link is ACP `initialize`.
+New link: the server starts an agent process and answers `101` with `Actp-Link-Id` (random, at least 128 bits, a secret bound to the token) and `Actp-Prompt-Timeout` (seconds). The first message on a new link is ACP `initialize`.
 
 Upgrade failures:
 
@@ -54,7 +54,7 @@ Every frame is an object with a type field `t`:
 | `msg` | `seq`, `ack`, `msg` | One ACP JSON-RPC message, unchanged. |
 | `ack` | `ack` | Acknowledgement without a message. |
 | `ping` / `pong` | – | Keepalive. |
-| `close` | `reason` | The sender ends the link on purpose. The server settles the agent at once. |
+| `bye` | – | Bridge → server: my client has left. The link becomes unattended (`docs/design.md` 3.1). The bridge then closes the socket. |
 | `error` | `code`, `message`, `data` | Link-level failure, then the socket closes. |
 
 ```json
@@ -106,7 +106,7 @@ If the link is attached to another socket, the server closes the old one with co
 | `sequence_gap` | Link survives. |
 | `protocol_error` | Malformed frame. Link survives. |
 
-WebSocket close codes: `1000` after `close`, `4001` replaced by a newer socket, `4002` link ended, `4003` protocol error (link survives).
+WebSocket close codes: `1000` after `bye`, `4001` replaced by a newer socket, `4002` link ended, `4003` protocol error (link survives).
 
 ## 7. Limits
 

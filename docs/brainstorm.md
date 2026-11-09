@@ -232,6 +232,15 @@ agents = ["claude", "codex"]
 8. **License** – open source from day one.
 9. **Later** – server-to-server session sync, and client-side load balancing across servers.
 
+## Decisions (round 7, after a design review)
+
+- **v1 is for chat-style clients.** The files live with the agent. IDE-style clients are out of scope for now.
+- **A token is always required.** No trust for local connections: a tunnel makes all traffic look local.
+- **Three link states:** attached, detached (may come back), unattended (client left). Unattended prompts are cancelled at once; unattended turns are capped at 1 h; `on_client_exit: cancel` is available.
+- **Two timers instead of one:** `idle_close` 10 min when nothing is running, `prompt_timeout` 24 h for an unanswered prompt.
+- **No silent folder fallback** unless turned on per token.
+- **M0 spike** before building.
+
 ## Decisions (round 6)
 
 - **Client quits → detach, not stop.** The agent finishes its turn, then the session is closed cleanly. The client gets it back with `session/load`. Explicit `session/cancel` or `session/close` still stop work.

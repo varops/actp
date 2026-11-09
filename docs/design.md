@@ -1,6 +1,6 @@
 # actp design
 
-Status: draft 3 (2026-11-09)
+Status: draft 4 (2026-11-09)
 
 `actp` (Agent Client Transport Protocol) is a tool that runs ACP agents on one machine and lets ACP clients use them from another. It is ACP over HTTP, packaged as one Go binary.
 
@@ -25,6 +25,19 @@ ACTP is a **tool, not a protocol standard**. Its promises are its public API (se
 ```
 
 Both ends are plain ACP. No client and no agent needs to know actp exists.
+
+### 1.1 Scope of v1: chat-style clients
+
+actp moves the agent to another machine, and **the files move with it**. The agent reads, edits and runs code on the agent host. v1 is built for clients that talk to an agent and show what it does: chat apps, bots, assistants, automations.
+
+Clients that also work on the files themselves (an IDE showing its own file tree, diffs or git status) will see their local disk, not the one the agent works on. Known limits for those clients in v1:
+
+- File paths in tool calls and diffs are paths on the agent host. The client cannot open them locally.
+- File links in prompts (`resource_link` with a client path) do not resolve on the agent host. Embedded content (text, images sent inline) works.
+- Client features that read the agent's local files, such as session history folders, see nothing.
+- "Log in through a terminal" flows offered by an agent would run on the client machine. Logins must be done on the agent host.
+
+Making IDE-style clients work (shared checkouts, path mapping, file access through the link) is out of scope for v1.
 
 ## 2. Public API
 
@@ -99,7 +112,8 @@ version: 1
 server:
   name: workstation
   listen: 127.0.0.1:7860
-  idle_timeout: 24h               # how long a detached, idle agent is kept (section 3.1)
+  idle_close: 10m                 # close a detached link with nothing running (section 3.1)
+  prompt_timeout: 24h             # how long an unanswered prompt waits for a dropped client
   spool_limit: 1GB                # disk space for output kept while detached
   log_dir: ~/.actp/logs
 
@@ -114,9 +128,11 @@ server:
 
   agents:
     - id: claude
-      preset: claude-code         # fills in command and quirks (section 3.6)
+      preset: claude-code         # fills in command and quirks (section 3.8)
       permissions: forward        # forward | auto_allow | auto_deny
-      max_links: 4
+      max_links: 16
+      on_client_exit: finish      # finish | cancel (section 3.1)
+      max_unattended: 1h          # longest a turn may run after its client left
     - id: codex
       preset: codex
     - id: my-agent
@@ -132,6 +148,7 @@ server:
       agents: [claude, codex]     # "*" for all
       workspaces: [website]       # "*" for all
       default_workspace: website
+      cwd_fallback: false         # true: unknown folders silently use default_workspace
       mcp_servers: remote         # none | remote | all
       max_links: 8
       map:
@@ -151,7 +168,7 @@ Served by `actp serve`, JSON, versioned by path.
 | Endpoint | Auth | Returns |
 | --- | --- | --- |
 | `GET /health` | no | `{"ok": true}` |
-| `GET /api/v1/info` | no | `name`, actp `version`, supported wire versions, `idleTimeoutSeconds` |
+| `GET /api/v1/info` | token | `name`, actp `version`, supported wire versions, `promptTimeoutSeconds` |
 | `GET /api/v1/agents` | token | Agents this token may use |
 
 `/api/v1/agents` example:
@@ -173,7 +190,7 @@ Served by `actp serve`, JSON, versioned by path.
 
 `status` is `ready`, `auth_required` (with `authHint` from the agent's `authMethods[].description`, for example "Run `claude /login` on the agent host"), or `unavailable` (with `error`).
 
-Auth everywhere: `Authorization: Bearer <token>`. Fields can be added at any time; clients ignore unknown fields.
+Auth: `Authorization: Bearer <token>` on everything except `/health`. There is no exception for local connections: a tunnel or reverse proxy on the same machine makes all internet traffic look local. Fields can be added at any time; clients ignore unknown fields.
 
 ## 3. Behaviour
 
@@ -194,28 +211,44 @@ While detached:
 - The agent keeps running. Its output is kept in memory and spilled to disk (`spool_limit`, default 1 GB), so long turns do not lose anything.
 - A turn that does not need the client runs to the end, as normal.
 - A turn that asks the client something (permission prompt, question) waits for the answer, as it would for a slow human.
-- The bridge keeps trying to reconnect (backoff 0.5 s up to 30 s, with jitter) for as long as its own client is running.
-- A session has exactly one client. A new connection for the same link replaces the old one. When it gets through, it catches up on everything it missed, including open prompts. The client sees a slow agent, nothing more.
+- The bridge keeps trying to reconnect (backoff 0.5 s up to 30 s, with jitter). When it gets through, it catches up on everything it missed, including open prompts. The client sees a slow agent, nothing more.
+- A session has exactly one client. A new connection for the same link replaces the old one.
+- If the bridge cannot reach the server for 10 minutes of awake time (sleep does not count), it stops trying: it answers its client's open requests with `-32000 remote session lost: server unreachable`, prints the reason to stderr and exits 1. The client is not left with an endless spinner. Work on the server is not lost; see "Getting a session back".
 
-When the server finally lets go:
+A link is in one of three states:
 
-- Only when the link has been detached **and idle** for `idle_timeout` (default 24 h). Idle means no turn running, or a turn waiting on the client.
-- Then the server closes the link (3.2). An agent waiting on a permission prompt gets `cancelled`; that is the only time a drop leads to anything being cancelled, and only after a day with nobody there.
-- The server also ends a link if the spool is full, the agent exits, or an admin ends it.
+| State | Meaning | What the server does |
+| --- | --- | --- |
+| **Attached** | Bridge connected. | Normal. |
+| **Detached** | Connection dropped. The bridge may come back. | Agent keeps running. Output is kept. Prompts wait. |
+| **Unattended** | The client has left. Nobody will come back to this link. | Agent finishes its turn. Output is dropped. Prompts are cancelled. Then the link closes. |
+
+When a detached link is closed:
+
+- **Nothing running and nothing waiting** for `idle_close` (default 10 min) → the server closes the link (3.2). Nothing is lost: the session is in the agent's own store and the client can load it again. Closing early matters, because every open link holds an agent process and counts against `max_links`.
+- **A turn waiting on the client** (permission prompt, question) for `prompt_timeout` (default 24 h) → the prompt gets `cancelled` and the link closes.
+- **A turn running** → never closed for being detached.
+- Also when the spool is full, the agent exits, or an admin ends it.
 
 When the client quits:
 
-A client closes the bridge's stdin both when the user stops an agent and when the app just quits, restarts or updates. actp cannot tell these apart, so it never treats a closed stdin as "stop".
+A client closes the bridge's stdin both when the user stops an agent and when the app quits, restarts or updates. Many clients also just kill the process. actp cannot tell these apart.
 
-- The bridge tells the server the client left, then exits. The server detaches the link, as for a drop.
-- The agent finishes its turn. Then, once the link is idle (no turn running, nothing waiting on the client), the server closes the sessions and stops the agent (3.2). Nothing is cancelled, because nothing is running. The work is saved in the agent's own session store.
-- A request waiting on the client (permission prompt, question) waits until `idle_timeout`, then gets `cancelled`.
-- When the client starts again, it opens a new link and uses ACP `session/load` (or `session/resume`) to get the session back, including what the agent did while it was away.
-- If it asks for a session that is still running on its old, detached link, the server answers `-32000` with `session still running on the agent host`, and the client can retry later. One client per session, always.
+- On a closed stdin or a termination signal, the bridge tells the server the client left, then exits. The link becomes **unattended**.
+- By default (`on_client_exit: finish`) the agent finishes its turn. With `on_client_exit: cancel`, the server cancels the turn at once, for users who expect "close" to mean "stop".
+- A prompt for the client (permission, question) is answered `cancelled` at once, now and for the rest of the turn. Nobody is there to answer, and waiting would lock the session.
+- A turn may run unattended for at most `max_unattended` (default 1 h). Then the server cancels it. An agent nobody is watching does not run forever.
+- When the turn ends, the server closes the sessions and stops the agent (3.2). The work is saved in the agent's own session store.
+- The tray lists unattended links with an "End" button.
+- If the bridge is killed hard and cannot say goodbye, the link is only detached. The rules above for detached links then apply, and "Getting a session back" covers the rest.
 
-To really stop work, the client sends ACP `session/cancel` (stops the turn) or `session/close` (ends the session). These pass through as usual.
+To stop work for certain, the client sends ACP `session/cancel` (stops the turn) or `session/close` (ends the session) before it goes. These pass through as usual.
 
-- If a link is gone when the bridge reconnects, the bridge answers every request its client is waiting on with JSON-RPC error `-32000` and a message starting with `remote session lost:`, prints the reason to stderr, and exits 1. Clients that support ACP `session/load` can start a new agent and reload.
+Getting a session back:
+
+- The client opens a new link and uses ACP `session/load` (or `session/resume`). It gets the session including what the agent did while it was away. This needs an agent that supports loading sessions; all presets do.
+- If that session is still live on an older link of the same token, the server marks the old link unattended (the client has clearly moved on), which cancels any waiting prompt. Until the old turn has ended, the new request gets `-32000` with `session still running on the agent host`, and the client retries.
+- If a link is gone when a bridge reconnects, the bridge answers every request its client is waiting on with `-32000` and a message starting with `remote session lost:`, prints the reason to stderr, and exits 1.
 
 ### 3.2 Ending a link cleanly
 
@@ -247,20 +280,26 @@ The server reads the ACP traffic and changes only these things.
 1. `actp://<workspace>/<sub/path>` → that workspace's path plus the sub path (which may not leave the workspace).
 2. An absolute path inside a workspace the token may use → unchanged.
 3. The token's `map` table → mapped.
-4. The token's `default_workspace` → used.
+4. Only if the token has `cwd_fallback: true`: the token's `default_workspace`. Off by default, because a silent fallback can send two different client projects into the same folder.
 5. Otherwise → JSON-RPC `invalidParams` with `cwd not allowed: <path>`.
 
 Paths are cleaned and symlinks resolved before the check. Responses carry the client's original `cwd` back.
 
-**MCP servers.** A `stdio` entry in `mcpServers` would run a command on the server machine. Per token: `none`, `remote` (default: keep `http` and `sse`, drop `stdio`), or `all`. Dropped entries are logged.
+**MCP servers.** A `stdio` entry in `mcpServers` would run a command on the server machine. Per token: `none`, `remote` (default: keep `http` and `sse`, drop `stdio`), or `all`. Entries whose URL points at `localhost` or a loopback address are dropped as well: they meant the client's machine, not the agent host. Dropped entries are logged.
 
-**Permissions.** Per agent, overridable per token: `forward` (default), `auto_allow` (first `allow_once` option, else forward), `auto_deny` (first `reject_once`, else `cancelled`). Forwarded requests never time out; only the idle timeout ends them (3.1).
+**Permissions.** Per agent, overridable per token: `forward` (default), `auto_allow` (first `allow_once` option, else forward), `auto_deny` (first `reject_once`, else `cancelled`). Forwarded requests never time out while a client is attached; `prompt_timeout` and the unattended rules end them (3.1).
+
+**Login hints.** In the `initialize` response, the server removes terminal-login metadata from `authMethods` (for example `_meta.terminal-auth`), because the client would run that login on its own machine. Descriptions stay, so the user still sees what to do on the agent host.
+
+**Requests the server sends itself** (for example `session/close` when a link ends) use ids in their own namespace (`actp-1`, `actp-2`, ...), so they cannot clash with the client's ids. Their replies are not forwarded.
 
 Everything else passes through untouched: ids, unknown methods and fields, extension methods (`elicitation/create`, `_x.ai/*`), and request cancellation in both directions. Message order is kept.
 
 ### 3.4 Probing
 
 At start and on demand (`actp doctor`, tray), the server runs `initialize` without a session against each agent, with a 10 s timeout, then stops it. The result feeds `/api/v1/agents`. An "authentication required" error (code -32000 or matching message) sets `auth_required` with the agent's own hint.
+
+The probe is only a first guess. Most agents pass `initialize` and report a missing login on the first `session/new` or `session/prompt`. So the server also watches real traffic: an authentication error on a link sets `auth_required`, and a successful session sets `ready`.
 
 ### 3.5 Limits
 
@@ -282,7 +321,15 @@ Clients can already offer both on ACP v1, on their own side, with plain ACP call
 
 Both work through actp unchanged: actp keeps message order on a link, and each link has one client, so nothing can slip in between the cancel and the new prompt. actp does not need its own queue.
 
-### 3.7 Agent presets and quirks
+### 3.7 Knowing when a turn is running
+
+The rules in 3.1 need to know whether a session has a turn running. The server works this out from the traffic, and how depends on the ACP version agreed in `initialize`:
+
+- **ACP v1:** a turn runs from a `session/prompt` request until its response.
+- **ACP v2 (draft):** the prompt response only confirms the message was accepted. The server follows the session status updates instead.
+- **Unknown version:** the server assumes a turn is running whenever it has seen agent output in the last few minutes, and never cancels on a guess.
+
+### 3.8 Agent presets and quirks
 
 Each agent runs as a child process with its own login on the server machine. `preset` in the config fills in the command and known quirks. The list of presets and everything known about how real agents behave over ACP lives in `docs/agents.md`, so it can grow on its own.
 
@@ -291,10 +338,13 @@ Each agent runs as a child process with its own login on the server machine. `pr
 - One agent process per link.
 - Keep the last 8 KB of each agent's stderr for error messages.
 - Tokens: `actp_` + 32 random bytes in base32, stored as SHA-256 hashes, compared in constant time, shown once.
-- Audit log (JSON lines): link opened, resumed, ended (with reason), session created, permission answered (by client or policy), cwd rejected. Prompts only with `audit.log_prompts = true`.
-- Plain HTTP on loopback by default. A non-loopback `listen` needs `tls_cert` and `tls_key`, or `insecure_listen = true` behind a TLS proxy.
+- Audit log (JSON lines): link opened, resumed, ended (with reason), session created, permission answered (by client or policy), cwd rejected. Prompts only with `audit.log_prompts: true`.
+- **Environment.** Desktop apps and system services start with a minimal PATH, so agent commands are often not found. At start the server reads the user's login-shell environment (as editors do) and uses it for agents. `actp doctor` shows the PATH agents will get.
+- **Process groups.** Each agent runs in its own process group (Windows: job object), so stopping it stops its children. The server records agent process ids, and on start it stops any left over from a crash.
+- **Spool files** hold agent output, which can include code and secrets. They are readable only by the server's user, deleted when the link ends, and purged at start.
+- Plain HTTP on loopback by default. A non-loopback `listen` needs `tls_cert` and `tls_key`, or `insecure_listen: true` behind a TLS proxy.
 - Config reload on `SIGHUP` or from the tray. New links use the new config.
-- **Restart and upgrade.** Agents are child processes of `actp serve`, so stopping the server stops them. `actp serve` refuses to stop or restart while any turn is running, unless `--force` is given. It waits for running turns when asked to stop gracefully. After a restart, clients get `remote session lost` and reload with ACP `session/load`.
+- **Restart and upgrade.** Agents are child processes of `actp serve`, so stopping the server stops them. A restart that actp starts itself (tray menu, upgrade) is refused while any turn is running, unless forced. On a stop signal from the system, the server waits up to 30 s for turns, then settles the links (3.2). After a restart, clients get `remote session lost` and reload with ACP `session/load`.
 
 ## 5. Tray
 
@@ -304,21 +354,23 @@ One app with a server section and a remotes section.
 - **Remotes:** saved remotes with status dots; "Add remote…" (URL and token, stored in the OS keychain); "Copy bridge command" for each agent.
 - **Shared:** open config, open logs, start at login, quit.
 
-`fyne.io/systray` for the menu. Input dialogs are small pages on loopback with a one-time token, so there is no native GUI toolkit to maintain.
+`fyne.io/systray` for the menu. The tray needs native code on macOS, so desktop builds are made per platform, and the tray sits behind a build tag: server and CI builds stay pure Go. On Linux desktops without a tray area (stock GNOME), `actp tray` opens the same local page instead. Input dialogs are small pages on loopback with a one-time token, so there is no native GUI toolkit to maintain.
 
 ### 5.1 Cloudflare tunnel
 
 - `cloudflared` runs as a child process pointed at `listen`.
 - `quick`: `cloudflared tunnel --url http://<listen>`. URL read from its output. Changes on restart. No account needed.
 - `named`: `cloudflared tunnel run --token <token>`. Stable hostname, needs a Cloudflare account.
-- Found on PATH or in `~/.actp/bin`. If missing, the tray offers to download the official release and checks its SHA-256.
+- Found on PATH or in `~/.actp/bin`. If missing, the tray offers to download one fixed `cloudflared` version. Its SHA-256 is built into the actp release, not fetched with the download.
 - Restarted with backoff if it exits.
 
 ## 6. Security
 
 - Agents run with the rights of the server's OS user. A token for an agent lets its holder make that agent do anything that user can. Workspaces set the starting point, not a sandbox.
 - **v1 is for trusted clients only.** All tokens share the same OS user, the same agent logins, and the same files outside the workspaces. Give tokens only to clients you would give a shell on that machine. The docs and the tray's "Add client" dialog say this plainly.
+- A token is always required. There is no "local connections are trusted" rule, because tunnels and proxies make remote traffic look local.
 - TLS off loopback. Tokens hashed at rest, shown once, never on a command line.
+- The tray's local pages check the `Host` header and a one-time token, so other websites cannot drive them.
 - File, terminal and `stdio` MCP rewrites stop clients from using ACP itself as a remote shell. They do not limit the agent.
 - Link ids are secrets tied to a token. Resume checks both.
 
@@ -330,6 +382,8 @@ One app with a server section and a remotes section.
 - **Server-to-server session sync**, so `session/load` works on another server.
 - **Live reattach after a client restart**, so a returning client takes over a session that is still running instead of waiting for it to finish.
 - **Agent host process** separate from `actp serve`, so agents survive a server upgrade.
+- **IDE-style clients** (1.1): path mapping, file access through the link, client-side MCP servers reachable from the agent.
+- **Seamless recovery in the bridge**: when a link was closed while the client slept, reopen and reload the session without the client noticing.
 - **Stable public address.** Quick tunnels change URL on every restart; named tunnels need a Cloudflare account. A hosted relay with stable names could fix this.
 - **Per-client isolation**: a separate OS user or container per token, for shared family or business setups.
 - **Per-client limits** beyond agents and workspaces: forced modes, allowed models, spending caps.
@@ -358,15 +412,17 @@ Everything is `internal/` until a public Go API is worth promising.
 
 - **Scripted ACP agent** with scenarios `stream`, `permission`, `ask-user`, `cancel`, `resume`, `auth-required`, `needs-fs`, `crash`, `slow-start`, `late-commands`.
 - **End to end:** a stdio ACP test client → bridge → server → scripted agent, on Linux, macOS and Windows in CI. These tests check the public API and the behaviour in section 3, not the wire.
-- **Client quit tests:** client closes stdin mid-turn → turn finishes, session closes, `session/load` on a new link shows the finished turn. Load while still running → `session still running`.
-- **Disconnect tests:** drop during a permission request, resume, answer, turn completes. Drop during a long turn: the turn finishes while detached and the bridge receives all of it on resume. Link idle past `idle_timeout` → `remote session lost`.
+- **Client quit tests:** client closes stdin mid-turn → turn finishes, session closes, `session/load` on a new link shows the finished turn. Load while still running → `session still running`. Permission asked while unattended → cancelled at once. `on_client_exit: cancel` and `max_unattended` → turn cancelled. Bridge killed hard, then a new link loads the session → old link becomes unattended.
+- **Auth tests:** every endpoint except `/health` rejects a missing token, also from loopback.
+- **Disconnect tests:** drop during a permission request, resume, answer, turn completes. Drop during a long turn: the turn finishes while detached and the bridge receives all of it on resume. Detached with nothing running past `idle_close` → link closed, later `session/load` works. Prompt unanswered past `prompt_timeout` → cancelled.
 - **Mixed versions:** current bridge against previous server and the other way round.
 - **Real agents:** `claude-code-acp` and `codex-acp` smoke tests behind a build tag.
 
 ## 10. Milestones
 
+0. **M0 – Spike (about a day).** Check the riskiest assumptions with real agents before building: WebSockets and large messages through a quick tunnel; whether agents exit when stdin closes; whether `session/load` returns a turn that finished with nobody connected; what each agent does when a permission is cancelled.
 1. **M1 – Relay.** Server with tokens, workspaces and rewrites; bridge with the URL form; management endpoints. A stdio client can use a remote Claude Code.
-2. **M2 – Durable links.** Resume, disk spool, idle timeout, lost-session handling, disconnect tests.
+2. **M2 – Durable links.** Resume, disk spool, link states and timers (3.1), turn tracking (3.7), lost-session handling, disconnect and client-quit tests.
 3. **M3 – Polish the CLI.** Saved remotes, `actp doctor`, `actp agents`, mixed-version tests.
 4. **M4 – Tray and tunnel.** Tray, keychain, cloudflared.
 5. **M5 – Release.** Signed builds, installers, docs site.
