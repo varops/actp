@@ -1,6 +1,6 @@
-# ACTP
+# ACTP – Agent Client Transport Protocol
 
-**ACP over the network.** Run coding agents on one machine, use them from anywhere.
+**Agent Client Transport Protocol.** ACP over the network: run coding agents on one machine, use them from anywhere.
 
 > Status: early design. The spec is a draft and there is no code yet.
 

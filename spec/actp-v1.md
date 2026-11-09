@@ -1,8 +1,8 @@
-# ACTP v1 – ACP over the network
+# ACTP v1 – Agent Client Transport Protocol
 
 Status: draft 1 (2026-11-09)
 
-ACTP carries the Agent Client Protocol (ACP) between machines. It lets an ACP client use an ACP agent that runs on another host, with authentication, discovery, and connections that survive network drops.
+ACTP (Agent Client Transport Protocol) carries the Agent Client Protocol (ACP) between machines. It lets an ACP client use an ACP agent that runs on another host, with authentication, discovery, and connections that survive network drops.
 
 This document is the standard. It does not depend on any one implementation. The `actp` binary in this repository is the reference implementation; see `docs/implementation.md`.
 
