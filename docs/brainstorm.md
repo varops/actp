@@ -232,6 +232,12 @@ agents = ["claude", "codex"]
 8. **License** – open source from day one.
 9. **Later** – server-to-server session sync, and client-side load balancing across servers.
 
+## Decisions (round 5)
+
+- **A dropped connection never interrupts the agent.** The server only marks the link detached. The agent finishes its turn; output spills to disk. The bridge reconnects whenever it can. The 10-minute "grace period" is replaced by a 24-hour idle timeout that only counts while the agent is idle or waiting on the client.
+- **Queue and steer stay on the client.** They are built from plain ACP calls and work through actp unchanged.
+- **Agent knowledge** lives in `docs/agents.md` so it can grow as shared, public knowledge.
+
 ## Decisions (round 4)
 
 - **Config in YAML**, not TOML.

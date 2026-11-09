@@ -100,8 +100,8 @@ version: 1
 server:
   name: workstation
   listen: 127.0.0.1:7860
-  grace_period: 10m
-  replay_buffer: 8MB
+  idle_timeout: 24h               # how long a detached, idle agent is kept (section 3.1)
+  spool_limit: 1GB                # disk space for output kept while detached
   log_dir: ~/.actp/logs
 
   tunnel:
@@ -152,7 +152,7 @@ Served by `actp serve`, JSON, versioned by path.
 | Endpoint | Auth | Returns |
 | --- | --- | --- |
 | `GET /health` | no | `{"ok": true}` |
-| `GET /api/v1/info` | no | `name`, actp `version`, supported wire versions, `gracePeriodSeconds` |
+| `GET /api/v1/info` | no | `name`, actp `version`, supported wire versions, `idleTimeoutSeconds` |
 | `GET /api/v1/agents` | token | Agents this token may use |
 
 `/api/v1/agents` example:
@@ -182,12 +182,31 @@ These are promises to users, whatever the wire looks like.
 
 ### 3.1 Dropped connections
 
-- A network drop does not end the agent's work. The agent keeps running on the server and its output is kept.
-- The bridge reconnects in the background (backoff 0.5 s up to 15 s, with jitter) and catches up. The client sees a slow agent, nothing more.
-- Requests from the agent to the client (permission prompts, questions) stay open while the bridge is away. The agent waits, as it would for a slow human.
-- This lasts for the **grace period**: how long the server keeps the agent running after it loses contact with the bridge (default 10 min). It covers a laptop lid closing, Wi-Fi switching, or a tunnel restarting. If the bridge comes back in time, nothing is lost. If not, the server ends the link (3.2), so no agent waits forever for a client that is gone.
-- If the session is lost, the bridge answers every request the client is waiting on with JSON-RPC error `-32000` and a message starting with `remote session lost:`, prints the reason to stderr, and exits 1. Clients that support ACP `session/load` can start a new agent and reload.
-- When the client closes the bridge's stdin, the bridge ends the link at once. No grace period.
+**Rule: a dropped connection never interrupts the agent.** The server does not cancel a turn because the bridge went away. The agent finishes what it is doing, and the bridge reconnects when it can.
+
+How a drop is noticed:
+
+- **Clean drops** (the bridge process or the tunnel closes the socket) are seen at once.
+- **Silent drops** (laptop sleeps, Wi-Fi changes, a NAT forgets the connection) send no signal. TCP can look open for minutes. Keepalive pings catch these within about 45 s (`docs/wire.md` 4.2).
+- Either way, the server only marks the link **detached**. It does not touch the agent.
+
+While detached:
+
+- The agent keeps running. Its output is kept in memory and spilled to disk (`spool_limit`, default 1 GB), so long turns do not lose anything.
+- A turn that does not need the client runs to the end, as normal.
+- A turn that asks the client something (permission prompt, question) waits for the answer, as it would for a slow human.
+- The bridge keeps trying to reconnect (backoff 0.5 s up to 30 s, with jitter) for as long as its own client is running. When it gets through, it catches up on everything it missed, including open prompts. The client sees a slow agent, nothing more.
+
+When the server finally lets go:
+
+- Only when the link has been detached **and idle** for `idle_timeout` (default 24 h). Idle means no turn running, or a turn waiting on the client.
+- Then the server closes the link (3.2). An agent waiting on a permission prompt gets `cancelled`; that is the only time a drop leads to anything being cancelled, and only after a day with nobody there.
+- The server also ends a link if the spool is full, the agent exits, or an admin ends it.
+
+Ending on purpose:
+
+- When the client closes the bridge's stdin (it stopped the agent), the bridge ends the link at once. That is a deliberate stop, so a running turn is cancelled.
+- If a link is gone when the bridge reconnects, the bridge answers every request its client is waiting on with JSON-RPC error `-32000` and a message starting with `remote session lost:`, prints the reason to stderr, and exits 1. Clients that support ACP `session/load` can start a new agent and reload.
 
 ### 3.2 Ending a link cleanly
 
@@ -200,6 +219,8 @@ When the server ends a link with a live agent process, it settles the agent in t
 5. Stop the process: SIGTERM, 2 s, SIGKILL. On Windows, kill the process tree.
 
 Errors in steps 3 and 4 are ignored. The agent never waits forever.
+
+This runs only when a link ends (3.1): never just because a connection dropped.
 
 ### 3.3 Rewrites on the server
 
@@ -224,7 +245,7 @@ Paths are cleaned and symlinks resolved before the check. Responses carry the cl
 
 **MCP servers.** A `stdio` entry in `mcpServers` would run a command on the server machine. Per token: `none`, `remote` (default: keep `http` and `sse`, drop `stdio`), or `all`. Dropped entries are logged.
 
-**Permissions.** Per agent, overridable per token: `forward` (default), `auto_allow` (first `allow_once` option, else forward), `auto_deny` (first `reject_once`, else `cancelled`). Forwarded requests never time out; only the grace period ends them.
+**Permissions.** Per agent, overridable per token: `forward` (default), `auto_allow` (first `allow_once` option, else forward), `auto_deny` (first `reject_once`, else `cancelled`). Forwarded requests never time out; only the idle timeout ends them (3.1).
 
 Everything else passes through untouched: ids, unknown methods and fields, extension methods (`elicitation/create`, `_x.ai/*`), and request cancellation in both directions. Message order is kept.
 
@@ -245,30 +266,16 @@ actp does not queue or reorder prompts. A `session/prompt` sent while a turn is 
 
 Because actp passes prompts, cancellations and `$/cancel_request` through unchanged and in order, both styles work as soon as the agent supports them. When ACP adds explicit queue and steer options, they pass through too.
 
+Clients can already offer both on ACP v1, on their own side, with plain ACP calls:
+
+- **Queue** – hold the prompt and send it when the current `session/prompt` returns. Pause the queue if a turn fails or the user stops it.
+- **Steer** ("send now") – send `session/cancel`, wait for the running prompt to return with `stopReason: cancelled`, then send the new prompt as the very next message.
+
+Both work through actp unchanged: actp keeps message order on a link, and each link has one client, so nothing can slip in between the cancel and the new prompt. actp does not need its own queue.
+
 ### 3.7 Agent presets and quirks
 
-Each agent runs as a child process with its own login on the server machine. Presets fill in the command and known quirks so users do not have to.
-
-| Preset | Command | Notes |
-| --- | --- | --- |
-| `claude-code` | `claude-code-acp` | Zed's ACP adapter. Login with `claude /login`. |
-| `codex` | `codex-acp` | |
-| `gemini` | `gemini --acp` | `--experimental-acp` is deprecated. |
-| `opencode` | `opencode acp` | Modes and models also appear as duplicate config options. |
-| `droid` | `droid exec --output-format acp` | Needs `elicitation.form` from the client for its AskUser tool. |
-| `grok` | `grok agent stdio` | Sends many `_x.ai/*` notifications. |
-| `pi` | to be confirmed | |
-
-Quirks the server must handle, from experience driving these agents over ACP:
-
-- **Process folder.** Agents find their session store relative to the folder they run in. The server starts each agent in the link's default workspace, so `session/list` and `session/load` find the right sessions.
-- **Ambient keys.** An API key in the server's environment can override an agent's own login. `env_remove` drops such variables for one agent.
-- **Windows.** npm-installed agents are `.cmd` shims. Stopping the shim leaves the real agent running, so the server kills the whole process tree.
-- **Startup failures.** An agent that exits or hangs during `initialize` must not block the link. The server races `initialize` against process exit and a timeout, and reports the exit code and stderr tail.
-- **Errors.** Agents often wrap the real reason in `data.details` of a JSON-RPC "Internal error". actp forwards errors unchanged and uses `data.details` in its own messages and logs.
-- **Unknown requests from the agent.** They carry an id and the agent waits for the reply. If nobody can answer one (for example while settling a link), the server replies `methodNotFound` instead of dropping it.
-- **Request cancellation from the agent.** Some agents cancel an open question with `$/cancel_request` when a turn ends. This must reach the client so it can remove the prompt from its UI.
-- **Late answers.** A permission answer can race a cancel. The server ignores answers for requests it already settled.
+Each agent runs as a child process with its own login on the server machine. `preset` in the config fills in the command and known quirks. The list of presets and everything known about how real agents behave over ACP lives in `docs/agents.md`, so it can grow on its own.
 
 ## 4. Server internals
 
@@ -336,14 +343,14 @@ Everything is `internal/` until a public Go API is worth promising.
 
 - **Scripted ACP agent** with scenarios `stream`, `permission`, `ask-user`, `cancel`, `resume`, `auth-required`, `needs-fs`, `crash`, `slow-start`, `late-commands`.
 - **End to end:** a stdio ACP test client → bridge → server → scripted agent, on Linux, macOS and Windows in CI. These tests check the public API and the behaviour in section 3, not the wire.
-- **Disconnect tests:** drop during a permission request, resume, answer, turn completes. Drop longer than the grace period → `remote session lost`.
+- **Disconnect tests:** drop during a permission request, resume, answer, turn completes. Drop during a long turn: the turn finishes while detached and the bridge receives all of it on resume. Link idle past `idle_timeout` → `remote session lost`.
 - **Mixed versions:** current bridge against previous server and the other way round.
 - **Real agents:** `claude-code-acp` and `codex-acp` smoke tests behind a build tag.
 
 ## 10. Milestones
 
 1. **M1 – Relay.** Server with tokens, workspaces and rewrites; bridge with the URL form; management endpoints. A stdio client can use a remote Claude Code.
-2. **M2 – Durable links.** Resume, grace period, lost-session handling, disconnect tests.
+2. **M2 – Durable links.** Resume, disk spool, idle timeout, lost-session handling, disconnect tests.
 3. **M3 – Polish the CLI.** Saved remotes, `actp doctor`, `actp agents`, `--state-dir`, mixed-version tests.
 4. **M4 – Tray and tunnel.** Tray, keychain, cloudflared.
 5. **M5 – Release.** Signed builds, installers, docs site.
@@ -351,5 +358,5 @@ Everything is `internal/` until a public Go API is worth promising.
 ## 11. Open points
 
 1. **Pi** – which command starts Pi in ACP mode?
-2. **Default grace period** – 10 min.
+2. **Default idle timeout** – 24 h.
 3. **ACP v2** – when v2 ships, check that the rewrites in 3.3 and the settle order in 3.2 still match (for example, held prompts are answered with `-32800` on cancel).

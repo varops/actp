@@ -55,6 +55,7 @@ In a client's agent config:
 ## Documents
 
 - [`docs/design.md`](docs/design.md) – the design: public API, behaviour, milestones.
+- [`docs/agents.md`](docs/agents.md) – known ACP agents: how to start them and their quirks.
 - [`docs/wire.md`](docs/wire.md) – the internal bridge-to-server format (subject to change).
 - [`docs/brainstorm.md`](docs/brainstorm.md) – early notes and decisions.
 

@@ -31,7 +31,7 @@ The bridge sends a WebSocket upgrade to `GET /actp/v1/agents/{agentId}/link`:
 | `Actp-Link-Id` | resume | The link to resume. |
 | `Actp-Last-Seq` | resume | Highest server `seq` the bridge has processed. |
 
-New link: the server starts an agent process and answers `101` with `Actp-Link-Id` (random, at least 128 bits, a secret bound to the token) and `Actp-Grace-Period` (seconds). The first message on a new link is ACP `initialize`.
+New link: the server starts an agent process and answers `101` with `Actp-Link-Id` (random, at least 128 bits, a secret bound to the token) and `Actp-Idle-Timeout` (seconds). The first message on a new link is ACP `initialize`.
 
 Upgrade failures:
 
@@ -54,7 +54,7 @@ Every frame is an object with a type field `t`:
 | `msg` | `seq`, `ack`, `msg` | One ACP JSON-RPC message, unchanged. |
 | `ack` | `ack` | Acknowledgement without a message. |
 | `ping` / `pong` | – | Keepalive. |
-| `close` | `reason` | The sender ends the link on purpose. No grace period. |
+| `close` | `reason` | The sender ends the link on purpose. The server settles the agent at once. |
 | `error` | `code`, `message`, `data` | Link-level failure, then the socket closes. |
 
 ```json
@@ -73,7 +73,9 @@ Unknown fields and unknown `t` values are ignored.
 
 ### 4.2 Keepalive
 
-Send `ping` after 20 s without sending anything. Answer `ping` with `pong`. Nothing received for 60 s → treat the socket as dropped. 20 s keeps Cloudflare (100 s idle limit) and most proxies happy.
+A clean close is seen at once. A silent drop (sleep, Wi-Fi change, NAT timeout) is not: TCP can look open for minutes. So each side sends `ping` after 15 s without sending anything and answers `ping` with `pong`. Nothing received for 45 s → treat the socket as dropped. The 15 s ping also keeps Cloudflare (100 s idle limit) and most proxies from closing quiet sockets.
+
+A dropped socket only detaches the link. The agent is not touched (`docs/design.md` 3.1).
 
 ## 5. Resume
 
@@ -86,7 +88,7 @@ If the link is attached to another socket, the server closes the old one with co
 | `error.code` | Meaning |
 | --- | --- |
 | `agent_exited` | `data` has `exitCode` and the stderr tail. Link ends. |
-| `buffer_overflow` | Replay buffer full while detached. Link ends. |
+| `spool_full` | Output spool full while detached. Link ends. |
 | `server_shutdown` | Link ends. |
 | `ended_by_admin` | Link ends. |
 | `sequence_gap` | Link survives. |
@@ -97,7 +99,7 @@ WebSocket close codes: `1000` after `close`, `4001` replaced by a newer socket, 
 ## 7. Limits
 
 - One frame: at most 16 MB.
-- Replay buffer per link: 8 MB or 10,000 messages by default.
+- Replay buffer per link: kept in memory up to 8 MB, then spilled to disk up to `spool_limit` (default 1 GB).
 
 ## 8. Likely future changes
 
