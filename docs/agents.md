@@ -6,15 +6,24 @@ Agents change between releases. Each entry should say which version it was check
 
 ## Presets
 
-| Preset | Command | Notes |
-| --- | --- | --- |
-| `claude-code` | `claude-code-acp` | Zed's ACP adapter. Login with `claude /login`. |
-| `codex` | `codex-acp` | |
-| `gemini` | `gemini --acp` | `--experimental-acp` is deprecated. |
-| `opencode` | `opencode acp` | Modes and models also appear as duplicate config options. |
-| `droid` | `droid exec --output-format acp` | Needs `elicitation.form` from the client for its AskUser tool. |
-| `grok` | `grok agent stdio` | Sends many `_x.ai/*` notifications. |
-| `pi` | to be confirmed | |
+"Verified" means the agent was checked over a live ACP handshake (November 2026). Capabilities are what the agent advertised, not what its vendor claims.
+
+| Preset | Command | Verified | Capabilities and notes |
+| --- | --- | --- | --- |
+| `claude-code` | `claude-code-acp` (npm `@zed-industries/claude-code-acp`, or `node <pkg>/dist/index.js`) | yes | `loadSession`, list, resume, fork, HTTP and SSE MCP, images. Claude Code only speaks ACP through this adapter. Login rides on the user's Claude Code login (`claude /login`). |
+| `codex` | `codex-acp` (Zed's adapter binary, built per platform) | yes | Full capability set. Plain `codex` does not speak ACP; use the adapter. Reasoning effort may need special handling. |
+| `droid` | `droid exec --output-format acp` | yes | `loadSession`, list, resume, close, fork, images, embedded context, HTTP and SSE MCP, modes, ~49 models, config options. Needs `elicitation.form` from the client for its AskUser tool. Many quirks. |
+| `gemini` | `gemini --acp` | yes | `loadSession`, HTTP and SSE MCP, image and audio prompts. Modes `default`, `autoEdit`, `yolo`, `plan`. Default model `auto`. `--experimental-acp` is deprecated. |
+| `opencode` | `opencode acp` | yes | `loadSession`, fork, resume, close, HTTP and SSE MCP, images. Modes `build` and `plan`. Modes and models also appear as duplicate config options. |
+| `grok` | `grok agent stdio` (a subcommand, not a flag) | yes | 12 models, `loadSession`, resume, close, HTTP and SSE MCP. No modes and no config options, so it cannot be steered mid-session. Sends many `_x.ai/*` notifications. |
+| `prime-agent` | `prime-agent --mode acp` | no | Seen as a documented `--mode` value. Not checked over a live handshake. |
+
+### Not available over ACP (yet)
+
+- **Pi** (`pi`) – runs only as a terminal app. No ACP mode is known. It can be added as a preset once an ACP mode or adapter exists and passes a live handshake.
+- **OMP**, **Mimo Code**, **Copilot** – terminal agents with no verified ACP launch.
+
+A custom agent is any command that speaks ACP over stdio. Use `command` and `args` in the config instead of `preset`.
 
 ## Quirks the server handles
 
