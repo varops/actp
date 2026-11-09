@@ -232,7 +232,12 @@ agents = ["claude", "codex"]
 8. **License** – open source from day one.
 9. **Later** – server-to-server session sync, and client-side load balancing across servers.
 
-## Decisions (round 2)
+## Decisions (round 3)
+
+- **Tool, not protocol.** Building on the experimental ACP web transport is risky, and a competing standard is worse. ACTP is a tool: its stable API is the CLI, the config file, a small management API and its behaviour. The bridge-to-server wire is internal (`docs/wire.md`) and can change, for example to the official web transport once it is stable.
+- The spec became `docs/wire.md`. The implementation doc became `docs/design.md`.
+
+## Decisions (round 2, superseded by round 3)
 
 - **Protocol first.** ACTP is a standard (`spec/actp-v1.md`), not one program. `actp` is the reference implementation (`docs/implementation.md`).
 - **Native clients are just clients.** Apps, bots, editors – any of them can speak ACTP directly. None get special treatment.
