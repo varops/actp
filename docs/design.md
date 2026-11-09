@@ -69,12 +69,11 @@ Options:
 | `--cwd VALUE` | Replace every `cwd` the client sends, for example `actp://website`. |
 | `--map FROM=TO` | Rewrite `cwd` values starting with `FROM`. Repeatable. |
 | `--name NAME` | Client name shown on the server. Default: hostname. |
-| `--state-dir PATH` | Save link state so a restarted bridge can resume its session. |
 | `--log-file PATH` | Debug log. stdout is ACP, so logs never go there. |
 
 Tokens are never accepted as a plain argument, because command lines are visible to other users.
 
-Exit codes: `0` when the client closed stdin, `1` on failure (reason on stderr).
+Exit codes: `0` when the client closed stdin (the link is detached, not stopped; see 3.1), `1` on failure (reason on stderr).
 
 ### 2.3 Other CLI commands
 
@@ -195,7 +194,8 @@ While detached:
 - The agent keeps running. Its output is kept in memory and spilled to disk (`spool_limit`, default 1 GB), so long turns do not lose anything.
 - A turn that does not need the client runs to the end, as normal.
 - A turn that asks the client something (permission prompt, question) waits for the answer, as it would for a slow human.
-- The bridge keeps trying to reconnect (backoff 0.5 s up to 30 s, with jitter) for as long as its own client is running. When it gets through, it catches up on everything it missed, including open prompts. The client sees a slow agent, nothing more.
+- The bridge keeps trying to reconnect (backoff 0.5 s up to 30 s, with jitter) for as long as its own client is running.
+- A session has exactly one client. A new connection for the same link replaces the old one. When it gets through, it catches up on everything it missed, including open prompts. The client sees a slow agent, nothing more.
 
 When the server finally lets go:
 
@@ -203,9 +203,18 @@ When the server finally lets go:
 - Then the server closes the link (3.2). An agent waiting on a permission prompt gets `cancelled`; that is the only time a drop leads to anything being cancelled, and only after a day with nobody there.
 - The server also ends a link if the spool is full, the agent exits, or an admin ends it.
 
-Ending on purpose:
+When the client quits:
 
-- When the client closes the bridge's stdin (it stopped the agent), the bridge ends the link at once. That is a deliberate stop, so a running turn is cancelled.
+A client closes the bridge's stdin both when the user stops an agent and when the app just quits, restarts or updates. actp cannot tell these apart, so it never treats a closed stdin as "stop".
+
+- The bridge tells the server the client left, then exits. The server detaches the link, as for a drop.
+- The agent finishes its turn. Then, once the link is idle (no turn running, nothing waiting on the client), the server closes the sessions and stops the agent (3.2). Nothing is cancelled, because nothing is running. The work is saved in the agent's own session store.
+- A request waiting on the client (permission prompt, question) waits until `idle_timeout`, then gets `cancelled`.
+- When the client starts again, it opens a new link and uses ACP `session/load` (or `session/resume`) to get the session back, including what the agent did while it was away.
+- If it asks for a session that is still running on its old, detached link, the server answers `-32000` with `session still running on the agent host`, and the client can retry later. One client per session, always.
+
+To really stop work, the client sends ACP `session/cancel` (stops the turn) or `session/close` (ends the session). These pass through as usual.
+
 - If a link is gone when the bridge reconnects, the bridge answers every request its client is waiting on with JSON-RPC error `-32000` and a message starting with `remote session lost:`, prints the reason to stderr, and exits 1. Clients that support ACP `session/load` can start a new agent and reload.
 
 ### 3.2 Ending a link cleanly
@@ -285,6 +294,7 @@ Each agent runs as a child process with its own login on the server machine. `pr
 - Audit log (JSON lines): link opened, resumed, ended (with reason), session created, permission answered (by client or policy), cwd rejected. Prompts only with `audit.log_prompts = true`.
 - Plain HTTP on loopback by default. A non-loopback `listen` needs `tls_cert` and `tls_key`, or `insecure_listen = true` behind a TLS proxy.
 - Config reload on `SIGHUP` or from the tray. New links use the new config.
+- **Restart and upgrade.** Agents are child processes of `actp serve`, so stopping the server stops them. `actp serve` refuses to stop or restart while any turn is running, unless `--force` is given. It waits for running turns when asked to stop gracefully. After a restart, clients get `remote session lost` and reload with ACP `session/load`.
 
 ## 5. Tray
 
@@ -306,7 +316,8 @@ One app with a server section and a remotes section.
 
 ## 6. Security
 
-- Agents run with the rights of the server's OS user. A token for an agent lets its holder make that agent do anything that user can. Workspaces set the starting point, not a sandbox. Issue tokens with that in mind.
+- Agents run with the rights of the server's OS user. A token for an agent lets its holder make that agent do anything that user can. Workspaces set the starting point, not a sandbox.
+- **v1 is for trusted clients only.** All tokens share the same OS user, the same agent logins, and the same files outside the workspaces. Give tokens only to clients you would give a shell on that machine. The docs and the tray's "Add client" dialog say this plainly.
 - TLS off loopback. Tokens hashed at rest, shown once, never on a command line.
 - File, terminal and `stdio` MCP rewrites stop clients from using ACP itself as a remote shell. They do not limit the agent.
 - Link ids are secrets tied to a token. Resume checks both.
@@ -317,7 +328,11 @@ One app with a server section and a remotes section.
 - **Go client package** for apps that want actp in-process instead of spawning the bridge. Public only once its API is settled.
 - **Load balancing and failover** in the bridge: a saved remote can list several servers.
 - **Server-to-server session sync**, so `session/load` works on another server.
-- **Shared bridge daemon**, so links survive a client restart without `--state-dir`.
+- **Live reattach after a client restart**, so a returning client takes over a session that is still running instead of waiting for it to finish.
+- **Agent host process** separate from `actp serve`, so agents survive a server upgrade.
+- **Stable public address.** Quick tunnels change URL on every restart; named tunnels need a Cloudflare account. A hosted relay with stable names could fix this.
+- **Per-client isolation**: a separate OS user or container per token, for shared family or business setups.
+- **Per-client limits** beyond agents and workspaces: forced modes, allowed models, spending caps.
 
 ## 8. Code layout
 
@@ -343,6 +358,7 @@ Everything is `internal/` until a public Go API is worth promising.
 
 - **Scripted ACP agent** with scenarios `stream`, `permission`, `ask-user`, `cancel`, `resume`, `auth-required`, `needs-fs`, `crash`, `slow-start`, `late-commands`.
 - **End to end:** a stdio ACP test client → bridge → server → scripted agent, on Linux, macOS and Windows in CI. These tests check the public API and the behaviour in section 3, not the wire.
+- **Client quit tests:** client closes stdin mid-turn → turn finishes, session closes, `session/load` on a new link shows the finished turn. Load while still running → `session still running`.
 - **Disconnect tests:** drop during a permission request, resume, answer, turn completes. Drop during a long turn: the turn finishes while detached and the bridge receives all of it on resume. Link idle past `idle_timeout` → `remote session lost`.
 - **Mixed versions:** current bridge against previous server and the other way round.
 - **Real agents:** `claude-code-acp` and `codex-acp` smoke tests behind a build tag.
@@ -351,12 +367,11 @@ Everything is `internal/` until a public Go API is worth promising.
 
 1. **M1 – Relay.** Server with tokens, workspaces and rewrites; bridge with the URL form; management endpoints. A stdio client can use a remote Claude Code.
 2. **M2 – Durable links.** Resume, disk spool, idle timeout, lost-session handling, disconnect tests.
-3. **M3 – Polish the CLI.** Saved remotes, `actp doctor`, `actp agents`, `--state-dir`, mixed-version tests.
+3. **M3 – Polish the CLI.** Saved remotes, `actp doctor`, `actp agents`, mixed-version tests.
 4. **M4 – Tray and tunnel.** Tray, keychain, cloudflared.
 5. **M5 – Release.** Signed builds, installers, docs site.
 
 ## 11. Open points
 
 1. **Pi** – which command starts Pi in ACP mode?
-2. **Default idle timeout** – 24 h.
-3. **ACP v2** – when v2 ships, check that the rewrites in 3.3 and the settle order in 3.2 still match (for example, held prompts are answered with `-32800` on cancel).
+2. **ACP v2** – when v2 ships, check that the rewrites in 3.3 and the settle order in 3.2 still match (for example, held prompts are answered with `-32800` on cancel).

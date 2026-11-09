@@ -232,6 +232,14 @@ agents = ["claude", "codex"]
 8. **License** – open source from day one.
 9. **Later** – server-to-server session sync, and client-side load balancing across servers.
 
+## Decisions (round 6)
+
+- **Client quits → detach, not stop.** The agent finishes its turn, then the session is closed cleanly. The client gets it back with `session/load`. Explicit `session/cancel` or `session/close` still stop work.
+- **One client per session.** No shared watchers.
+- **Server restart** refuses while turns run, unless forced. Agents surviving restarts comes later.
+- **Stable addresses, per-client isolation, per-client limits:** not in v1. v1 is for trusted clients.
+- **Idle timeout** default 24 h.
+
 ## Decisions (round 5)
 
 - **A dropped connection never interrupts the agent.** The server only marks the link detached. The agent finishes its turn; output spills to disk. The bridge reconnects whenever it can. The 10-minute "grace period" is replaced by a 24-hour idle timeout that only counts while the agent is idle or waiting on the client.
