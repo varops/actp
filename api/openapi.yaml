@@ -1,0 +1,300 @@
+openapi: 3.0.3
+info:
+  title: actp server API
+  version: 1.0.0
+  description: |
+    HTTP API of `actp serve`, the server side of ACTP (Agent Client Transport Protocol, ACP over HTTP).
+
+    The management endpoints (`/health`, `/api/v1/*`) are public API and follow semantic versioning.
+
+    The link endpoint is **internal**: it is how the actp bridge talks to the server, and it may change in any release. Only its opening request is described here. The messages sent after the WebSocket opens are described in `docs/wire.md`.
+
+    Every endpoint except `/health` needs `Authorization: Bearer <token>`. There is no exception for local connections.
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+tags:
+  - name: management
+    description: Public, stable endpoints.
+  - name: internal
+    description: Used by the actp bridge only. May change in any release.
+
+security:
+  - bearer: []
+
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      tags: [management]
+      summary: Liveness check
+      security: []
+      responses:
+        "200":
+          description: The server is running.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+
+  /api/v1/info:
+    get:
+      operationId: getInfo
+      tags: [management]
+      summary: Server metadata
+      responses:
+        "200":
+          description: Server metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Info"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/agents:
+    get:
+      operationId: listAgents
+      tags: [management]
+      summary: Agents this token may use
+      responses:
+        "200":
+          description: The agents this token may use. Agents the token may not use are not listed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /actp/v1/agents/{agentId}/link:
+    get:
+      operationId: openLink
+      tags: [internal]
+      x-internal: true
+      summary: Open or resume a link (WebSocket upgrade)
+      description: |
+        Opens a new link to an agent, or resumes an existing one when `Actp-Link-Id` and `Actp-Last-Seq` are sent. The request must be a WebSocket upgrade offering a supported wire version as subprotocol (for example `actp.v1`). See `docs/wire.md`.
+      parameters:
+        - name: agentId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/AgentId"
+        - name: Sec-WebSocket-Protocol
+          in: header
+          required: true
+          description: Wire versions the bridge supports, for example `actp.v1`.
+          schema:
+            type: string
+        - name: Actp-Client-Name
+          in: header
+          required: false
+          description: Display name of the client, for logs and the tray.
+          schema:
+            type: string
+            maxLength: 128
+        - name: Actp-Link-Id
+          in: header
+          required: false
+          description: Resume this link. Requires `Actp-Last-Seq`.
+          schema:
+            type: string
+        - name: Actp-Last-Seq
+          in: header
+          required: false
+          description: Highest server sequence number the bridge has processed.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+      responses:
+        "101":
+          description: Switching to WebSocket. The link is open.
+          headers:
+            Actp-Link-Id:
+              description: The link id. Secret, bound to the token.
+              schema:
+                type: string
+            Actp-Prompt-Timeout:
+              description: Seconds an unanswered prompt waits for a dropped client.
+              schema:
+                type: integer
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Resume refused. The link belongs to another token.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "410":
+          description: Resume refused. The link is unknown or ended, or its replay no longer covers `Actp-Last-Seq`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "426":
+          description: No wire version in common, or the request was not a WebSocket upgrade.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: Too many links for this agent or token.
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: The agent failed to start.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      description: An actp token, created with `actp token create`.
+
+  responses:
+    BadRequest:
+      description: The request is malformed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Missing or invalid token.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: The token may not use this agent.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Unknown agent.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  schemas:
+    AgentId:
+      type: string
+      pattern: "^[a-z0-9][a-z0-9_-]{0,63}$"
+
+    Health:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+
+    Info:
+      type: object
+      required: [version, wireVersions, promptTimeoutSeconds]
+      properties:
+        name:
+          type: string
+          description: Display name of the server.
+        version:
+          type: string
+          description: actp version, for example `0.1.0`.
+        wireVersions:
+          type: array
+          description: Wire versions the server supports, newest first.
+          items:
+            type: string
+        promptTimeoutSeconds:
+          type: integer
+          description: Seconds an unanswered prompt waits for a dropped client.
+
+    AgentList:
+      type: object
+      required: [agents]
+      properties:
+        agents:
+          type: array
+          items:
+            $ref: "#/components/schemas/Agent"
+
+    Agent:
+      type: object
+      required: [id, status, workspaces]
+      properties:
+        id:
+          $ref: "#/components/schemas/AgentId"
+        name:
+          type: string
+        description:
+          type: string
+        status:
+          type: string
+          enum: [ready, auth_required, unavailable, unknown]
+          description: |
+            `ready`: the agent started and worked. `auth_required`: the agent needs a login on the agent host (see `authHint`). `unavailable`: the agent failed to start (see `error`). `unknown`: not probed yet.
+        authHint:
+          type: string
+          description: What to do on the agent host to log in, from the agent itself.
+        error:
+          type: string
+        workspaces:
+          type: array
+          description: Workspaces this token may use with this agent.
+          items:
+            $ref: "#/components/schemas/Workspace"
+        agentInfo:
+          $ref: "#/components/schemas/AgentInfo"
+        agentCapabilities:
+          type: object
+          additionalProperties: true
+          description: The agent's ACP `agentCapabilities` from its last `initialize`. A hint only.
+
+    Workspace:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        default:
+          type: boolean
+
+    AgentInfo:
+      type: object
+      properties:
+        name:
+          type: string
+        title:
+          type: string
+        version:
+          type: string
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Machine-readable code, for example `unauthorized`.
+        message:
+          type: string
+          description: Human-readable explanation.
