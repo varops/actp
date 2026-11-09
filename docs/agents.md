@@ -16,11 +16,11 @@ Agents change between releases. Each entry should say which version it was check
 | `gemini` | `gemini --acp` | yes | `loadSession`, HTTP and SSE MCP, image and audio prompts. Modes `default`, `autoEdit`, `yolo`, `plan`. Default model `auto`. `--experimental-acp` is deprecated. |
 | `opencode` | `opencode acp` | yes | `loadSession`, fork, resume, close, HTTP and SSE MCP, images. Modes `build` and `plan`. Modes and models also appear as duplicate config options. |
 | `grok` | `grok agent stdio` (a subcommand, not a flag) | yes | 12 models, `loadSession`, resume, close, HTTP and SSE MCP. No modes and no config options, so it cannot be steered mid-session. Sends many `_x.ai/*` notifications. |
+| `pi` | `pi-acp` (npm `pi-acp`, MIT, or `npx -y pi-acp`) | no | Community adapter, listed in the ACP registry. Needs `pi` v0.81+ on PATH and Node 22+. It runs `pi --mode rpc` underneath. `session/load` works (pi keeps sessions in `~/.pi/agent/sessions`). No `fs`/`terminal` delegation, which fits actp. MCP servers from the client are not passed to pi. No separate thought stream. Login: `pi-acp --terminal-login` on the agent host. Queue and steering are pi modes, set with the `/queue`, `/steering` and `/follow-up` slash commands. `PI_ACP_ENABLE_EMBEDDED_CONTEXT=true` turns on embedded context. |
 | `prime-agent` | `prime-agent --mode acp` | no | Seen as a documented `--mode` value. Not checked over a live handshake. |
 
 ### Not available over ACP (yet)
 
-- **Pi** (`pi`) – runs only as a terminal app. No ACP mode is known. It can be added as a preset once an ACP mode or adapter exists and passes a live handshake.
 - **OMP**, **Mimo Code**, **Copilot** – terminal agents with no verified ACP launch.
 
 A custom agent is any command that speaks ACP over stdio. Use `command` and `args` in the config instead of `preset`.

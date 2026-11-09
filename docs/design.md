@@ -373,5 +373,5 @@ Everything is `internal/` until a public Go API is worth promising.
 
 ## 11. Open points
 
-1. **Pi** – no ACP mode is known yet (`docs/agents.md`). Add a preset once one exists.
+1. **Pi** – preset uses the community `pi-acp` adapter. Verify it over a live handshake before release.
 2. **ACP v2** – when v2 ships, check that the rewrites in 3.3 and the settle order in 3.2 still match (for example, held prompts are answered with `-32800` on cancel).
