@@ -2,7 +2,7 @@
 
 Status: draft 1 (2026-11-09)
 
-ACTP (Agent Client Transport Protocol) carries the Agent Client Protocol (ACP) between machines. It lets an ACP client use an ACP agent that runs on another host, with authentication, discovery, and connections that survive network drops.
+ACTP (Agent Client Transport Protocol) is ACP over HTTP. It carries the Agent Client Protocol (ACP) between machines. It lets an ACP client use an ACP agent that runs on another host, with authentication, discovery, and connections that survive network drops.
 
 This document is the standard. It does not depend on any one implementation. The `actp` binary in this repository is the reference implementation; see `docs/implementation.md`.
 
