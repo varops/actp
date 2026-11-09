@@ -232,6 +232,13 @@ agents = ["claude", "codex"]
 8. **License** – open source from day one.
 9. **Later** – server-to-server session sync, and client-side load balancing across servers.
 
+## Decisions (round 4)
+
+- **Config in YAML**, not TOML.
+- **License: Apache 2.0.**
+- **Prompts during a turn:** the agent decides. actp passes prompts through unchanged, so queueing and steering work as ACP and agents support them.
+- **Files and terminals:** confirmed by ACP itself. The ACP v2 draft removes the client file and terminal methods.
+
 ## Decisions (round 3)
 
 - **Tool, not protocol.** Building on the experimental ACP web transport is risky, and a competing standard is worse. ACTP is a tool: its stable API is the CLI, the config file, a small management API and its behaviour. The bridge-to-server wire is internal (`docs/wire.md`) and can change, for example to the official web transport once it is stable.

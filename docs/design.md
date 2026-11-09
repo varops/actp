@@ -92,56 +92,57 @@ actp version
 
 ### 2.4 Configuration file
 
-TOML at `~/.actp/actp.toml` (Windows `%APPDATA%\actp\actp.toml`), or `--config`. Every section is optional. The file has a `version = 1` key; old versions are migrated on load.
+YAML at `~/.actp/actp.yaml` (Windows `%APPDATA%\actp\actp.yaml`), or `--config`. Every section is optional. The file has a `version: 1` key; old versions are migrated on load.
 
-```toml
-version = 1
+```yaml
+version: 1
 
-[server]
-name = "workstation"
-listen = "127.0.0.1:7860"
-grace_period = "10m"
-replay_buffer = "8MB"
-log_dir = "~/.actp/logs"
+server:
+  name: workstation
+  listen: 127.0.0.1:7860
+  grace_period: 10m
+  replay_buffer: 8MB
+  log_dir: ~/.actp/logs
 
-[server.tunnel]
-provider = "cloudflare"
-mode = "off"                      # off | quick | named
-token_env = "CF_TUNNEL_TOKEN"     # named only
+  tunnel:
+    provider: cloudflare
+    mode: off                     # off | quick | named
+    token_env: CF_TUNNEL_TOKEN    # named only
 
-[[server.workspaces]]
-name = "website"
-path = "~/code/website"
+  workspaces:
+    - name: website
+      path: ~/code/website
 
-[[server.agents]]
-id = "claude"
-name = "Claude Code"
-command = "claude-code-acp"
-args = []
-env = {}
-permissions = "forward"           # forward | auto_allow | auto_deny
-max_links = 4
+  agents:
+    - id: claude
+      preset: claude-code         # fills in command and quirks (section 3.6)
+      permissions: forward        # forward | auto_allow | auto_deny
+      max_links: 4
+    - id: codex
+      preset: codex
+    - id: my-agent
+      name: My Agent
+      command: my-agent
+      args: [--acp]
+      env: {}
+      env_remove: [ANTHROPIC_API_KEY]   # drop ambient keys so the agent uses its own login
 
-[[server.agents]]
-id = "codex"
-command = "codex-acp"
-
-[[server.tokens]]
-name = "bot-vps"
-hash = "sha256:9f2c..."
-agents = ["claude", "codex"]      # "*" for all
-workspaces = ["website"]          # "*" for all
-default_workspace = "website"
-mcp_servers = "remote"            # none | remote | all
-permissions = ""                  # optional override
-max_links = 8
-map = { "/srv/bot/repo" = "website" }
+  tokens:
+    - name: bot-vps
+      hash: "sha256:9f2c..."
+      agents: [claude, codex]     # "*" for all
+      workspaces: [website]       # "*" for all
+      default_workspace: website
+      mcp_servers: remote         # none | remote | all
+      max_links: 8
+      map:
+        /srv/bot/repo: website
 
 # Saved remotes, for the bridge short form and the tray
-[[remotes]]
-name = "workstation"
-url = "https://agents.example.com"
-token_env = "ACTP_WORKSTATION_TOKEN"   # or token_file, or keychain (tray)
+remotes:
+  - name: workstation
+    url: https://agents.example.com
+    token_env: ACTP_WORKSTATION_TOKEN   # or token_file, or keychain (tray)
 ```
 
 ### 2.5 Management endpoints
@@ -184,7 +185,7 @@ These are promises to users, whatever the wire looks like.
 - A network drop does not end the agent's work. The agent keeps running on the server and its output is kept.
 - The bridge reconnects in the background (backoff 0.5 s up to 15 s, with jitter) and catches up. The client sees a slow agent, nothing more.
 - Requests from the agent to the client (permission prompts, questions) stay open while the bridge is away. The agent waits, as it would for a slow human.
-- This lasts for the **grace period** (default 10 min). After that the server ends the link (3.2).
+- This lasts for the **grace period**: how long the server keeps the agent running after it loses contact with the bridge (default 10 min). It covers a laptop lid closing, Wi-Fi switching, or a tunnel restarting. If the bridge comes back in time, nothing is lost. If not, the server ends the link (3.2), so no agent waits forever for a client that is gone.
 - If the session is lost, the bridge answers every request the client is waiting on with JSON-RPC error `-32000` and a message starting with `remote session lost:`, prints the reason to stderr, and exits 1. Clients that support ACP `session/load` can start a new agent and reload.
 - When the client closes the bridge's stdin, the bridge ends the link at once. No grace period.
 
@@ -209,6 +210,7 @@ The server reads the ACP traffic and changes only these things.
 - In `initialize`, the server removes `clientCapabilities.fs` and `clientCapabilities.terminal`. The agent then reads files and runs commands itself, where its working folder is. Clients still see every tool call, command and output through normal `session/update` messages.
 - If an agent sends `fs/*` or `terminal/*` anyway, the server answers `methodNotFound` and does not forward it.
 - Every other client capability passes through, because they change agent behaviour (some agents only ask structured questions when `elicitation.form` is present).
+- This matches where ACP is going: the ACP v2 draft removes the client file and terminal methods completely.
 
 **Working folder (`cwd`).** A client's `cwd` is a path on the client machine and usually means nothing on the server. In `session/new`, `session/load`, `session/resume` and `session/list`, the server resolves it in this order:
 
@@ -233,6 +235,40 @@ At start and on demand (`actp doctor`, tray), the server runs `initialize` witho
 ### 3.5 Limits
 
 Per agent and per token `max_links`. Over the limit, the bridge gets an error it prints as "server busy, try later".
+
+### 3.6 Prompts during a turn
+
+actp does not queue or reorder prompts. A `session/prompt` sent while a turn is running goes straight to the agent, and the agent decides what to do with it.
+
+- **ACP v1:** one turn per session. Most agents reject a second prompt while one runs, so clients queue on their side.
+- **ACP v2 (draft):** clients may send a prompt at any time. The agent either inserts it at once or holds it and inserts held prompts in order. Whether that **steers** the current turn or **queues** the next one is up to the agent. Explicit queue and steer capabilities are planned for a later ACP change.
+
+Because actp passes prompts, cancellations and `$/cancel_request` through unchanged and in order, both styles work as soon as the agent supports them. When ACP adds explicit queue and steer options, they pass through too.
+
+### 3.7 Agent presets and quirks
+
+Each agent runs as a child process with its own login on the server machine. Presets fill in the command and known quirks so users do not have to.
+
+| Preset | Command | Notes |
+| --- | --- | --- |
+| `claude-code` | `claude-code-acp` | Zed's ACP adapter. Login with `claude /login`. |
+| `codex` | `codex-acp` | |
+| `gemini` | `gemini --acp` | `--experimental-acp` is deprecated. |
+| `opencode` | `opencode acp` | Modes and models also appear as duplicate config options. |
+| `droid` | `droid exec --output-format acp` | Needs `elicitation.form` from the client for its AskUser tool. |
+| `grok` | `grok agent stdio` | Sends many `_x.ai/*` notifications. |
+| `pi` | to be confirmed | |
+
+Quirks the server must handle, from experience driving these agents over ACP:
+
+- **Process folder.** Agents find their session store relative to the folder they run in. The server starts each agent in the link's default workspace, so `session/list` and `session/load` find the right sessions.
+- **Ambient keys.** An API key in the server's environment can override an agent's own login. `env_remove` drops such variables for one agent.
+- **Windows.** npm-installed agents are `.cmd` shims. Stopping the shim leaves the real agent running, so the server kills the whole process tree.
+- **Startup failures.** An agent that exits or hangs during `initialize` must not block the link. The server races `initialize` against process exit and a timeout, and reports the exit code and stderr tail.
+- **Errors.** Agents often wrap the real reason in `data.details` of a JSON-RPC "Internal error". actp forwards errors unchanged and uses `data.details` in its own messages and logs.
+- **Unknown requests from the agent.** They carry an id and the agent waits for the reply. If nobody can answer one (for example while settling a link), the server replies `methodNotFound` instead of dropping it.
+- **Request cancellation from the agent.** Some agents cancel an open question with `$/cancel_request` when a turn ends. This must reach the client so it can remove the prompt from its UI.
+- **Late answers.** A permission answer can race a cancel. The server ignores answers for requests it already settled.
 
 ## 4. Server internals
 
@@ -278,7 +314,7 @@ One app with a server section and a remotes section.
 
 ## 8. Code layout
 
-Module `github.com/varops/actp`, Go 1.24+. Libraries: `github.com/coder/websocket`, `github.com/BurntSushi/toml`, `fyne.io/systray`. No ACP SDK: messages stay `json.RawMessage`, and only routed or rewritten fields are parsed, so unknown fields survive.
+Module `github.com/varops/actp`, Go 1.24+. Libraries: `github.com/coder/websocket`, `github.com/goccy/go-yaml`, `fyne.io/systray`. No ACP SDK: messages stay `json.RawMessage`, and only routed or rewritten fields are parsed, so unknown fields survive.
 
 ```
 cmd/actp/            CLI entry
@@ -314,7 +350,6 @@ Everything is `internal/` until a public Go API is worth promising.
 
 ## 11. Open points
 
-1. **License.**
-2. **Pi** – which command starts Pi in ACP mode?
-3. **Default grace period** – 10 min.
-4. **Second prompt during a turn** – proposal: pass through and let the agent reject it; queuing is a client concern.
+1. **Pi** – which command starts Pi in ACP mode?
+2. **Default grace period** – 10 min.
+3. **ACP v2** – when v2 ships, check that the rewrites in 3.3 and the settle order in 3.2 still match (for example, held prompts are answered with `-32800` on cancel).

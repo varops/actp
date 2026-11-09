@@ -60,4 +60,4 @@ In a client's agent config:
 
 ## License
 
-Open source. License to be chosen before the first release.
+[Apache 2.0](LICENSE).
