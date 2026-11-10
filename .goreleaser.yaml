@@ -1,5 +1,6 @@
-# Release builds of the actp CLI (server and bridge). The tray is built separately
-# per platform, because it needs native code on macOS.
+# Release builds. "actp" is the CLI (server and bridge) for every platform.
+# "actp-desktop" adds the tray icon; it is pure Go on Linux and Windows. The macOS
+# desktop build needs native code and is made by the macos job in release.yml.
 version: 2
 
 project_name: actp
@@ -20,9 +21,22 @@ builds:
     flags: [-trimpath]
     ldflags:
       - -s -w -X main.version={{ .Version }}
+  - id: actp-desktop
+    main: ./cmd/actp
+    binary: actp
+    tags: [tray]
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+      - "{{ if eq .Os \"windows\" }}-H windowsgui{{ end }}"
 
 archives:
   - id: actp
+    ids: [actp]
     formats: [tar.gz]
     format_overrides:
       - goos: windows
@@ -31,10 +45,23 @@ archives:
     files:
       - LICENSE
       - README.md
+  - id: actp-desktop
+    ids: [actp-desktop]
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: "{{ .ProjectName }}-desktop_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
 
 checksum:
   name_template: checksums.txt
   algorithm: sha256
+
+release:
+  draft: true
 
 changelog:
   use: git
