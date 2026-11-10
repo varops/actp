@@ -121,6 +121,9 @@ func TestRemoteAddListRemove(t *testing.T) {
 }
 
 func TestCheckPublicURL(t *testing.T) {
+	old := firstCheckDelay
+	firstCheckDelay = 0
+	defer func() { firstCheckDelay = old }()
 	cfg := &config.Server{StateDir: t.TempDir(), LogDir: t.TempDir()}
 	srv, err := server.New(cfg, server.Options{BaseEnv: os.Environ(), ReadOnly: true, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	if err != nil {

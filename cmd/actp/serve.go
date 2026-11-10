@@ -171,7 +171,17 @@ func (h *host) startServer() (bool, error) {
 // checkPublicURL asks the public URL for /health every 30 s, so the dashboard
 // can say whether the tunnel really reaches this server.
 func checkPublicURL(ctx context.Context, log *slog.Logger, srv *server.Server, url string) {
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{
+		Proxy:       http.ProxyFromEnvironment,
+		DialContext: dialViaPublicDNS,
+	}}
+	// A new quick tunnel takes 10-60 s to appear in DNS. Asking too early makes
+	// caches remember "no such host", so wait before the first check.
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(firstCheckDelay):
+	}
 	wasOK := false
 	for {
 		check := server.PublicCheck{At: time.Now()}
@@ -179,6 +189,9 @@ func checkPublicURL(ctx context.Context, log *slog.Logger, srv *server.Server, u
 		switch {
 		case err != nil:
 			check.Detail = err.Error()
+			if strings.Contains(err.Error(), "no such host") {
+				check.Detail = "Cloudflare has not published this address yet. If this machine looked it up too early it may remember \"not found\" for a while; clear the cache with: sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder"
+			}
 		default:
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 			resp.Body.Close()
@@ -198,7 +211,7 @@ func checkPublicURL(ctx context.Context, log *slog.Logger, srv *server.Server, u
 		srv.SetPublicCheck(check)
 		delay := 30 * time.Second
 		if !check.OK {
-			delay = 5 * time.Second // a new quick tunnel can take a little while to work
+			delay = 10 * time.Second
 		}
 		select {
 		case <-ctx.Done():
@@ -206,6 +219,51 @@ func checkPublicURL(ctx context.Context, log *slog.Logger, srv *server.Server, u
 		case <-time.After(delay):
 		}
 	}
+}
+
+// firstCheckDelay is how long checkPublicURL waits before its first request.
+var firstCheckDelay = 20 * time.Second
+
+// publicResolver asks Cloudflare's DNS directly, so the check neither depends on
+// nor fills this machine's DNS cache. It falls back to the system resolver.
+func publicResolver() *net.Resolver {
+	return &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+		d := net.Dialer{Timeout: 3 * time.Second}
+		if c, err := d.DialContext(ctx, network, "1.1.1.1:53"); err == nil {
+			return c, nil
+		}
+		return d.DialContext(ctx, network, "1.0.0.1:53")
+	}}
+}
+
+// dialViaPublicDNS resolves with Cloudflare's DNS and falls back to the system
+// resolver when that is blocked.
+func dialViaPublicDNS(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	d := &net.Dialer{Timeout: 10 * time.Second}
+	if net.ParseIP(host) != nil {
+		return d.DialContext(ctx, network, addr)
+	}
+	ips, err := publicResolver().LookupHost(ctx, host)
+	if err != nil {
+		var dnsErr *net.DNSError
+		if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
+			return nil, err // a real answer: the name does not exist (yet)
+		}
+		return d.DialContext(ctx, network, addr) // public DNS unreachable: use the system's
+	}
+	var last error
+	for _, ip := range ips {
+		c, err := d.DialContext(ctx, network, net.JoinHostPort(ip, port))
+		if err == nil {
+			return c, nil
+		}
+		last = err
+	}
+	return nil, last
 }
 
 // TunnelError is cloudflared's last error line, if any.
