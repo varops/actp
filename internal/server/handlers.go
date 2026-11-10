@@ -166,6 +166,9 @@ func (s *Server) overLimit(agentID, tokenName string, agentMax, tokenMax int) st
 	defer s.mu.Unlock()
 	perAgent, perToken := 0, 0
 	for _, l := range s.links {
+		if l.ended != nil && isClosed(l.ended) {
+			continue // ended links waiting for their client hold no agent process
+		}
 		if l.agent.ID == agentID {
 			perAgent++
 		}
@@ -180,4 +183,13 @@ func (s *Server) overLimit(agentID, tokenName string, agentMax, tokenMax int) st
 		return "this token has reached its link limit"
 	}
 	return ""
+}
+
+func isClosed(ch chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
 }

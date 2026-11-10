@@ -239,3 +239,28 @@ func TestSpoolSpillsToDiskAndReplays(t *testing.T) {
 		t.Fatal("spool file not removed")
 	}
 }
+
+func TestSpoolCompactsAckedData(t *testing.T) {
+	old := compactMin
+	compactMin = 200
+	defer func() { compactMin = old }()
+	opts := fastOpts()
+	opts.SpoolPath = t.TempDir() + "/link.spool"
+	opts.MemoryLimit = 1
+	e := NewEndpoint(opts, func(json.RawMessage) error { return nil })
+	defer e.Close()
+	for i := 1; i <= 40; i++ {
+		e.Send(json.RawMessage(fmt.Sprintf(`{"n":%02d}`, i))) // 8 bytes each
+	}
+	e.mu.Lock()
+	e.ackPeer(30) // 240 bytes dead, 80 live
+	end := e.spoolEnd
+	raw, err := e.load(e.outbox[0])
+	e.mu.Unlock()
+	if end != 80 || err != nil || string(raw) != `{"n":31}` {
+		t.Fatalf("after compaction: end %d, first %s, %v", end, raw, err)
+	}
+	if info, _ := os.Stat(opts.SpoolPath); info.Size() != 80 {
+		t.Fatalf("file size %d", info.Size())
+	}
+}

@@ -10,6 +10,8 @@
 //	cwd             reply with the session cwd
 //	mcp             reply with the session MCP servers
 //	crash           exit with code 3
+//	burst-crash <n> send n chunks, then exit with code 4
+//	late-burst-crash <n>  like burst-crash, after 300 ms
 //
 // Sessions are stored as files under $ACTP_TESTAGENT_STORE so session/load
 // works from a fresh process. With ACTP_TESTAGENT_SCENARIO=auth-required,
@@ -275,6 +277,22 @@ func (a *agent) prompt(m *jsonrpc.Message) {
 	case "crash":
 		fmt.Fprintln(os.Stderr, "testagent: crashing on purpose")
 		os.Exit(3)
+	case "late-burst-crash":
+		n, _ := strconv.Atoi(arg)
+		a.chunk(s.ID, "starting")
+		time.Sleep(300 * time.Millisecond)
+		for i := 1; i <= n; i++ {
+			a.chunk(s.ID, fmt.Sprintf("burst %d", i))
+		}
+		fmt.Fprintln(os.Stderr, "testagent: crashing after a late burst")
+		os.Exit(4)
+	case "burst-crash":
+		n, _ := strconv.Atoi(arg)
+		for i := 1; i <= n; i++ {
+			a.chunk(s.ID, fmt.Sprintf("burst %d", i))
+		}
+		fmt.Fprintln(os.Stderr, "testagent: crashing after a burst")
+		os.Exit(4)
 	default:
 		reply("unknown command: " + text)
 	}

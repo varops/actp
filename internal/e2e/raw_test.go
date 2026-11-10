@@ -197,3 +197,38 @@ func TestResumeWithAnotherTokenIsRefused(t *testing.T) {
 	var lost *bridge.LostError
 	_ = errors.As(err, &lost)
 }
+
+func TestIdleCloseCountsFromWhenTheTurnEnded(t *testing.T) {
+	e := newEnv(t) // idle_close: 1s
+	r := e.raw()
+	r.call("initialize", map[string]any{"protocolVersion": 1, "clientCapabilities": map[string]any{}})
+	nr := r.call("session/new", map[string]any{"cwd": "actp://site", "mcpServers": []any{}})
+	var s struct {
+		SessionID string `json:"sessionId"`
+	}
+	_ = json.Unmarshal(nr.Result, &s)
+	m, _ := jsonrpc.NewRequest(json.RawMessage(`"p"`), "session/prompt", map[string]any{"sessionId": s.SessionID, "prompt": []any{map[string]any{"type": "text", "text": "slow 20"}}})
+	r.ep.Send(m.Raw)
+	r.waitChunk("chunk 1")
+	r.drop()
+	// The turn runs about 2 s while detached, longer than idle_close.
+	waitUntil(t, "turn to finish", func() bool {
+		l := e.srv.Links()
+		return len(l) == 1 && !l[0].Running
+	})
+	time.Sleep(300 * time.Millisecond) // well inside idle_close after the turn ended
+	if resp, err := r.connect(r.id); err != nil {
+		t.Fatalf("resume after the turn ended: %v %v", resp, err)
+	}
+	r.waitChunk("chunk 20")
+	waitUntil(t, "prompt response", func() bool {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		for _, g := range r.got {
+			if g.IDKey() == `"p"` && g.Kind() == jsonrpc.KindResponse {
+				return true
+			}
+		}
+		return false
+	})
+}

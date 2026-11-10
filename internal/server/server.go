@@ -163,6 +163,9 @@ func (s *Server) Close(grace time.Duration) {
 		go func() { defer wg.Done(); l.end(wire.ErrServerShutdown, "server is stopping") }()
 	}
 	wg.Wait()
+	for _, l := range links {
+		l.finalize()
+	}
 	s.stop()
 	s.audit.close()
 }
@@ -203,7 +206,9 @@ func (s *Server) Links() []LinkInfo {
 	s.mu.Unlock()
 	out := make([]LinkInfo, 0, len(links))
 	for _, l := range links {
-		out = append(out, l.info())
+		if info := l.info(); info.State != StateEnded {
+			out = append(out, info)
+		}
 	}
 	return out
 }
@@ -217,6 +222,7 @@ func (s *Server) EndLink(id string) bool {
 		return false
 	}
 	l.end(wire.ErrEndedByAdmin, "ended by an operator")
+	l.finalize()
 	return true
 }
 

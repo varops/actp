@@ -106,6 +106,7 @@ func Run(ctx context.Context, opts Options, stdin io.Reader, stdout io.Writer) e
 
 		conn, peerLast, err = b.reconnect(ctx, clientGone)
 		if errors.Is(err, errClientGone) {
+			b.sayBye(nil)
 			return nil
 		}
 		if err != nil {
@@ -139,6 +140,16 @@ func lastLine(s string) string {
 // reconnect retries with backoff until it gets through, the client leaves, or
 // it is time to give up. Time asleep does not count: Go's monotonic clock stops during sleep.
 func (b *bridge) reconnect(ctx context.Context, clientGone <-chan struct{}) (*websocket.Conn, int64, error) {
+	// A dial in progress is cancelled as soon as the client leaves.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		select {
+		case <-clientGone:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 	start := time.Now()
 	delay := 500 * time.Millisecond
 	for {
@@ -148,6 +159,14 @@ func (b *bridge) reconnect(ctx context.Context, clientGone <-chan struct{}) (*we
 		case <-time.After(jitter(delay)):
 		}
 		conn, last, err := b.dial(ctx)
+		select {
+		case <-clientGone:
+			if conn != nil {
+				_ = conn.CloseNow()
+			}
+			return nil, 0, errClientGone
+		default:
+		}
 		if err == nil {
 			b.log.Info("reconnected")
 			return conn, last, nil
@@ -178,10 +197,23 @@ func (b *bridge) sayBye(served chan error) {
 		}
 		return
 	}
-	// Not connected right now: one quick try, so the server does not wait for a client that is gone.
+	// Not connected right now: try for a few seconds, so the server does not
+	// keep prompts waiting for a client that is gone.
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if conn, last, err := b.dial(ctx); err == nil {
+	for ctx.Err() == nil {
+		conn, last, err := b.dial(ctx)
+		if err != nil {
+			var se *statusError
+			if errors.As(err, &se) && se.permanent() {
+				return
+			}
+			select {
+			case <-ctx.Done():
+			case <-time.After(200 * time.Millisecond):
+			}
+			continue
+		}
 		done := make(chan error, 1)
 		go func() { done <- b.ep.Serve(ctx, conn, last) }()
 		b.ep.SendControl(wire.Frame{T: wire.TBye})
@@ -189,6 +221,7 @@ func (b *bridge) sayBye(served chan error) {
 		case <-done:
 		case <-ctx.Done():
 		}
+		return
 	}
 }
 

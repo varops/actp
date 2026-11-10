@@ -76,6 +76,10 @@ type Link struct {
 	nextServerReq   int
 	cancelSent      bool
 	ended           chan struct{}
+	tomb            *tombstone // set when a link ended with output its client has not received
+	finalized       bool
+	drained         chan struct{} // closed when the agent's output has been handled
+	lastBusy        time.Time     // last time a turn ran or a prompt waited
 	endOnce         sync.Once
 }
 
@@ -109,7 +113,7 @@ func (s *Server) startLink(agent *config.Agent, tok *config.Token, clientName st
 		state: StateDetached, stateSince: time.Now(),
 		clientReqs: map[string]clientReq{}, agentReqs: map[string]agentReq{},
 		sessions: map[string]*linkSession{}, serverReqs: map[string]bool{},
-		ended: make(chan struct{}),
+		ended: make(chan struct{}), drained: make(chan struct{}),
 	}
 	wopts := s.opts.Wire
 	wopts.SpoolPath = filepath.Join(s.spoolDir(), l.id+".spool")
@@ -130,6 +134,17 @@ func (l *Link) logf(msg string, args ...any) {
 
 // serve attaches a socket and runs it until it ends.
 func (l *Link) serve(conn *websocket.Conn, lastSeq int64) {
+	l.mu.Lock()
+	tomb := l.tomb
+	l.mu.Unlock()
+	if tomb != nil {
+		// The link ended while the client was away: hand over what it missed, then say why.
+		l.srv.audit.event("link_resumed", map[string]any{"link": l.id[:8], "ended": true})
+		l.ep.SendControl(tomb.frame())
+		_ = l.ep.Serve(l.srv.ctx, conn, lastSeq)
+		l.finalizeIfDelivered()
+		return
+	}
 	l.setState(StateAttached)
 	if lastSeq > 0 {
 		l.srv.audit.event("link_resumed", map[string]any{"link": l.id[:8]})
@@ -146,7 +161,11 @@ func (l *Link) serve(conn *websocket.Conn, lastSeq int64) {
 		if l.state == StateAttached {
 			l.state, l.stateSince = StateDetached, time.Now()
 		}
+		ended := l.state == StateEnded
 		l.mu.Unlock()
+		if ended {
+			l.finalizeIfDelivered()
+		}
 		if err != nil {
 			l.logf("connection dropped", "reason", err.Error())
 		}
@@ -165,7 +184,7 @@ func (l *Link) setState(state string) {
 func (l *Link) resumable() bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.state == StateAttached || l.state == StateDetached
+	return l.state == StateAttached || l.state == StateDetached || (l.tomb != nil && !l.finalized)
 }
 
 func (l *Link) info() LinkInfo {
@@ -322,6 +341,7 @@ func (l *Link) readAgent() {
 		}
 		l.fromAgent(m)
 	}
+	close(l.drained)
 	<-l.proc.Done()
 	data, _ := json.Marshal(map[string]any{"exitCode": l.proc.ExitCode(), "stderr": l.proc.Stderr()})
 	l.endWithData(wire.ErrAgentExited, fmt.Sprintf("agent %s exited with code %d", l.agent.ID, l.proc.ExitCode()), data)
@@ -657,18 +677,32 @@ func (l *Link) supervise() {
 			}
 		}
 		cancelSent := l.cancelSent
+		if running || !oldest.IsZero() {
+			l.lastBusy = time.Now()
+		}
+		idleSince := since
+		if l.lastBusy.After(idleSince) {
+			idleSince = l.lastBusy
+		}
 		l.mu.Unlock()
+		if state != StateEnded && state != StateUnattended {
+			// Disk is bounded in every state, also for a slow client that is still attached.
+			if l.ep.OutboxBytes() > int64(l.srv.conf().SpoolLimit) {
+				l.end(wire.ErrSpoolFull, "output spool is full")
+				continue
+			}
+			if err := l.ep.SpoolError(); err != nil {
+				l.end(wire.ErrSpoolFull, "output spool failed: "+err.Error())
+				continue
+			}
+		}
 		cfg := l.srv.conf()
 		switch state {
 		case StateDetached:
 			switch {
-			case l.ep.OutboxBytes() > int64(cfg.SpoolLimit):
-				l.end(wire.ErrSpoolFull, "output spool is full")
-			case l.ep.SpoolError() != nil:
-				l.end(wire.ErrSpoolFull, "output spool failed: "+l.ep.SpoolError().Error())
 			case !oldest.IsZero() && time.Since(oldest) >= cfg.PromptTimeout.D():
 				l.end(wire.ErrLinkEnded, "prompt unanswered past prompt_timeout")
-			case !running && oldest.IsZero() && time.Since(since) >= cfg.IdleClose.D():
+			case !running && oldest.IsZero() && time.Since(idleSince) >= cfg.IdleClose.D():
 				l.end(wire.ErrLinkEnded, "detached and idle past idle_close")
 			}
 		case StateUnattended:
@@ -690,11 +724,47 @@ func (l *Link) supervise() {
 
 func (l *Link) end(code, reason string) { l.endWithData(code, reason, nil) }
 
+// tombstone keeps an ended link's unsent output for a returning client.
+type tombstone struct {
+	code, reason string
+	data         json.RawMessage
+}
+
+func (t *tombstone) frame() wire.Frame {
+	return wire.Frame{T: wire.TError, Code: t.code, Message: t.reason, Data: t.data}
+}
+
+// finalizeIfDelivered forgets an ended link once its client has everything.
+func (l *Link) finalizeIfDelivered() {
+	if !l.ep.Attached() && l.ep.OutboxBytes() == 0 {
+		l.finalize()
+	}
+}
+
+// TombstoneFor is how long an ended link keeps output its client has not received.
+const TombstoneFor = 10 * time.Minute
+
+// finalize drops what an ended link still holds and forgets it.
+func (l *Link) finalize() {
+	l.mu.Lock()
+	if l.finalized {
+		l.mu.Unlock()
+		return
+	}
+	l.finalized = true
+	l.mu.Unlock()
+	l.ep.SetDiscard(true)
+	l.ep.Close()
+	l.srv.mu.Lock()
+	delete(l.srv.links, l.id)
+	l.srv.mu.Unlock()
+	l.srv.recordPIDs()
+}
+
 // endWithData settles the agent and closes the link (design 3.2).
 func (l *Link) endWithData(code, reason string, data json.RawMessage) {
 	l.endOnce.Do(func() {
 		l.mu.Lock()
-		wasAttached := l.state == StateAttached
 		l.state, l.stateSince = StateEnded, time.Now()
 		var open []string
 		for id := range l.sessions {
@@ -705,34 +775,54 @@ func (l *Link) endWithData(code, reason string, data json.RawMessage) {
 		l.logf("link ended", "reason", reason)
 		l.srv.audit.event("link_ended", map[string]any{"link": l.id[:8], "code": code, "reason": reason})
 
-		if wasAttached {
-			l.ep.SendControl(wire.Frame{T: wire.TError, Code: code, Message: reason, Data: data})
-		}
 		select {
 		case <-l.proc.Done():
 		default:
-			l.settlePending()
-			l.cancelRunningTurns()
-			if canClose {
-				for _, id := range open {
-					l.serverRequest("session/close", map[string]any{"sessionId": id})
+			// Writes to a wedged agent can block, so they get a deadline; Stop always runs.
+			settled := make(chan struct{})
+			go func() {
+				defer close(settled)
+				l.settlePending()
+				l.cancelRunningTurns()
+				if canClose {
+					for _, id := range open {
+						l.serverRequest("session/close", map[string]any{"sessionId": id})
+					}
+					ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+					l.waitServerReqs(ctx)
+					cancel()
 				}
-				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-				l.waitServerReqs(ctx)
-				cancel()
+			}()
+			select {
+			case <-settled:
+			case <-time.After(3 * time.Second):
+				l.logf("agent did not take the settle messages in time, stopping it")
 			}
 			l.proc.Stop(2 * time.Second)
 		}
-		time.AfterFunc(2*time.Second, func() { l.ep.Detach(wire.CloseLinkEnded, reason) })
-		l.ep.SetDiscard(true)
-		time.AfterFunc(3*time.Second, l.ep.Close)
+
+		// Let the agent's last output reach the client before the error frame,
+		// which the endpoint sends only after everything queued is on the wire.
+		select {
+		case <-l.drained:
+		case <-time.After(2 * time.Second):
+		}
 		for _, id := range open {
 			l.srv.releaseSession(l.agent.ID, id, l)
 		}
-		l.srv.mu.Lock()
-		delete(l.srv.links, l.id)
-		l.srv.mu.Unlock()
-		l.srv.recordPIDs()
+		// The error frame goes out on whatever socket is attached now or later,
+		// after every queued message, so a client that is reconnecting still gets
+		// its output and then the reason (design 3.1).
+		tomb := &tombstone{code: code, reason: reason, data: data}
+		l.mu.Lock()
+		l.tomb = tomb
+		l.mu.Unlock()
+		if l.ep.Attached() || l.ep.OutboxBytes() > 0 {
+			l.ep.SendControl(tomb.frame())
+			time.AfterFunc(TombstoneFor, l.finalize)
+		} else {
+			l.finalize()
+		}
 		close(l.ended)
 	})
 }

@@ -310,6 +310,7 @@ type dropProxy struct {
 	mu     sync.Mutex
 	conns  []net.Conn
 	frozen []*atomic.Bool
+	paused atomic.Bool
 }
 
 func newDropProxy(t *testing.T, target string) *dropProxy {
@@ -323,6 +324,10 @@ func newDropProxy(t *testing.T, target string) *dropProxy {
 			c, err := ln.Accept()
 			if err != nil {
 				return
+			}
+			if p.paused.Load() {
+				c.Close()
+				continue
 			}
 			up, err := net.Dial("tcp", target)
 			if err != nil {
@@ -386,3 +391,7 @@ func (e *env) auditHas(event string) bool {
 	data, _ := os.ReadFile(filepath.Join(e.cfg.LogDir, "audit.jsonl"))
 	return strings.Contains(string(data), `"event":"`+event+`"`)
 }
+
+// pause refuses new connections (the server looks unreachable) until resume.
+func (p *dropProxy) pause()  { p.paused.Store(true) }
+func (p *dropProxy) resume() { p.paused.Store(false) }

@@ -54,18 +54,26 @@ func Start(spec Spec) (*Process, error) {
 	if err != nil {
 		return nil, err
 	}
-	stdout, err := cmd.StdoutPipe()
+	// Our own pipe, not cmd.StdoutPipe: Wait closes that one as soon as the
+	// process exits, which would drop output the agent wrote just before.
+	stdout, stdoutW, err := os.Pipe()
 	if err != nil {
 		return nil, err
 	}
+	cmd.Stdout = stdoutW
 	p := &Process{cmd: cmd, Stdin: stdin, Stdout: stdout, stderr: &tail{max: StderrTail}, done: make(chan struct{})}
 	cmd.Stderr = p.stderr
 	if err := cmd.Start(); err != nil {
+		stdout.Close()
+		stdoutW.Close()
 		return nil, err
 	}
+	stdoutW.Close() // the child has its copy; EOF comes when it (and its children) close theirs
 	go func() {
 		p.err = cmd.Wait()
 		close(p.done)
+		// A child the agent left behind may hold stdout open; stop reading soon after exit.
+		time.AfterFunc(2*time.Second, func() { _ = stdout.Close() })
 	}()
 	return p, nil
 }

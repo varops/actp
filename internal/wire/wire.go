@@ -169,6 +169,8 @@ type Endpoint struct {
 	lastSent  time.Time
 	wake      chan struct{}
 	closeConn func(websocket.StatusCode, string)
+	serveDone chan struct{}
+	deliverMu sync.Mutex
 }
 
 // NewEndpoint creates an endpoint. deliver is called once per peer message, in
@@ -276,12 +278,19 @@ func (e *Endpoint) Serve(ctx context.Context, conn *websocket.Conn, peerLastSeq 
 		})
 	}
 
+	// Only one socket at a time: close the old one and wait until its Serve has
+	// fully returned, so it cannot deliver a message the new socket delivers again.
 	e.mu.Lock()
-	if old := e.closeConn; old != nil {
+	for e.closeConn != nil {
+		old, oldDone := e.closeConn, e.serveDone
 		e.mu.Unlock()
 		old(CloseReplaced, "replaced")
+		<-oldDone
 		e.mu.Lock()
 	}
+	myDone := make(chan struct{})
+	defer close(myDone)
+	e.serveDone = myDone
 	e.conn = conn
 	e.closeConn = closeFn
 	e.ackPeer(peerLastSeq)
@@ -363,22 +372,29 @@ func (e *Endpoint) readLoop(ctx context.Context, conn *websocket.Conn, closeFn f
 		switch f.T {
 		case TMsg:
 			e.handleAck(f.Ack)
+			// deliverMu makes check, deliver and update one step, so a message is
+			// never delivered twice or out of order, whichever socket it came on.
+			e.deliverMu.Lock()
 			e.mu.Lock()
 			last := e.lastRecv
 			e.mu.Unlock()
 			if f.Seq <= last {
+				e.deliverMu.Unlock()
 				continue
 			}
 			if f.Seq != last+1 {
+				e.deliverMu.Unlock()
 				e.sendNow(ctx, conn, Frame{T: TError, Code: ErrSequenceGap, Message: fmt.Sprintf("expected %d, got %d", last+1, f.Seq)})
 				closeFn(CloseProtocolError, "sequence gap")
 				return &RemoteError{Code: ErrSequenceGap, Message: "sequence gap"}
 			}
 			if err := e.deliver(f.Msg); err != nil {
+				e.deliverMu.Unlock()
 				return err
 			}
 			e.mu.Lock()
 			e.lastRecv = f.Seq
+			e.deliverMu.Unlock()
 			if e.lastRecv-e.ackSent >= e.opts.AckEvery {
 				e.ackDue = time.Now()
 			} else if e.ackDue.IsZero() {
@@ -436,6 +452,9 @@ func (e *Endpoint) load(it outItem) (json.RawMessage, error) {
 	if it.raw != nil {
 		return it.raw, nil
 	}
+	if e.spool == nil {
+		return nil, errors.New("spool file is gone")
+	}
 	buf := make([]byte, it.size)
 	if _, err := e.spool.ReadAt(buf, it.off); err != nil {
 		return nil, fmt.Errorf("reading spool: %w", err)
@@ -449,6 +468,74 @@ func (e *Endpoint) resetSpool() {
 		_ = e.spool.Truncate(0)
 		e.spoolEnd = 0
 	}
+}
+
+// compactMin is the amount of acked data in the spool that triggers compaction.
+var compactMin int64 = 64 << 20
+
+// maybeCompactSpool rewrites the spool without acked data once that data is
+// most of the file, so a long stream to a slow reader does not grow it forever.
+// The caller holds mu.
+func (e *Endpoint) maybeCompactSpool() {
+	if e.spool == nil {
+		return
+	}
+	var live int64
+	for _, it := range e.outbox {
+		if it.raw == nil {
+			live += it.size
+		}
+	}
+	dead := e.spoolEnd - live
+	if dead < compactMin || dead < e.spoolEnd/2 {
+		return
+	}
+	tmpPath := e.opts.SpoolPath + ".tmp"
+	tmp, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
+	if err != nil {
+		e.spoolErr = err
+		return
+	}
+	var off int64
+	moved := make([]int64, len(e.outbox))
+	for i, it := range e.outbox {
+		if it.raw != nil {
+			continue
+		}
+		buf, err := e.load(it)
+		if err == nil {
+			_, err = tmp.WriteAt(buf, off)
+		}
+		if err != nil {
+			tmp.Close()
+			_ = os.Remove(tmpPath)
+			e.spoolErr = err
+			return
+		}
+		moved[i] = off
+		off += it.size
+	}
+	// Windows cannot rename open files, so close both, rename, and reopen.
+	_ = e.spool.Close()
+	_ = tmp.Close()
+	if err := os.Rename(tmpPath, e.opts.SpoolPath); err != nil {
+		_ = os.Remove(tmpPath)
+		e.spoolErr = err
+		e.spool, _ = os.OpenFile(e.opts.SpoolPath, os.O_RDWR, 0o600)
+		return
+	}
+	tmp, err = os.OpenFile(e.opts.SpoolPath, os.O_RDWR, 0o600)
+	if err != nil {
+		e.spoolErr = err
+		e.spool = nil
+		return
+	}
+	for i := range e.outbox {
+		if e.outbox[i].raw == nil {
+			e.outbox[i].off = moved[i]
+		}
+	}
+	e.spool, e.spoolEnd = tmp, off
 }
 
 // SpoolError reports a failure to use the spool file, if any.
@@ -490,6 +577,8 @@ func (e *Endpoint) ackPeer(a int64) bool {
 	e.outbox = append(e.outbox[:0:0], e.outbox[n:]...)
 	if len(e.outbox) == 0 {
 		e.resetSpool()
+	} else {
+		e.maybeCompactSpool()
 	}
 	if e.sentSeq < a {
 		e.sentSeq = a
@@ -546,16 +635,13 @@ func (e *Endpoint) collect() (frames []Frame, dead bool, closeAfter websocket.St
 	if now.Sub(e.lastHeard) > e.opts.DeadAfter {
 		return nil, true, 0
 	}
-	// Errors go out at once. A bye waits until every queued message is on the wire,
-	// so a last session/cancel is not lost behind it.
+	// A bye or a link-ending error waits until every queued message is on the
+	// wire, so nothing the peer still needs is overtaken by it.
 	var bye []Frame
 	for _, c := range e.control {
 		switch c.T {
-		case TBye:
+		case TBye, TError:
 			bye = append(bye, c)
-		case TError:
-			frames = append(frames, c)
-			closeAfter = CloseLinkEnded
 		default:
 			frames = append(frames, c)
 		}
@@ -596,9 +682,14 @@ func (e *Endpoint) collect() (frames []Frame, dead bool, closeAfter websocket.St
 		}
 	}
 	if len(e.control) > 0 && closeAfter == 0 && e.sentSeq >= e.nextSeq {
+		closeAfter = websocket.StatusNormalClosure
+		for _, c := range e.control {
+			if c.T == TError {
+				closeAfter = CloseLinkEnded
+			}
+		}
 		frames = append(frames, e.control...)
 		e.control = nil
-		closeAfter = websocket.StatusNormalClosure
 	}
 	ackOwed := e.lastRecv > e.ackSent && !e.ackDue.IsZero() && !now.Before(e.ackDue)
 	heartbeat := now.Sub(e.lastSent) >= e.opts.HeartbeatEvery

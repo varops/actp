@@ -428,3 +428,61 @@ func TestReloadRevokesTokens(t *testing.T) {
 		t.Fatalf("bridge after revoke: %v", err)
 	}
 }
+
+func TestLastOutputArrivesBeforeTheAgentExitError(t *testing.T) {
+	e := newEnv(t)
+	c := e.bridge()
+	c.initialize()
+	sid := c.newSession("actp://site")
+	id := c.prompt(sid, "burst-crash 300")
+	r := c.response(id)
+	if r.Error == nil || !strings.Contains(r.Error.Message, "remote session lost") {
+		t.Fatalf("got %s", r.Raw)
+	}
+	c.chunk("burst 300") // nothing the agent wrote before exiting is lost
+}
+
+func TestByeIsSentWhenTheClientLeavesDuringAReconnect(t *testing.T) {
+	e := newEnv(t, func(s *config.Server) { s.PromptTimeout = config.Duration(time.Hour) })
+	c := e.bridge()
+	c.initialize()
+	sid := c.newSession("actp://site")
+	c.prompt(sid, "permission")
+	c.waitMsg("permission request", func(m *jsonrpc.Message) bool { return m.Method == "session/request_permission" })
+	e.proxy.pause()
+	e.proxy.drop()
+	waitUntil(t, "link detached", func() bool {
+		l := e.srv.Links()
+		return len(l) == 1 && l[0].State == server.StateDetached
+	})
+	c.closeStdin()
+	time.Sleep(300 * time.Millisecond)
+	e.proxy.resume()
+	if err := c.wait(); err != nil {
+		t.Fatalf("bridge exit: %v", err)
+	}
+	// The bye got through: the waiting prompt is cancelled and the link ends,
+	// long before the one-hour prompt_timeout.
+	waitNoLinks(t, e.srv)
+	if !e.auditHas("link_unattended") {
+		t.Fatal("link never became unattended")
+	}
+}
+
+func TestAgentExitWhileAwayStillDeliversItsOutput(t *testing.T) {
+	e := newEnv(t)
+	c := e.bridge()
+	c.initialize()
+	sid := c.newSession("actp://site")
+	id := c.prompt(sid, "late-burst-crash 100")
+	c.chunk("starting")
+	e.proxy.freeze() // the client goes quiet; the agent bursts and exits meanwhile
+	r := c.response(id)
+	if r.Error == nil || !strings.Contains(r.Error.Message, "exited with code 4") {
+		t.Fatalf("got %s", r.Raw)
+	}
+	c.chunk("burst 100")
+	if !e.auditHas("link_resumed") {
+		t.Fatal("the bridge never came back for the output")
+	}
+}

@@ -228,7 +228,7 @@ A link is in one of three states:
 
 When a detached link is closed:
 
-- **Nothing running and nothing waiting** for `idle_close` (default 10 min) → the server closes the link (3.2). Nothing is lost: the session is in the agent's own store and the client can load it again. Closing early matters, because every open link holds an agent process and counts against `max_links`.
+- **Nothing running and nothing waiting** for `idle_close` (default 10 min, counted from when the link became idle, not from the drop) → the server closes the link (3.2). Nothing is lost: the session is in the agent's own store and the client can load it again. Closing early matters, because every open link holds an agent process and counts against `max_links`.
 - **A turn waiting on the client** (permission prompt, question) for `prompt_timeout` (default 24 h) → the prompt gets `cancelled` and the link closes.
 - **A turn running** → never closed for being detached.
 - Also when the spool is full, the agent exits, or an admin ends it.
@@ -243,6 +243,8 @@ A client closes the bridge's stdin both when the user stops an agent and when th
 - A turn may run unattended for at most `max_unattended` (default 1 h). Then the server cancels it. An agent nobody is watching does not run forever.
 - When the turn ends, the server closes the sessions and stops the agent (3.2). The work is saved in the agent's own session store.
 - The tray lists unattended links with an "End" button.
+- If the client quits while the bridge is reconnecting, the bridge still tries to say goodbye for a few seconds.
+- If the agent exits while the client is away, the link keeps the output the client has not received for 10 minutes. A returning bridge gets all of it, then the reason the link ended.
 - If the bridge is killed hard and cannot say goodbye, the link is only detached. The rules above for detached links then apply, and "Getting a session back" covers the rest.
 
 To stop work for certain, the client sends ACP `session/cancel` (stops the turn) or `session/close` (ends the session) before it goes. These pass through as usual.
