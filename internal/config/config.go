@@ -21,7 +21,9 @@ type Config struct {
 	Version int      `yaml:"version"`
 	Server  *Server  `yaml:"server"`
 	Remotes []Remote `yaml:"remotes"`
-	path    string
+	// RemotesFile holds remotes saved by `actp remote`, apart from this hand-edited file.
+	RemotesFile string `yaml:"remotes_file"`
+	path        string
 }
 
 type Server struct {
@@ -147,7 +149,10 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) && !explicit {
 			cfg := &Config{Version: CurrentVersion, path: path}
-			return cfg, cfg.finish()
+			if err := cfg.finish(); err != nil {
+				return nil, err
+			}
+			return cfg, cfg.loadRemotesFile()
 		}
 		return nil, err
 	}
@@ -157,6 +162,9 @@ func Load(path string) (*Config, error) {
 	}
 	cfg.path = path
 	if err := cfg.loadTokensFile(); err != nil {
+		return nil, err
+	}
+	if err := cfg.loadRemotesFile(); err != nil {
 		return nil, err
 	}
 	if err := cfg.Validate(); err != nil {
@@ -181,6 +189,10 @@ func Parse(data []byte) (*Config, error) {
 }
 
 func (c *Config) finish() error {
+	if c.RemotesFile == "" {
+		c.RemotesFile = filepath.Join(Dir(), "remotes.yaml")
+	}
+	c.RemotesFile = ExpandHome(c.RemotesFile)
 	if c.Server == nil {
 		return nil
 	}

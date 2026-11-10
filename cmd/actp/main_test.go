@@ -76,3 +76,38 @@ func TestCheckListen(t *testing.T) {
 		t.Error("insecure_listen ignored")
 	}
 }
+
+func TestRemoteAddListRemove(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "actp.yaml")
+	if err := os.WriteFile(cfgPath, []byte("remotes_file: "+filepath.Join(dir, "remotes.yaml")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"remote", "add", "box", "https://box.example.com/", "--config", cfgPath, "--token-env", "BOX_TOKEN"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"remote", "add", "box", "https://other", "--config", cfgPath}); err == nil {
+		t.Fatal("duplicate accepted")
+	}
+	if err := run([]string{"remote", "add", "bad", "ftp://x", "--config", cfgPath}); err == nil {
+		t.Fatal("bad URL accepted")
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := cfg.Remote("box")
+	if r == nil || r.URL != "https://box.example.com" || r.TokenEnv != "BOX_TOKEN" {
+		t.Fatalf("remote: %+v", r)
+	}
+	if got, _ := resolveServer(cfg, "box"); got != "https://box.example.com" {
+		t.Fatalf("resolve: %s", got)
+	}
+	if err := run([]string{"remote", "remove", "box", "--config", cfgPath}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ = config.Load(cfgPath)
+	if cfg.Remote("box") != nil {
+		t.Fatal("not removed")
+	}
+}

@@ -27,6 +27,9 @@ Usage:
   actp token create --name NAME [--agents a,b] [--workspaces w,x] [--default-workspace w]
   actp token list
   actp token revoke NAME
+  actp remote add NAME URL [--token-stdin | --token-env NAME | --token-file PATH]
+  actp remote list
+  actp remote remove NAME
   actp agents <server> [--token-env NAME | --token-file PATH]
   actp doctor [--config FILE]
   actp version
@@ -61,6 +64,8 @@ func run(args []string) error {
 		return cmdToken(rest)
 	case "agents":
 		return cmdAgents(rest)
+	case "remote":
+		return cmdRemote(rest)
 	case "doctor":
 		return cmdDoctor(rest)
 	case "version", "--version", "-v":
