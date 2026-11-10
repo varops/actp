@@ -20,7 +20,7 @@ func (s *Server) recordPIDs() {
 		pids = append(pids, l.proc.PID())
 	}
 	s.mu.Unlock()
-	if err := os.MkdirAll(s.cfg.StateDir, 0o700); err != nil {
+	if err := os.MkdirAll(s.conf().StateDir, 0o700); err != nil {
 		return
 	}
 	data, _ := json.Marshal(map[string]any{"serverPid": os.Getpid(), "agentPids": pids})
@@ -30,7 +30,7 @@ func (s *Server) recordPIDs() {
 	}
 }
 
-func (s *Server) spoolDir() string { return filepath.Join(s.cfg.StateDir, "spool") }
+func (s *Server) spoolDir() string { return filepath.Join(s.conf().StateDir, "spool") }
 
 // cleanupLeftovers stops agents left running by a server that crashed, and
 // deletes spool files, which can hold code and secrets.

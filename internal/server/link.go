@@ -88,10 +88,10 @@ func newID() string {
 // startLink starts an agent process for a new link.
 func (s *Server) startLink(agent *config.Agent, tok *config.Token, clientName string) (*Link, error) {
 	dir := homeDir()
-	if ws := s.cfg.Workspace(tok.DefaultWorkspace); ws != nil {
+	if ws := s.conf().Workspace(tok.DefaultWorkspace); ws != nil {
 		dir = ws.Path
-	} else if names := tok.AllowedWorkspaces(s.cfg); len(names) > 0 {
-		if ws := s.cfg.Workspace(names[0]); ws != nil {
+	} else if names := tok.AllowedWorkspaces(s.conf()); len(names) > 0 {
+		if ws := s.conf().Workspace(names[0]); ws != nil {
 			dir = ws.Path
 		}
 	}
@@ -255,7 +255,7 @@ func (l *Link) rewriteClientRequest(m *jsonrpc.Message) (*jsonrpc.Message, *json
 		var cwd string
 		_ = json.Unmarshal(p["cwd"], &cwd)
 		if cwd != "" || m.Method != "session/list" {
-			resolved, err := resolveCwd(l.srv.cfg, &l.token, cwd)
+			resolved, err := resolveCwd(l.srv.conf(), &l.token, cwd)
 			if err != nil {
 				l.srv.audit.event("cwd_rejected", map[string]any{"link": l.id[:8], "cwd": cwd})
 				return nil, jsonrpc.NewError(m.ID, jsonrpc.CodeInvalidParams, err.Error(), nil)
@@ -658,7 +658,7 @@ func (l *Link) supervise() {
 		}
 		cancelSent := l.cancelSent
 		l.mu.Unlock()
-		cfg := l.srv.cfg
+		cfg := l.srv.conf()
 		switch state {
 		case StateDetached:
 			switch {

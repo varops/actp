@@ -186,7 +186,7 @@ func TestResumeAfterDropLosesNothing(t *testing.T) {
 	sid := c.newSession("actp://site")
 	id := c.prompt(sid, "slow 20")
 	c.chunk("chunk 3")
-	e.http.CloseClientConnections() // drop every TCP connection mid-turn
+	e.proxy.drop() // drop every TCP connection mid-turn
 	r := c.response(id)
 	if stopReason(r) != "end_turn" {
 		t.Fatalf("stop: %s", r.Raw)
@@ -212,6 +212,26 @@ func TestResumeAfterDropLosesNothing(t *testing.T) {
 	}
 	if len(got) != 20 {
 		t.Fatalf("got %d chunks: %v", len(got), got)
+	}
+	if !e.auditHas("link_resumed") {
+		t.Fatal("the connection was never resumed: the drop did not happen")
+	}
+}
+
+func TestSilentDropIsDetectedAndResumed(t *testing.T) {
+	e := newEnv(t)
+	c := e.bridge()
+	c.initialize()
+	sid := c.newSession("actp://site")
+	id := c.prompt(sid, "slow 20")
+	c.chunk("chunk 2")
+	e.proxy.freeze() // no FIN, no RST: only heartbeats can tell
+	if r := c.response(id); stopReason(r) != "end_turn" {
+		t.Fatalf("stop: %s", r.Raw)
+	}
+	c.chunk("chunk 20")
+	if !e.auditHas("link_resumed") {
+		t.Fatal("silent drop was not detected")
 	}
 }
 
@@ -377,5 +397,34 @@ func TestProbe(t *testing.T) {
 	e.cfg.Agents[0].Command = "/nonexistent/agent"
 	if status, _ := e.srv.Probe(&e.cfg.Agents[0]); status != "unavailable" {
 		t.Fatalf("missing agent probed as %s", status)
+	}
+}
+
+func TestReloadRevokesTokens(t *testing.T) {
+	e := newEnv(t)
+	c := e.bridge()
+	c.initialize()
+	sid := c.newSession("actp://site")
+
+	next := *e.cfg
+	next.Tokens = nil
+	e.srv.Reload(&next)
+
+	req, _ := http.NewRequest("GET", e.http.URL+"/api/v1/info", nil)
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("revoked token got %d", resp.StatusCode)
+	}
+	// The open link keeps working until it drops; then it cannot come back.
+	c.response(c.prompt(sid, "echo still here"))
+	e.proxy.drop()
+	var lost *bridge.LostError
+	if err := c.wait(); !errors.As(err, &lost) {
+		t.Fatalf("bridge after revoke: %v", err)
 	}
 }

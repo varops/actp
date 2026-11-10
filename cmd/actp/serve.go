@@ -63,18 +63,44 @@ func cmdServe(args []string) error {
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-	select {
-	case err := <-errs:
-		if !errors.Is(err, http.ErrServerClosed) {
-			return err
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+loop:
+	for {
+		select {
+		case err := <-errs:
+			if !errors.Is(err, http.ErrServerClosed) {
+				return err
+			}
+			break loop
+		case <-hup:
+			reloadConfig(log, srv, cfg.Path(), sc)
+		case s := <-sig:
+			log.Info("stopping: waiting up to 30 s for running turns", "signal", s.String())
+			break loop
 		}
-	case s := <-sig:
-		log.Info("stopping: waiting up to 30 s for running turns", "signal", s.String())
 	}
 	srv.Close(30 * time.Second)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return httpSrv.Shutdown(ctx)
+}
+
+// reloadConfig applies a changed config file. Listen address and TLS need a restart.
+func reloadConfig(log *slog.Logger, srv *server.Server, path string, running *config.Server) {
+	cfg, err := config.Load(path)
+	if err != nil {
+		log.Error("config reload failed, keeping the old config", "error", err)
+		return
+	}
+	if cfg.Server == nil {
+		log.Error("config reload failed: no server section, keeping the old config")
+		return
+	}
+	if cfg.Server.Listen != running.Listen || cfg.Server.TLSCert != running.TLSCert {
+		log.Warn("listen and TLS changes need a restart; other changes apply now")
+	}
+	srv.Reload(cfg.Server)
 }
 
 // checkListen refuses plain HTTP on a public address unless told it sits behind a TLS proxy.

@@ -21,10 +21,10 @@ func (s *Server) GetInfo(w http.ResponseWriter, r *http.Request) {
 	info := api.Info{
 		Version:              s.opts.Version,
 		WireVersions:         wire.Versions,
-		PromptTimeoutSeconds: int(s.cfg.PromptTimeout.D().Seconds()),
+		PromptTimeoutSeconds: int(s.conf().PromptTimeout.D().Seconds()),
 	}
-	if s.cfg.Name != "" {
-		info.Name = &s.cfg.Name
+	if s.conf().Name != "" {
+		info.Name = &s.conf().Name
 	}
 	writeJSON(w, http.StatusOK, info)
 }
@@ -32,9 +32,9 @@ func (s *Server) GetInfo(w http.ResponseWriter, r *http.Request) {
 func (s *Server) ListAgents(w http.ResponseWriter, r *http.Request) {
 	tok := tokenFrom(r.Context())
 	out := api.AgentList{Agents: []api.Agent{}}
-	workspaces := tok.AllowedWorkspaces(s.cfg)
-	for i := range s.cfg.Agents {
-		a := &s.cfg.Agents[i]
+	workspaces := tok.AllowedWorkspaces(s.conf())
+	for i := range s.conf().Agents {
+		a := &s.conf().Agents[i]
 		if !tok.AllowsAgent(a.ID) {
 			continue
 		}
@@ -75,7 +75,7 @@ func (s *Server) ListAgents(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) OpenLink(w http.ResponseWriter, r *http.Request, agentID api.AgentId, params api.OpenLinkParams) {
 	tok := tokenFrom(r.Context())
-	agent := s.cfg.Agent(agentID)
+	agent := s.conf().Agent(agentID)
 	if agent == nil {
 		writeError(w, http.StatusNotFound, "unknown_agent", "no agent named "+agentID)
 		return
@@ -130,7 +130,7 @@ func (s *Server) OpenLink(w http.ResponseWriter, r *http.Request, agentID api.Ag
 
 	w.Header().Set(wire.HeaderLinkID, link.id)
 	w.Header().Set(wire.HeaderLastSeq, strconv.FormatInt(link.ep.LastReceived(), 10))
-	w.Header().Set(wire.HeaderPromptTimeout, strconv.Itoa(int(s.cfg.PromptTimeout.D().Seconds())))
+	w.Header().Set(wire.HeaderPromptTimeout, strconv.Itoa(int(s.conf().PromptTimeout.D().Seconds())))
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		Subprotocols:       wire.Versions,
 		InsecureSkipVerify: true, // bridges are not browsers; the token is the check

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/varops/actp/api"
@@ -35,7 +36,7 @@ type Options struct {
 
 // Server holds configuration, links and agent status.
 type Server struct {
-	cfg   *config.Server
+	cfg   atomic.Pointer[config.Server]
 	opts  Options
 	log   *slog.Logger
 	audit *auditLog
@@ -69,7 +70,6 @@ func New(cfg *config.Server, opts Options) (*Server, error) {
 	}
 	ctx, stop := context.WithCancel(context.Background())
 	s := &Server{
-		cfg:      cfg,
 		opts:     opts,
 		log:      opts.Logger,
 		ctx:      ctx,
@@ -78,6 +78,7 @@ func New(cfg *config.Server, opts Options) (*Server, error) {
 		sessions: map[string]*Link{},
 		status:   map[string]*agentStatus{},
 	}
+	s.cfg.Store(cfg)
 	if s.opts.BaseEnv == nil {
 		if cfg.ShellEnv == nil || *cfg.ShellEnv {
 			s.opts.BaseEnv = loginShellEnv(ctx)
@@ -102,6 +103,29 @@ func New(cfg *config.Server, opts Options) (*Server, error) {
 		}
 	}
 	return s, nil
+}
+
+// conf is the current configuration. Links keep the agent settings they started with.
+func (s *Server) conf() *config.Server { return s.cfg.Load() }
+
+// Reload switches to a new configuration. New links and new requests use it;
+// open links keep running with the settings they started with. A revoked token
+// cannot open or resume links any more.
+func (s *Server) Reload(cfg *config.Server) {
+	s.mu.Lock()
+	for _, a := range cfg.Agents {
+		if s.status[a.ID] == nil {
+			s.status[a.ID] = &agentStatus{Status: string(api.Unknown)}
+		}
+	}
+	s.mu.Unlock()
+	s.cfg.Store(cfg)
+	s.log.Info("configuration reloaded", "agents", len(cfg.Agents), "tokens", len(cfg.Tokens))
+	if s.opts.ProbeOnStart {
+		for i := range cfg.Agents {
+			go s.Probe(&cfg.Agents[i])
+		}
+	}
 }
 
 // Handler serves the HTTP API.
@@ -218,7 +242,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		presented, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-		tok := s.cfg.FindToken(strings.TrimSpace(presented))
+		tok := s.conf().FindToken(strings.TrimSpace(presented))
 		if !ok || tok == nil {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="actp"`)
 			writeError(w, http.StatusUnauthorized, "unauthorized", "missing or invalid token")
@@ -240,5 +264,5 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 
 // statePath is where the server records agent process ids, for crash cleanup.
 func (s *Server) statePath() string {
-	return filepath.Join(s.cfg.StateDir, "agents.json")
+	return filepath.Join(s.conf().StateDir, "agents.json")
 }

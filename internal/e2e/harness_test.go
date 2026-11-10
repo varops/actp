@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -14,6 +15,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -50,6 +52,7 @@ var fastWire = wire.Options{HeartbeatEvery: 50 * time.Millisecond, DeadAfter: 40
 
 type env struct {
 	t         *testing.T
+	proxy     *dropProxy
 	cfg       *config.Server
 	srv       *server.Server
 	http      *httptest.Server
@@ -108,7 +111,7 @@ server:
 		t.Fatal(err)
 	}
 	h := httptest.NewServer(srv.Handler())
-	e := &env{t: t, cfg: cfg.Server, srv: srv, http: h, workspace: ws, store: store}
+	e := &env{t: t, cfg: cfg.Server, srv: srv, http: h, workspace: ws, store: store, proxy: newDropProxy(t, h.Listener.Addr().String())}
 	t.Cleanup(func() {
 		h.CloseClientConnections()
 		srv.Close(0)
@@ -137,7 +140,7 @@ func (e *env) bridge(opts ...func(*bridge.Options)) *client {
 	outR, outW := io.Pipe()
 	c := &client{t: e.t, in: inW, out: jsonrpc.NewWriter(inW), done: make(chan error, 1)}
 	c.cond = sync.NewCond(&c.mu)
-	o := bridge.Options{Agent: "test", BaseURL: e.http.URL, Token: testToken, ClientName: "e2e", Wire: fastWire, MaxBackoff: 100 * time.Millisecond, GiveUpAfter: 3 * time.Second}
+	o := bridge.Options{Agent: "test", BaseURL: e.proxy.url(), Token: testToken, ClientName: "e2e", Wire: fastWire, MaxBackoff: 100 * time.Millisecond, GiveUpAfter: 3 * time.Second}
 	for _, f := range opts {
 		f(&o)
 	}
@@ -297,4 +300,89 @@ func waitUntil(t *testing.T, what string, cond func() bool) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+// dropProxy forwards TCP to the server and can cut every connection at once,
+// including upgraded WebSockets, which httptest does not track.
+type dropProxy struct {
+	ln     net.Listener
+	target string
+	mu     sync.Mutex
+	conns  []net.Conn
+	frozen []*atomic.Bool
+}
+
+func newDropProxy(t *testing.T, target string) *dropProxy {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &dropProxy{ln: ln, target: target}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			up, err := net.Dial("tcp", target)
+			if err != nil {
+				c.Close()
+				continue
+			}
+			frozen := &atomic.Bool{}
+			p.mu.Lock()
+			p.conns = append(p.conns, c, up)
+			p.frozen = append(p.frozen, frozen)
+			p.mu.Unlock()
+			go func() { pipe(up, c, frozen); up.Close() }()
+			go func() { pipe(c, up, frozen); c.Close() }()
+		}
+	}()
+	t.Cleanup(func() { ln.Close(); p.drop() })
+	return p
+}
+
+func (p *dropProxy) url() string { return "http://" + p.ln.Addr().String() }
+
+// drop cuts every open connection, like a network failure.
+func (p *dropProxy) drop() {
+	p.mu.Lock()
+	conns := p.conns
+	p.conns = nil
+	p.mu.Unlock()
+	for _, c := range conns {
+		c.Close()
+	}
+}
+
+// freeze makes every open connection silently swallow data, like a laptop
+// going to sleep: nothing is closed, nothing arrives. New connections work.
+func (p *dropProxy) freeze() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, f := range p.frozen {
+		f.Store(true)
+	}
+	p.frozen = nil
+}
+
+func pipe(dst, src net.Conn, frozen *atomic.Bool) {
+	buf := make([]byte, 32<<10)
+	for {
+		n, err := src.Read(buf)
+		if n > 0 && !frozen.Load() {
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// auditHas reports whether the server's audit log mentions an event.
+func (e *env) auditHas(event string) bool {
+	data, _ := os.ReadFile(filepath.Join(e.cfg.LogDir, "audit.jsonl"))
+	return strings.Contains(string(data), `"event":"`+event+`"`)
 }
