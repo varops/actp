@@ -69,6 +69,7 @@ func (d *Dashboard) setupInfo(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	host, _ := os.Hostname()
+	host, _, _ = strings.Cut(host, ".") // m1pro.cable.example.net → m1pro
 	writeJSON(w, http.StatusOK, map[string]any{
 		"agents":     agents,
 		"folder":     folder,

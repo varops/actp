@@ -6,10 +6,12 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/cookiejar"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -243,5 +245,69 @@ func TestSetupAppendsToAnExistingConfig(t *testing.T) {
 	after, _ := os.ReadFile(cfgPath)
 	if string(after) != string(data) {
 		t.Fatal("broken append was not rolled back")
+	}
+}
+
+func TestEditFoldersAgentsAndRevoke(t *testing.T) {
+	keyring.MockInit()
+	d, c, cfgPath := setup(t)
+	base := "http://" + d.addr
+	do(t, c, "GET", d.URL(), "", false)
+	dir := filepath.Dir(cfgPath)
+	site, extra := filepath.Join(dir, "site"), filepath.Join(dir, "Extra Stuff")
+	_ = os.MkdirAll(extra, 0o755)
+
+	body := `{"folders":[` + strconv.Quote(site) + `,` + strconv.Quote(extra) + `]}`
+	if code, out := do(t, c, "PUT", base+"/api/server/folders", body, true); code != 200 {
+		t.Fatalf("folders: %d %s", code, out)
+	}
+	if _, out := do(t, c, "GET", base+"/api/status", "", false); !strings.Contains(out, `"name":"extra-stuff"`) {
+		t.Fatalf("status folders: %s", out)
+	}
+	sc := d.opts.Server().Config()
+	if sc.Workspace("site") == nil || sc.Workspace("extra-stuff") == nil {
+		t.Fatalf("workspaces after edit: %+v", sc.Workspaces)
+	}
+	if code, _ := do(t, c, "PUT", base+"/api/server/folders", `{"folders":["/no/such/dir"]}`, true); code != 400 {
+		t.Fatalf("bad folder: %d", code)
+	}
+
+	if code, out := do(t, c, "PUT", base+"/api/server/agents", `{"presets":["pi"]}`, true); code != 200 {
+		t.Fatalf("agents: %d %s", code, out)
+	}
+	sc = d.opts.Server().Config()
+	if sc.Agent("pi") == nil || sc.Agent("a") == nil { // "a" has no preset and is kept
+		t.Fatalf("agents after edit: %+v", sc.Agents)
+	}
+
+	code, out := do(t, c, "POST", base+"/api/tokens", `{"name":"laptop","agents":["a"],"workspaces":["site"],"defaultWorkspace":"site"}`, true)
+	if code != 200 {
+		t.Fatalf("token: %d %s", code, out)
+	}
+	var tok struct{ Token string }
+	_ = json.Unmarshal([]byte(out), &tok)
+	if _, out := do(t, c, "GET", base+"/api/status", "", false); !strings.Contains(out, `"name":"laptop"`) || !strings.Contains(out, `"revocable":true`) {
+		t.Fatalf("status tokens: %s", out)
+	}
+
+	// The bridge tab lists a remote's agents with the remote's own token.
+	h := httptest.NewServer(d.opts.Server().Handler())
+	defer h.Close()
+	rbody := `{"name":"self","url":"` + h.URL + `","token":"` + tok.Token + `"}`
+	if code, out := do(t, c, "POST", base+"/api/remotes", rbody, true); code != 200 {
+		t.Fatalf("remote: %d %s", code, out)
+	}
+	if code, out := do(t, c, "GET", base+"/api/remotes/self/agents", "", false); code != 200 || !strings.Contains(out, `"id":"a"`) {
+		t.Fatalf("remote agents: %d %s", code, out)
+	}
+
+	if code, out := do(t, c, "DELETE", base+"/api/tokens/laptop", "", true); code != 200 {
+		t.Fatalf("revoke: %d %s", code, out)
+	}
+	if d.opts.Server().Config().FindToken(tok.Token) != nil {
+		t.Fatal("revoked token still accepted")
+	}
+	if code, out := do(t, c, "GET", base+"/api/remotes/self/agents", "", false); code != 502 || !strings.Contains(out, "did not accept this token") {
+		t.Fatalf("remote agents after revoke: %d %s", code, out)
 	}
 }

@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -103,6 +104,10 @@ func (d *Dashboard) Handler() http.Handler {
 	mux.HandleFunc("POST /api/autostart", d.setAutostart)
 	mux.HandleFunc("POST /api/cloudflared", d.installCloudflared)
 	mux.HandleFunc("GET /api/setup", d.setupInfo)
+	mux.HandleFunc("PUT /api/server/folders", d.setFolders)
+	mux.HandleFunc("PUT /api/server/agents", d.setAgents)
+	mux.HandleFunc("DELETE /api/tokens/{name}", d.revokeToken)
+	mux.HandleFunc("GET /api/remotes/{name}/agents", d.remoteAgents)
 	mux.HandleFunc("POST /api/setup", d.setup)
 	return d.guard(mux)
 }
@@ -164,6 +169,8 @@ type statusResponse struct {
 	Server     *serverStatus `json:"server,omitempty"`
 	Remotes    []remoteView  `json:"remotes"`
 	Autostart  bool          `json:"autostart"`
+	// ActpPath is this actp binary, for agent commands a client can paste.
+	ActpPath string `json:"actpPath"`
 }
 
 type serverStatus struct {
@@ -175,8 +182,17 @@ type serverStatus struct {
 	Cloudflared string              `json:"cloudflared"`
 	Agents      []server.AgentState `json:"agents"`
 	Links       []linkView          `json:"links"`
-	Tokens      []string            `json:"tokens"`
+	Tokens      []tokenView         `json:"tokens"`
 	Workspaces  []string            `json:"workspaces"`
+	Folders     []config.Workspace  `json:"folders"`
+	Presets     []string            `json:"presets"`
+}
+
+type tokenView struct {
+	Name       string   `json:"name"`
+	Agents     []string `json:"agents"`
+	Workspaces []string `json:"workspaces"`
+	Revocable  bool     `json:"revocable"`
 }
 
 type linkView struct {
@@ -200,7 +216,7 @@ func (d *Dashboard) status(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	resp := statusResponse{Version: d.opts.Version, ConfigPath: cfg.Path(), Remotes: []remoteView{}, Autostart: autostart.Enabled()}
+	resp := statusResponse{Version: d.opts.Version, ConfigPath: cfg.Path(), Remotes: []remoteView{}, Autostart: autostart.Enabled(), ActpPath: actpPath()}
 	for _, r := range cfg.Remotes {
 		resp.Remotes = append(resp.Remotes, remoteView{Name: r.Name, URL: r.URL})
 	}
@@ -216,11 +232,24 @@ func (d *Dashboard) status(w http.ResponseWriter, r *http.Request) {
 		for _, l := range srv.Links() {
 			st.Links = append(st.Links, linkView{ID: l.ID, Agent: l.Agent, Token: l.Token, ClientName: l.ClientName, State: l.State, Since: l.Since.UTC().Format("2006-01-02T15:04:05Z"), Running: l.Running})
 		}
+		inFile := map[string]bool{}
+		if tf, err := config.ReadTokensFile(sc.TokensFile); err == nil {
+			for _, t := range tf.Tokens {
+				inFile[t.Name] = true
+			}
+		}
+		st.Tokens = []tokenView{}
 		for _, t := range sc.Tokens {
-			st.Tokens = append(st.Tokens, t.Name)
+			st.Tokens = append(st.Tokens, tokenView{Name: t.Name, Agents: t.Agents, Workspaces: t.Workspaces, Revocable: inFile[t.Name]})
 		}
 		for _, ws := range sc.Workspaces {
 			st.Workspaces = append(st.Workspaces, ws.Name)
+			st.Folders = append(st.Folders, config.Workspace{Name: ws.Name, Path: ws.Path})
+		}
+		for _, a := range sc.Agents {
+			if a.Preset != "" {
+				st.Presets = append(st.Presets, a.Preset)
+			}
 		}
 		resp.Server = st
 	}
@@ -461,4 +490,15 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeErr(w http.ResponseWriter, status int, err error) {
 	writeJSON(w, status, map[string]string{"error": err.Error()})
+}
+
+func actpPath() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return "actp"
+	}
+	if real, err := filepath.EvalSymlinks(exe); err == nil {
+		return real
+	}
+	return exe
 }

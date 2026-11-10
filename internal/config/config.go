@@ -77,8 +77,8 @@ func (m *TunnelMode) UnmarshalYAML(unmarshal func(any) error) error {
 }
 
 type Workspace struct {
-	Name string `yaml:"name"`
-	Path string `yaml:"path"`
+	Name string `yaml:"name" json:"name"`
+	Path string `yaml:"path" json:"path"`
 }
 
 type Agent struct {
