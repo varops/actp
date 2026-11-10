@@ -14,6 +14,12 @@ import (
 func TestMain(m *testing.M) {
 	switch os.Getenv("FAKE_CLOUDFLARED") {
 	case "quick":
+		// actp must point cloudflared at its own empty config, never the user's.
+		cfg := argAfter("--config")
+		if data, err := os.ReadFile(cfg); err != nil || !strings.Contains(string(data), "{}") || strings.Contains(cfg, ".cloudflared") {
+			fmt.Fprintln(os.Stderr, "ERR bad --config", cfg)
+			os.Exit(5)
+		}
 		fmt.Fprintln(os.Stderr, "INF Requesting new quick Tunnel on trycloudflare.com...")
 		fmt.Fprintln(os.Stderr, "INF |  https://brave-fox-test.trycloudflare.com  |")
 		if os.Getenv("FAKE_EXIT") == "1" {
@@ -37,7 +43,7 @@ func TestQuickTunnelReportsURL(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	got := make(chan string, 1)
 	tun, err := Start(ctx, Options{
-		Mode: "quick", Target: "http://127.0.0.1:1", Binary: os.Args[0],
+		Mode: "quick", Target: "http://127.0.0.1:1", Binary: os.Args[0], ConfigFile: t.TempDir() + "/cf.yml",
 		Env:   append(os.Environ(), "FAKE_CLOUDFLARED=quick"),
 		OnURL: func(u string) { got <- u },
 	})
@@ -65,7 +71,7 @@ func TestTunnelRestartsAfterExit(t *testing.T) {
 	defer cancel()
 	var urls atomic.Int32
 	_, err := Start(ctx, Options{
-		Mode: "quick", Target: "http://127.0.0.1:1", Binary: os.Args[0], MaxBackoff: 50 * time.Millisecond,
+		Mode: "quick", Target: "http://127.0.0.1:1", Binary: os.Args[0], MaxBackoff: 50 * time.Millisecond, ConfigFile: t.TempDir() + "/cf.yml",
 		Env:   append(os.Environ(), "FAKE_CLOUDFLARED=quick", "FAKE_EXIT=1"),
 		OnURL: func(string) { urls.Add(1) },
 	})
@@ -86,7 +92,7 @@ func TestTunnelRestartsAfterExit(t *testing.T) {
 func TestNamedTunnelTokenStaysOffTheCommandLine(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	tun, err := Start(ctx, Options{
-		Mode: "named", Token: "secret-token", Binary: os.Args[0],
+		Mode: "named", Token: "secret-token", Binary: os.Args[0], ConfigFile: t.TempDir() + "/cf.yml",
 		Env: append(os.Environ(), "FAKE_CLOUDFLARED=named"),
 	})
 	if err != nil {
@@ -100,7 +106,16 @@ func TestNamedTunnelTokenStaysOffTheCommandLine(t *testing.T) {
 			t.Fatal("token on the command line")
 		}
 	}
-	if _, err := Start(context.Background(), Options{Mode: "named", Binary: os.Args[0]}); err == nil {
+	if _, err := Start(context.Background(), Options{Mode: "named", Binary: os.Args[0], ConfigFile: t.TempDir() + "/cf.yml"}); err == nil {
 		t.Fatal("named tunnel without token accepted")
 	}
+}
+
+func argAfter(flag string) string {
+	for i, a := range os.Args {
+		if a == flag && i+1 < len(os.Args) {
+			return os.Args[i+1]
+		}
+	}
+	return ""
 }

@@ -36,6 +36,8 @@ type Options struct {
 	MaxBackoff time.Duration
 	// Output receives every line cloudflared writes (for a log file).
 	Output io.Writer
+	// ConfigFile is the (empty) cloudflared config actp uses; default ~/.actp/state/cloudflared.yml.
+	ConfigFile string
 }
 
 // Tunnel is a supervised cloudflared process.
@@ -101,6 +103,12 @@ func Start(ctx context.Context, opts Options) (*Tunnel, error) {
 		}
 		opts.Binary = bin
 	}
+	if opts.ConfigFile == "" {
+		opts.ConfigFile = filepath.Join(config.Dir(), "state", "cloudflared.yml")
+	}
+	if err := emptyConfig(opts.ConfigFile); err != nil {
+		return nil, err
+	}
 	t := &Tunnel{opts: opts, done: make(chan struct{})}
 	go t.supervise(ctx)
 	return t, nil
@@ -117,10 +125,22 @@ func (t *Tunnel) URL() string {
 func (t *Tunnel) Done() <-chan struct{} { return t.done }
 
 func (t *Tunnel) args() []string {
+	// Our own empty config: a ~/.cloudflared/config.yml with ingress rules would
+	// otherwise route the tunnel's requests and answer them with 404.
+	base := []string{"tunnel", "--config", t.opts.ConfigFile, "--no-autoupdate"}
 	if t.opts.Mode == "quick" {
-		return []string{"tunnel", "--no-autoupdate", "--url", t.opts.Target}
+		return append(base, "--url", t.opts.Target)
 	}
-	return []string{"tunnel", "--no-autoupdate", "run"}
+	return append(base, "run")
+}
+
+// emptyConfig writes the config file actp gives cloudflared: no settings, so
+// only actp's command line counts.
+func emptyConfig(path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte("# Written by actp. Kept empty so ~/.cloudflared/config.yml cannot change actp's tunnel.\n{}\n"), 0o600)
 }
 
 func (t *Tunnel) supervise(ctx context.Context) {
