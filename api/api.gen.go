@@ -101,6 +101,9 @@ type Info struct {
 	// PromptTimeoutSeconds Seconds an unanswered prompt waits for a dropped client.
 	PromptTimeoutSeconds int `json:"promptTimeoutSeconds"`
 
+	// PublicUrl The public URL when the server runs a tunnel.
+	PublicUrl *string `json:"publicUrl,omitempty"`
+
 	// Version actp version, for example `0.1.0`.
 	Version string `json:"version"`
 

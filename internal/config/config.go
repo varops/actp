@@ -343,6 +343,9 @@ func (c *Config) Validate() error {
 		if !oneOf(string(s.Tunnel.Mode), "off", "quick", "named") {
 			errs = append(errs, errors.New("tunnel mode must be off, quick or named"))
 		}
+		if s.Tunnel.Mode == "named" && s.Tunnel.TokenEnv == "" {
+			errs = append(errs, errors.New("a named tunnel needs token_env: the variable holding the Cloudflare tunnel token"))
+		}
 		if s.TLSCert == "" != (s.TLSKey == "") {
 			errs = append(errs, errors.New("tls_cert and tls_key must be set together"))
 		}

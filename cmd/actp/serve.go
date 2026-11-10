@@ -15,6 +15,7 @@ import (
 
 	"github.com/varops/actp/internal/config"
 	"github.com/varops/actp/internal/server"
+	"github.com/varops/actp/internal/tunnel"
 )
 
 func cmdServe(args []string) error {
@@ -60,6 +61,29 @@ func cmdServe(args []string) error {
 			errs <- httpSrv.ListenAndServe()
 		}
 	}()
+
+	ctx, stopTunnel := context.WithCancel(context.Background())
+	defer stopTunnel()
+	if mode := string(sc.Tunnel.Mode); mode != "off" {
+		if sc.TLSCert != "" {
+			return fmt.Errorf("the tunnel needs the server on plain HTTP on loopback; remove tls_cert and tls_key")
+		}
+		token := ""
+		if mode == "named" {
+			token = os.Getenv(sc.Tunnel.TokenEnv)
+		}
+		tun, err := tunnel.Start(ctx, tunnel.Options{
+			Mode: mode, Target: "http://" + sc.Listen, Token: token, Logger: log,
+			OnURL: func(u string) {
+				srv.SetPublicURL(u)
+				log.Info("clients can connect with: actp <agent>@" + u)
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("tunnel: %w", err)
+		}
+		defer func() { stopTunnel(); <-tun.Done() }()
+	}
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)

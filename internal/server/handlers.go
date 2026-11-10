@@ -23,6 +23,9 @@ func (s *Server) GetInfo(w http.ResponseWriter, r *http.Request) {
 		WireVersions:         wire.Versions,
 		PromptTimeoutSeconds: int(s.conf().PromptTimeout.D().Seconds()),
 	}
+	if u, _ := s.publicURL.Load().(string); u != "" {
+		info.PublicUrl = &u
+	}
 	if s.conf().Name != "" {
 		info.Name = &s.conf().Name
 	}

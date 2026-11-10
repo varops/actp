@@ -409,7 +409,7 @@ internal/bridge/     stdio ↔ link, reconnect, bye, lost-session handling
 internal/agentproc/  spawn, environment, stderr tail, process groups (POSIX + Windows)
 internal/testagent/  the scripted agent's logic
 internal/e2e/        end-to-end tests: stdio client → bridge → server → scripted agent
-internal/tunnel/     (planned) cloudflared manager
+internal/tunnel/     cloudflared manager
 internal/tray/       (planned) tray app
 ```
 
@@ -445,6 +445,6 @@ Everything is `internal/` until a public Go API is worth promising.
 
 What the code does today (M1 done, most of M2):
 
-- **Done:** server, bridge (`actp <agent>@<server>`), `token`, `remote` (kept in `remotes_file`, tokens from `--token-stdin` saved in a private file), `agents`, `doctor`, `version`. Token auth with no local exception. Management endpoints. Wire format with acks, heartbeats, send window, resume and `bye`. Link states (attached, detached, unattended) with `idle_close`, `prompt_timeout`, `max_unattended` and `on_client_exit`. Settle order on link end. Rewrites: fs/terminal stripping, cwd resolution (`actp://`, workspace paths, `map`, opt-in fallback), MCP filtering, permission policies, terminal-auth hints. Session takeover on `session/load`. Replay buffer spilled to a private spool file. Config reload on `SIGHUP` (a revoked token cannot open or resume links; open links run on until they drop). Probing and login status from traffic. Audit log. Agent process groups and cleanup after a crash. Login-shell environment for agents. CI on Linux, macOS and Windows.
-- **Not yet:** turn tracking for ACP v2 beyond the "recent output" rule, tray, tunnel, release builds.
+- **Done:** server, bridge (`actp <agent>@<server>`), `token`, `remote` (kept in `remotes_file`, tokens from `--token-stdin` saved in a private file), `agents`, `doctor`, `version`. Token auth with no local exception. Management endpoints. Wire format with acks, heartbeats, send window, resume and `bye`. Link states (attached, detached, unattended) with `idle_close`, `prompt_timeout`, `max_unattended` and `on_client_exit`. Settle order on link end. Rewrites: fs/terminal stripping, cwd resolution (`actp://`, workspace paths, `map`, opt-in fallback), MCP filtering, permission policies, terminal-auth hints. Session takeover on `session/load`. Replay buffer spilled to a private spool file. Cloudflare tunnel (quick and named) supervised by `actp serve`, with the public URL in `/api/v1/info`; the named-tunnel token goes through the environment, never the command line. Config reload on `SIGHUP` (a revoked token cannot open or resume links; open links run on until they drop). Probing and login status from traffic. Audit log. Agent process groups and cleanup after a crash. Login-shell environment for agents. CI on Linux, macOS and Windows.
+- **Not yet:** turn tracking for ACP v2 beyond the "recent output" rule, tray, downloading `cloudflared` (it must be on PATH or in `~/.actp/bin`), release builds.
 - **Real agents, partly (M0):** Claude and OpenCode adapters pass `initialize`, `session/new`, updates and extension notifications through actp, and exit cleanly when stdin closes (`docs/agents.md`). Not yet checked: real prompts, a drop mid-turn, `session/load` after an unattended turn, cancelled permissions, and anything through a tunnel.

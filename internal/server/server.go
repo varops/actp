@@ -43,6 +43,8 @@ type Server struct {
 	ctx   context.Context
 	stop  context.CancelFunc
 
+	publicURL atomic.Value // string
+
 	mu       sync.Mutex
 	links    map[string]*Link
 	sessions map[string]*Link // agentID + "\x00" + sessionId → link holding it
@@ -127,6 +129,9 @@ func (s *Server) Reload(cfg *config.Server) {
 		}
 	}
 }
+
+// SetPublicURL records the tunnel's public URL for /api/v1/info.
+func (s *Server) SetPublicURL(u string) { s.publicURL.Store(u) }
 
 // Handler serves the HTTP API.
 func (s *Server) Handler() http.Handler {

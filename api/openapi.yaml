@@ -232,6 +232,9 @@ components:
         promptTimeoutSeconds:
           type: integer
           description: Seconds an unanswered prompt waits for a dropped client.
+        publicUrl:
+          type: string
+          description: The public URL when the server runs a tunnel.
 
     AgentList:
       type: object

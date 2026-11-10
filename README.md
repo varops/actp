@@ -2,7 +2,7 @@
 
 **ACP over HTTP.** Run coding agents on one machine, use them from anywhere.
 
-> Status: early. The server and bridge work and are tested against a scripted agent. Not yet tested with real agents; no tray, tunnel or release builds yet. See [`docs/design.md`](docs/design.md) section 12.
+> Status: early. The server and bridge work and are tested against a scripted agent. Checked with real Claude and OpenCode adapters for handshakes and sessions; no tray or release builds yet. See [`docs/design.md`](docs/design.md) section 12.
 
 ## Mission
 
@@ -91,7 +91,15 @@ actp doctor
 actp serve
 ```
 
-The server listens on loopback. To reach it from another machine, put it behind a TLS reverse proxy or a tunnel (built-in Cloudflare tunnel support is planned).
+The server listens on loopback. To reach it from another machine, put it behind a TLS reverse proxy, or let actp run a Cloudflare tunnel (needs `cloudflared` on PATH):
+
+```yaml
+server:
+  tunnel:
+    mode: quick        # a random https://….trycloudflare.com URL, new on each restart
+```
+
+`mode: named` with `token_env` gives a stable hostname from your Cloudflare account.
 
 On the client machine, point any ACP client at the bridge instead of a local agent:
 
