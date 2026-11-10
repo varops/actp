@@ -108,6 +108,7 @@ func (d *Dashboard) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/server/agents", d.setAgents)
 	mux.HandleFunc("DELETE /api/tokens/{name}", d.revokeToken)
 	mux.HandleFunc("GET /api/remotes/{name}/agents", d.remoteAgents)
+	mux.HandleFunc("PUT /api/remotes/{name}", d.updateRemote)
 	mux.HandleFunc("POST /api/setup", d.setup)
 	return d.guard(mux)
 }

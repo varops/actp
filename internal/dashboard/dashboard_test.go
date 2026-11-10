@@ -311,3 +311,27 @@ func TestEditFoldersAgentsAndRevoke(t *testing.T) {
 		t.Fatalf("remote agents after revoke: %d %s", code, out)
 	}
 }
+
+func TestRemoteWithNoServerExplainsWhy(t *testing.T) {
+	keyring.MockInit()
+	d, c, _ := setup(t)
+	base := "http://" + d.addr
+	do(t, c, "GET", d.URL(), "", false)
+	gone := httptest.NewServer(http.NotFoundHandler()) // like an old quick tunnel address
+	defer gone.Close()
+	if code, out := do(t, c, "POST", base+"/api/remotes", `{"name":"old","url":"`+gone.URL+`","token":"actp_x"}`, true); code != 200 {
+		t.Fatalf("add: %d %s", code, out)
+	}
+	if code, out := do(t, c, "GET", base+"/api/remotes/old/agents", "", false); code != 502 || !strings.Contains(out, "no actp server answers") {
+		t.Fatalf("got %d %s", code, out)
+	}
+	// Point it at a live server (the address changed) and it works again.
+	live := httptest.NewServer(d.opts.Server().Handler())
+	defer live.Close()
+	if code, out := do(t, c, "PUT", base+"/api/remotes/old", `{"url":"`+live.URL+`"}`, true); code != 200 {
+		t.Fatalf("update: %d %s", code, out)
+	}
+	if code, out := do(t, c, "GET", base+"/api/remotes/old/agents", "", false); code != 502 || !strings.Contains(out, "did not accept this token") {
+		t.Fatalf("after update: %d %s", code, out)
+	}
+}

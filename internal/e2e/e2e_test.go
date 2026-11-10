@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -484,5 +485,19 @@ func TestAgentExitWhileAwayStillDeliversItsOutput(t *testing.T) {
 	c.chunk("burst 100")
 	if !e.auditHas("link_resumed") {
 		t.Fatal("the bridge never came back for the output")
+	}
+}
+
+func TestBridgeExplainsAURLWithNoServer(t *testing.T) {
+	gone := httptest.NewServer(http.NotFoundHandler())
+	defer gone.Close()
+	e := newEnv(t)
+	c := e.bridge(func(o *bridge.Options) { o.BaseURL = gone.URL })
+	if err := c.wait(); err == nil || !strings.Contains(err.Error(), "no actp server answers") {
+		t.Fatalf("got %v", err)
+	}
+	c2 := e.bridge(func(o *bridge.Options) { o.Agent = "nope" })
+	if err := c2.wait(); err == nil || strings.Contains(err.Error(), "no actp server answers") {
+		t.Fatalf("unknown agent on a real server: %v", err)
 	}
 }

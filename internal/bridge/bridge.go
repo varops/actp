@@ -408,6 +408,10 @@ func (b *bridge) dial(ctx context.Context) (*websocket.Conn, int64, error) {
 				_ = json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&body)
 				se.Code, se.Message = body.Error, body.Message
 			}
+			// An actp server always explains a 404; a bare one means something else answered.
+			if se.Status == http.StatusNotFound && se.Code == "" {
+				se.Message = NoServerHint(b.opts.BaseURL)
+			}
 			return nil, 0, se
 		}
 		return nil, 0, err

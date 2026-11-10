@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/goccy/go-yaml"
 
 	"github.com/varops/actp/api"
+	"github.com/varops/actp/internal/bridge"
 	"github.com/varops/actp/internal/config"
 )
 
@@ -233,11 +235,62 @@ func (d *Dashboard) remoteAgents(w http.ResponseWriter, r *http.Request) {
 	}
 	if resp.JSON200 == nil {
 		msg := strings.TrimSpace(string(resp.Body))
-		if resp.StatusCode() == http.StatusUnauthorized {
+		switch {
+		case resp.StatusCode() == http.StatusUnauthorized:
 			msg = "the server did not accept this token"
+		case resp.StatusCode() == http.StatusNotFound || !strings.HasPrefix(msg, "{"):
+			writeErr(w, http.StatusBadGateway, errors.New(bridge.NoServerHint(rm.URL)))
+			return
 		}
 		writeErr(w, http.StatusBadGateway, fmt.Errorf("%s answered HTTP %d: %s", rm.URL, resp.StatusCode(), msg))
 		return
 	}
 	writeJSON(w, http.StatusOK, resp.JSON200)
+}
+
+// updateRemote changes a saved remote's URL, and its token when one is given.
+func (d *Dashboard) updateRemote(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		URL   string `json:"url"`
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	u, err := url.Parse(strings.TrimSpace(req.URL))
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+		writeErr(w, http.StatusBadRequest, errors.New("the URL must look like https://host[:port]"))
+		return
+	}
+	cfg, err := config.LoadOrEmpty(d.opts.ConfigPath)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	rf, err := config.ReadRemotesFile(cfg.RemotesFile)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	name := r.PathValue("name")
+	for i := range rf.Remotes {
+		if rf.Remotes[i].Name != name {
+			continue
+		}
+		rf.Remotes[i].URL = strings.TrimSuffix(u.String(), "/")
+		if tok := strings.TrimSpace(req.Token); tok != "" {
+			if err := config.SaveRemoteToken(cfg, &rf.Remotes[i], tok); err != nil {
+				writeErr(w, http.StatusInternalServerError, err)
+				return
+			}
+		}
+		if err := config.WriteRemotesFile(cfg.RemotesFile, rf); err != nil {
+			writeErr(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return
+	}
+	writeErr(w, http.StatusNotFound, fmt.Errorf("no saved remote %q (remotes in the config file are edited there)", name))
 }

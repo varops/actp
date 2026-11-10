@@ -270,7 +270,7 @@ function renderRemotes() {
     }).join("") || `<p class="muted">This token may use no agents.</p>`;
     return `<section style="margin:12px 0 0;padding:12px"><div class="row" style="justify-content:space-between">
       <div><strong>${esc(r.name)}</strong> <code>${esc(r.url)}</code></div>
-      <div class="row"><button data-agents="${esc(r.name)}">${info && info !== "loading" ? "Refresh" : "Show agents"}</button><button class="danger" data-remove="${esc(r.name)}">Remove</button></div></div>${body}</section>`;
+      <div class="row"><button data-agents="${esc(r.name)}">${info && info !== "loading" ? "Refresh" : "Show agents"}</button><button data-edit-remote="${esc(r.name)}" data-url="${esc(r.url)}">Edit</button><button class="danger" data-remove="${esc(r.name)}">Remove</button></div></div>${body}</section>`;
   }).join("") || `<p class="muted">No remote servers yet. Add one with the URL and the token its owner created for you.</p>`;
 }
 
@@ -400,6 +400,15 @@ document.addEventListener("click", async (ev) => {
     if (t.dataset.close) { $(t.dataset.close).classList.add("hidden"); return; }
     if (t.dataset.copy) { await navigator.clipboard.writeText(t.dataset.copy); const old = t.textContent; t.textContent = "Copied"; setTimeout(() => (t.textContent = old), 1500); return; }
     if (t.dataset.agents) { showAgents(t.dataset.agents); return; }
+    if (t.dataset.editRemote) {
+      const url = prompt(`New URL for ${t.dataset.editRemote}. Quick tunnel URLs change when the server restarts.`, t.dataset.url);
+      if (!url) return;
+      const token = prompt("New token (leave empty to keep the current one):", "") || "";
+      await api("PUT", `/api/remotes/${encodeURIComponent(t.dataset.editRemote)}`, { url, token });
+      await refresh();
+      showAgents(t.dataset.editRemote);
+      return;
+    }
     if (t.dataset.probe) { t.textContent = "Checking…"; await api("POST", `/api/agents/${encodeURIComponent(t.dataset.probe)}/probe`); }
     if (t.dataset.end && confirm("End this connection? A running turn is cancelled.")) await api("POST", `/api/links/${encodeURIComponent(t.dataset.end)}/end`);
     if (t.dataset.revoke && confirm(`Revoke the token for ${t.dataset.revoke}? That client can no longer connect.`)) await api("DELETE", `/api/tokens/${encodeURIComponent(t.dataset.revoke)}`);
