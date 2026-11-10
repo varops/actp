@@ -2,7 +2,7 @@
 
 **ACP over HTTP.** Run coding agents on one machine, use them from anywhere.
 
-> Status: early. The server and bridge work and are tested against a scripted agent. Checked with real Claude and OpenCode adapters for handshakes and sessions; no tray or release builds yet. See [`docs/design.md`](docs/design.md) section 12.
+> Status: early. The server and bridge work and are tested against a scripted agent. Checked with real Claude and OpenCode adapters for handshakes and sessions. The tray icon has not been tried on a real desktop yet. See [`docs/design.md`](docs/design.md) section 12.
 
 ## Mission
 
@@ -112,6 +112,10 @@ On the client machine, point any ACP client at the bridge instead of a local age
 ```bash
 actp agents https://agents.example.com --token-env ACTP_TOKEN
 ```
+
+### Dashboard and tray
+
+`actp serve --dashboard` prints a one-time link to a local page with the server status, agents, open connections, and buttons to add clients and remotes. `actp tray` starts the server and opens that page; built with `-tags tray`, it also shows a menu bar icon (macOS builds need a Mac).
 
 ## Development
 
