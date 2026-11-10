@@ -383,6 +383,8 @@ export class ActpLink extends EventEmitter {
 }
 ```
 
+This code was run against `actp serve` and the scripted agent with the socket killed mid-turn: it reconnected, received all chunks once and in order, and the turn ended with `end_turn`. It uses TypeScript parameter properties, so with Node's built-in TypeScript support run it with `--experimental-transform-types` (or compile it as usual).
+
 Points that are easy to get wrong:
 
 - Deliver a message to your ACP layer **before** you count it as processed. If your process dies in between, the server resends it.
