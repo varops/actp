@@ -60,8 +60,26 @@ input, select { font: inherit; padding: 7px 9px; border-radius: 7px; border: 1px
     </div>
   </header>
 
+  <p class="error hidden" id="status-error" style="margin:0 0 16px"></p>
+
   <div id="no-server" class="hidden">
-    <section><h2>Server</h2><p class="muted">This machine runs no server. Add a <code>server:</code> section to the config to share agents from here.</p></section>
+    <section>
+      <h2>Share agents from this machine</h2>
+      <p class="muted">Let other machines use the coding agents installed here. Each agent works in the folders you pick, with your logins on this machine.</p>
+      <form id="setup">
+        <div><div class="muted">Agents</div><div class="checks" id="setup-agents"></div><div class="muted" id="setup-missing"></div></div>
+        <div>
+          <div class="muted">Folders agents may work in</div>
+          <div id="setup-folders"></div>
+          <button type="button" id="setup-add-folder" style="margin-top:6px">Add folder</button>
+        </div>
+        <label>Name of this server <input name="name"></label>
+        <label class="row" style="display:flex"><input type="checkbox" name="tunnel" style="width:auto"> Reach it from anywhere with a free Cloudflare tunnel (otherwise only from this machine or your own proxy)</label>
+        <div class="warn">Anyone you give a client token to can make these agents do anything you can do on this machine. Only share with clients you trust.</div>
+        <div class="row"><button class="primary" type="submit">Start sharing</button><span class="muted" id="setup-file"></span></div>
+        <p class="error" id="setup-error"></p>
+      </form>
+    </section>
   </div>
 
   <div id="server" class="hidden">
@@ -182,8 +200,48 @@ function render() {
     || `<tr><td colspan="3" class="muted">No saved remotes.</td></tr>`;
 }
 
+let setupLoaded = false;
+async function loadSetup() {
+  if (setupLoaded) return;
+  setupLoaded = true;
+  const info = await api("GET", "/api/setup");
+  const found = info.agents.filter((a) => a.path), missing = info.agents.filter((a) => !a.path);
+  $("setup-agents").innerHTML = found.map((a) => `<label title="${esc(a.path)}"><input type="checkbox" name="agent" value="${esc(a.preset)}" checked>${esc(a.name)}</label>`).join("")
+    || `<span class="muted">No supported agents found on this machine.</span>`;
+  $("setup-missing").innerHTML = missing.length ? "Not found: " + missing.map((a) => a.hint ? `${esc(a.name)} (<code>${esc(a.hint)}</code>)` : esc(a.name)).join(", ") : "";
+  addFolder(info.folder);
+  $("setup").name.value = info.name || "";
+  $("setup-file").textContent = "Saved to " + info.configFile;
+}
+function addFolder(value) {
+  const input = document.createElement("input");
+  input.name = "folder"; input.value = value || ""; input.placeholder = "/Users/you/code/project"; input.style.marginTop = "6px";
+  $("setup-folders").appendChild(input);
+}
+$("setup-add-folder").onclick = () => addFolder("");
+$("setup").onsubmit = async (ev) => {
+  ev.preventDefault();
+  const f = ev.target;
+  $("setup-error").textContent = "";
+  try {
+    const agents = [...f.querySelectorAll("input[name=agent]:checked")].map((i) => i.value);
+    const folders = [...f.querySelectorAll("input[name=folder]")].map((i) => i.value.trim()).filter(Boolean);
+    f.querySelector("button[type=submit]").textContent = "Starting…";
+    await api("POST", "/api/setup", { name: f.name.value, agents, folders, tunnel: f.tunnel.checked });
+    refresh();
+  } catch (e) { $("setup-error").textContent = e.message; f.querySelector("button[type=submit]").textContent = "Start sharing"; }
+};
+
 async function refresh() {
-  try { state = await api("GET", "/api/status"); render(); } catch (e) { console.error(e); }
+  try {
+    state = await api("GET", "/api/status");
+    $("status-error").classList.add("hidden");
+    render();
+    if (!state.server) loadSetup().catch((e) => { $("setup-error").textContent = e.message; });
+  } catch (e) {
+    $("status-error").textContent = "Could not load the status: " + e.message;
+    $("status-error").classList.remove("hidden");
+  }
 }
 
 document.addEventListener("click", async (ev) => {

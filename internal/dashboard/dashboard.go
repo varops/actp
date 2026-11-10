@@ -32,9 +32,15 @@ const cookieName = "actp_dashboard"
 
 // Options configure the dashboard.
 type Options struct {
-	Server     *server.Server // nil when this machine runs no server
+	// Server returns the running server, or nil when this machine runs none (yet).
+	Server func() *server.Server
+	// ConfigPath is the --config value ("" for the default); ConfigFile is the
+	// file the dashboard writes when it sets up a server.
 	ConfigPath string
+	ConfigFile string
 	Version    string
+	// StartServer starts the server after the dashboard wrote its config.
+	StartServer func() error
 	// Reload re-reads the config after the dashboard changed tokens.
 	Reload func() error
 	// StartTunnel starts the configured tunnel, for example after installing cloudflared.
@@ -96,6 +102,8 @@ func (d *Dashboard) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/remotes/{name}", d.removeRemote)
 	mux.HandleFunc("POST /api/autostart", d.setAutostart)
 	mux.HandleFunc("POST /api/cloudflared", d.installCloudflared)
+	mux.HandleFunc("GET /api/setup", d.setupInfo)
+	mux.HandleFunc("POST /api/setup", d.setup)
 	return d.guard(mux)
 }
 
@@ -187,7 +195,7 @@ type remoteView struct {
 }
 
 func (d *Dashboard) status(w http.ResponseWriter, r *http.Request) {
-	cfg, err := config.Load(d.opts.ConfigPath)
+	cfg, err := config.LoadOrEmpty(d.opts.ConfigPath)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
@@ -196,7 +204,7 @@ func (d *Dashboard) status(w http.ResponseWriter, r *http.Request) {
 	for _, r := range cfg.Remotes {
 		resp.Remotes = append(resp.Remotes, remoteView{Name: r.Name, URL: r.URL})
 	}
-	if srv := d.opts.Server; srv != nil {
+	if srv := d.server(); srv != nil {
 		sc := srv.Config()
 		st := &serverStatus{Name: sc.Name, Listen: sc.Listen, PublicURL: srv.PublicURL(), Tunnel: string(sc.Tunnel.Mode), Agents: srv.Agents(), Links: []linkView{}, Cloudflared: "ok"}
 		if _, err := tunnel.FindBinary(nil); err != nil {
@@ -219,8 +227,15 @@ func (d *Dashboard) status(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+func (d *Dashboard) server() *server.Server {
+	if d.opts.Server == nil {
+		return nil
+	}
+	return d.opts.Server()
+}
+
 func (d *Dashboard) endLink(w http.ResponseWriter, r *http.Request) {
-	if d.opts.Server == nil || !d.opts.Server.EndLink(r.PathValue("id")) {
+	if d.server() == nil || !d.server().EndLink(r.PathValue("id")) {
 		writeErr(w, http.StatusNotFound, errors.New("no such link"))
 		return
 	}
@@ -228,17 +243,18 @@ func (d *Dashboard) endLink(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *Dashboard) probe(w http.ResponseWriter, r *http.Request) {
-	if d.opts.Server == nil {
+	srv := d.server()
+	if srv == nil {
 		writeErr(w, http.StatusNotFound, errors.New("no server"))
 		return
 	}
-	sc := d.opts.Server.Config()
+	sc := srv.Config()
 	a := sc.Agent(r.PathValue("id"))
 	if a == nil {
 		writeErr(w, http.StatusNotFound, errors.New("no such agent"))
 		return
 	}
-	status, detail := d.opts.Server.Probe(a)
+	status, detail := srv.Probe(a)
 	writeJSON(w, http.StatusOK, map[string]string{"status": status, "detail": detail})
 }
 
@@ -259,7 +275,7 @@ func (d *Dashboard) createToken(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, errors.New("the name may only use letters, digits, '.', '-' and '_'"))
 		return
 	}
-	cfg, err := config.Load(d.opts.ConfigPath)
+	cfg, err := config.LoadOrEmpty(d.opts.ConfigPath)
 	if err != nil || cfg.Server == nil {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("no server configured: %v", err))
 		return
@@ -307,8 +323,8 @@ func (d *Dashboard) createToken(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	publicURL := ""
-	if d.opts.Server != nil {
-		publicURL = d.opts.Server.PublicURL()
+	if srv := d.server(); srv != nil {
+		publicURL = srv.PublicURL()
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"token": token, "publicUrl": publicURL})
 }
@@ -337,7 +353,7 @@ func (d *Dashboard) addRemote(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, errors.New("a token is required"))
 		return
 	}
-	cfg, err := config.Load(d.opts.ConfigPath)
+	cfg, err := config.LoadOrEmpty(d.opts.ConfigPath)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
@@ -365,7 +381,7 @@ func (d *Dashboard) addRemote(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *Dashboard) removeRemote(w http.ResponseWriter, r *http.Request) {
-	cfg, err := config.Load(d.opts.ConfigPath)
+	cfg, err := config.LoadOrEmpty(d.opts.ConfigPath)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return

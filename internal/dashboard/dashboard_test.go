@@ -39,7 +39,7 @@ func setup(t *testing.T) (*Dashboard, *http.Client, string) {
 	}
 	t.Cleanup(func() { srv.Close(0) })
 	reloads := 0
-	d, err := Listen(Options{Server: srv, ConfigPath: cfgPath, Version: "test", Reload: func() error {
+	d, err := Listen(Options{Server: func() *server.Server { return srv }, ConfigPath: cfgPath, ConfigFile: cfgPath, Version: "test", Reload: func() error {
 		reloads++
 		c, err := config.Load(cfgPath)
 		if err != nil {
@@ -124,7 +124,7 @@ func TestCreateTokenAndRemotes(t *testing.T) {
 	if !strings.HasPrefix(res.Token, config.TokenPrefix) {
 		t.Fatalf("token %q", res.Token)
 	}
-	if d.opts.Server.Config().FindToken(res.Token) == nil {
+	if d.opts.Server().Config().FindToken(res.Token) == nil {
 		t.Fatal("server did not reload the new token")
 	}
 	if code, _ := do(t, c, "POST", base+"/api/tokens", `{"name":"bot"}`, true); code != 409 {
@@ -174,5 +174,74 @@ func TestAutostartToggle(t *testing.T) {
 	}
 	if code, body := do(t, c, "POST", base+"/api/autostart", `{"enabled":false}`, true); code != 200 || !strings.Contains(body, `"enabled":false`) {
 		t.Fatalf("disable: %d %s", code, body)
+	}
+}
+
+func TestSetupWithoutAConfigFile(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "actp.yaml") // does not exist yet
+	ws := filepath.Join(dir, "code")
+	_ = os.MkdirAll(ws, 0o755)
+	started := 0
+	d, err := Listen(Options{
+		Server: func() *server.Server { return nil }, ConfigPath: cfgPath, ConfigFile: cfgPath, Version: "test",
+		StartServer: func() error { started++; return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	jar, _ := cookiejar.New(nil)
+	c := &http.Client{Jar: jar}
+	base := "http://" + d.addr
+	do(t, c, "GET", d.URL(), "", false)
+
+	// A missing config is not an error: the page shows the setup.
+	if code, body := do(t, c, "GET", base+"/api/status", "", false); code != 200 || strings.Contains(body, `"server"`) {
+		t.Fatalf("status without config: %d %s", code, body)
+	}
+	if code, body := do(t, c, "GET", base+"/api/setup", "", false); code != 200 || !strings.Contains(body, `"preset":"claude-code"`) {
+		t.Fatalf("setup info: %d %s", code, body)
+	}
+	if code, body := do(t, c, "POST", base+"/api/setup", `{"name":"mac","agents":["claude-code","pi"],"folders":["`+filepath.ToSlash(ws)+`"],"tunnel":true}`, true); code != 200 {
+		t.Fatalf("setup: %d %s", code, body)
+	}
+	if started != 1 {
+		t.Fatalf("StartServer called %d times", started)
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := cfg.Server
+	if s == nil || s.Name != "mac" || s.Tunnel.Mode != "quick" || s.Agent("claude") == nil || s.Agent("pi") == nil || s.Workspace("code") == nil {
+		t.Fatalf("written config: %+v", s)
+	}
+	if code, _ := do(t, c, "POST", base+"/api/setup", `{"agents":["pi"],"folders":["`+filepath.ToSlash(ws)+`"]}`, true); code != 409 {
+		t.Fatalf("second setup: %d", code)
+	}
+	if code, _ := do(t, c, "POST", base+"/api/setup", `{"agents":["pi"],"folders":["/no/such/folder"]}`, true); code != 409 && code != 400 {
+		t.Fatalf("bad folder: %d", code)
+	}
+}
+
+func TestSetupAppendsToAnExistingConfig(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "actp.yaml")
+	_ = os.WriteFile(cfgPath, []byte("remotes_file: "+filepath.Join(dir, "remotes.yaml")+"\n# my comment\n"), 0o600)
+	if err := appendConfig(cfgPath, []byte("server:\n  listen: 127.0.0.1:7860\n")); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(cfgPath)
+	if !strings.Contains(string(data), "# my comment") || !strings.Contains(string(data), "server:") {
+		t.Fatalf("file:\n%s", data)
+	}
+	// A block that breaks the config is rolled back.
+	if err := appendConfig(cfgPath, []byte("server:\n  nonsense: [\n")); err == nil {
+		t.Fatal("broken config accepted")
+	}
+	after, _ := os.ReadFile(cfgPath)
+	if string(after) != string(data) {
+		t.Fatal("broken append was not rolled back")
 	}
 }

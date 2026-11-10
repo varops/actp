@@ -65,8 +65,8 @@ func trayReady(h *host, open bool) {
 		defer t.Stop()
 		for {
 			status.SetTitle(statusLine(h))
-			if h.srv != nil && h.srv.PublicURL() != "" {
-				tunnelItem.SetTitle("Tunnel: " + h.srv.PublicURL())
+			if srv := h.Server(); srv != nil && srv.PublicURL() != "" {
+				tunnelItem.SetTitle("Tunnel: " + srv.PublicURL())
 				tunnelItem.Show()
 			}
 			select {
@@ -93,17 +93,18 @@ func trayReady(h *host, open bool) {
 }
 
 func statusLine(h *host) string {
-	if h.srv == nil {
-		return "No server on this machine"
+	srv := h.Server()
+	if srv == nil {
+		return "Not sharing agents (set up in the dashboard)"
 	}
 	links, working := 0, 0
-	for _, l := range h.srv.Links() {
+	for _, l := range srv.Links() {
 		links++
 		if l.Running {
 			working++
 		}
 	}
-	return fmt.Sprintf("%d agents · %d connections · %d working", len(h.srv.Agents()), links, working)
+	return fmt.Sprintf("%d agents · %d connections · %d working", len(srv.Agents()), links, working)
 }
 
 // trayIcon draws a small two-node glyph: PNG on macOS and Linux, ICO on Windows.

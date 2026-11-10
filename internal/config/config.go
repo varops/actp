@@ -175,6 +175,21 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
+// LoadOrEmpty is Load, except that a missing file is an empty config even when
+// the path was given. For tools that create the file, like the dashboard.
+func LoadOrEmpty(path string) (*Config, error) {
+	if path != "" {
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			cfg := &Config{Version: CurrentVersion, path: path}
+			if err := cfg.finish(); err != nil {
+				return nil, err
+			}
+			return cfg, cfg.loadRemotesFile()
+		}
+	}
+	return Load(path)
+}
+
 // Parse decodes and defaults a config without touching the file system.
 func Parse(data []byte) (*Config, error) {
 	cfg := &Config{}
