@@ -43,7 +43,8 @@ type Server struct {
 	ctx   context.Context
 	stop  context.CancelFunc
 
-	publicURL atomic.Value // string
+	publicURL   atomic.Value // string
+	publicCheck atomic.Value // PublicCheck
 
 	mu       sync.Mutex
 	links    map[string]*Link

@@ -1,6 +1,10 @@
 package server
 
-import "github.com/varops/actp/internal/config"
+import (
+	"time"
+
+	"github.com/varops/actp/internal/config"
+)
 
 // Config is the configuration the server runs with now.
 func (s *Server) Config() *config.Server { return s.conf() }
@@ -34,4 +38,20 @@ func (s *Server) Agents() []AgentState {
 		out = append(out, st)
 	}
 	return out
+}
+
+// PublicCheck is the result of the last check of the public URL from outside.
+type PublicCheck struct {
+	OK     bool      `json:"ok"`
+	Detail string    `json:"detail,omitempty"`
+	At     time.Time `json:"at"`
+}
+
+// SetPublicCheck records whether the public URL answered.
+func (s *Server) SetPublicCheck(c PublicCheck) { s.publicCheck.Store(c) }
+
+// LastPublicCheck returns the last public URL check, if any.
+func (s *Server) LastPublicCheck() (PublicCheck, bool) {
+	c, ok := s.publicCheck.Load().(PublicCheck)
+	return c, ok
 }

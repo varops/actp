@@ -159,6 +159,10 @@ section h2 button { text-transform: none; letter-spacing: 0; font-weight: 400; }
   <div id="tab-bridge" class="hidden">
     <p class="intro">Use agents that run on another machine. Add its server once, then point your ACP client (an app, editor or bot) at the agent command shown below instead of a local agent.</p>
     <section>
+      <h2>Command line</h2>
+      <div id="cli"></div>
+    </section>
+    <section>
       <h2>Remote servers <button class="primary" id="add-remote-btn">Add remote…</button></h2>
       <form id="add-remote" class="hidden">
         <label>Name <input name="name" required placeholder="workstation" pattern="[A-Za-z0-9][A-Za-z0-9_\-]{0,63}"></label>
@@ -215,6 +219,7 @@ function render() {
   $("server").classList.toggle("hidden", !srv);
   $("no-server").classList.toggle("hidden", !!srv);
   if (srv) renderServer(srv);
+  if (!$("cli").dataset.shown || (state.cli && state.cli.current)) { renderCLI(); $("cli").dataset.shown = "1"; }
   renderRemotes();
 }
 
@@ -222,7 +227,11 @@ function renderServer(srv) {
   $("srv-name").textContent = srv.name || "actp server";
   $("srv-listen").textContent = "listening on " + srv.listen;
   if (srv.publicUrl) {
-    $("tunnel").innerHTML = `<span class="dot ready"></span><code>${esc(srv.publicUrl)}</code><button data-copy="${esc(srv.publicUrl)}">Copy URL</button>`;
+    const pc = srv.publicCheck;
+    const reach = !pc ? `<span class="muted">checking that it reaches this machine…</span>`
+      : pc.ok ? `<span class="muted">reachable</span>`
+      : `<span class="error">not reachable yet: ${esc(pc.detail)}. A new quick tunnel can take a minute.${srv.tunnelError ? " cloudflared said: " + esc(srv.tunnelError) : ""}</span>`;
+    $("tunnel").innerHTML = `<span class="dot ${pc && !pc.ok ? "detached" : "ready"}"></span><code>${esc(srv.publicUrl)}</code><button data-copy="${esc(srv.publicUrl)}">Copy URL</button><div style="flex-basis:100%">${reach}</div>`;
   } else if (srv.tunnel !== "off" && srv.cloudflared === "missing") {
     $("tunnel").innerHTML = `<span class="dot unavailable"></span><span class="muted">The tunnel needs cloudflared (about 40 MB).</span><button class="primary" id="install-cf">Install cloudflared</button>`;
     $("install-cf").onclick = async (ev) => {
@@ -233,7 +242,7 @@ function renderServer(srv) {
   } else if (srv.tunnel !== "off" && srv.cloudflared === "unavailable") {
     $("tunnel").innerHTML = `<span class="dot unavailable"></span><span class="muted">The tunnel needs cloudflared, and there is no build for this platform. Install it yourself and put it on PATH.</span>`;
   } else if (srv.tunnel !== "off") {
-    $("tunnel").innerHTML = `<span class="dot detached"></span><span class="muted">Tunnel (${esc(srv.tunnel)}) is starting…</span>`;
+    $("tunnel").innerHTML = `<span class="dot detached"></span><span class="muted">Tunnel (${esc(srv.tunnel)}) is starting…${srv.tunnelError ? " cloudflared said: " + esc(srv.tunnelError) : ""}</span>`;
   } else {
     $("tunnel").innerHTML = `<span class="muted">No tunnel: reachable only from this machine or through your own proxy.</span>`;
   }
@@ -255,6 +264,20 @@ function renderServer(srv) {
   }
 }
 
+function renderCLI() {
+  const cli = state.cli || {};
+  if (cli.current) {
+    $("cli").innerHTML = `<span class="dot ready"></span><code>actp</code> <span class="muted">is installed at ${esc(cli.path)}.</span>`;
+  } else {
+    $("cli").innerHTML = `<p class="muted" style="margin-top:0">${cli.path ? `The <code>actp</code> on your PATH (${esc(cli.path)}) is a different copy.` : "There is no <code>actp</code> command on your PATH yet."} Install it to use <code>actp</code> in a terminal and in client configs.</p>
+      <button class="primary" id="install-cli">Install the actp command</button> <span class="error" id="cli-error"></span>`;
+    $("install-cli").onclick = async () => {
+      $("cli-error").textContent = "";
+      try { await api("POST", "/api/cli"); refresh(); } catch (e) { $("cli-error").textContent = e.message; }
+    };
+  }
+}
+
 function renderRemotes() {
   $("remotes").innerHTML = state.remotes.map((r) => {
     const info = remoteAgents[r.name];
@@ -263,8 +286,9 @@ function renderRemotes() {
     else if (info && info.error) body = `<p class="error">${esc(info.error)}</p>`;
     else if (info) body = info.agents.map((a) => {
       const target = `${a.id}@${r.name}`;
-      const cmd = `${quote(state.actpPath)} ${target}`;
-      const json = JSON.stringify({ command: state.actpPath, args: [target] });
+      const bin = state.cli && state.cli.current ? "actp" : state.actpPath;
+      const cmd = `${quote(bin)} ${target}`;
+      const json = JSON.stringify({ command: state.actpPath, args: [target] }); // apps started from Finder may not see your shell PATH
       return `<div style="margin-top:10px"><strong>${esc(a.id)}</strong> <span class="dot ${esc(a.status)}"></span><span class="muted">${esc(a.status.replace("_", " "))}</span>
         <div class="agent-cmds"><div class="code">${esc(cmd)}</div><div class="row"><button data-copy="${esc(cmd)}">Copy command</button><button data-copy="${esc(json)}">Copy as JSON</button></div></div></div>`;
     }).join("") || `<p class="muted">This token may use no agents.</p>`;

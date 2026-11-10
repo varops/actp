@@ -5,17 +5,21 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/varops/actp/internal/config"
 	"github.com/varops/actp/internal/dashboard"
+	"github.com/varops/actp/internal/logfile"
 	"github.com/varops/actp/internal/server"
 	"github.com/varops/actp/internal/tunnel"
 )
@@ -34,6 +38,7 @@ type hostOptions struct {
 	configPath    string
 	dashboard     bool
 	requireServer bool
+	logFile       bool // also log to ~/.actp/logs/actp.log
 	// onReady is called once the host and dashboard are up (dash may be nil).
 	onReady func(h *host)
 }
@@ -53,6 +58,7 @@ type host struct {
 	httpSrv    *http.Server
 	running    *config.Server
 	tunnelDone <-chan struct{}
+	tunnel     *tunnel.Tunnel
 	tunnelFn   func() (<-chan struct{}, error)
 }
 
@@ -131,16 +137,27 @@ func (h *host) startServer() (bool, error) {
 			if mode == "named" {
 				token = os.Getenv(sc.Tunnel.TokenEnv)
 			}
+			var out io.Writer
+			if f, err := logfile.Open(sc.LogDir, "cloudflared.log"); err == nil {
+				out = f
+				go func() { <-h.ctx.Done(); f.Close() }()
+			}
+			checkCtx, stopCheck := context.WithCancel(h.ctx)
 			tun, err := tunnel.Start(h.ctx, tunnel.Options{
-				Mode: mode, Target: "http://" + sc.Listen, Token: token, Logger: h.log,
+				Mode: mode, Target: "http://" + sc.Listen, Token: token, Logger: h.log, Output: out,
 				OnURL: func(u string) {
 					srv.SetPublicURL(u)
 					h.log.Info("clients can connect with: actp <agent>@" + u)
+					stopCheck()
+					checkCtx, stopCheck = context.WithCancel(h.ctx)
+					go checkPublicURL(checkCtx, h.log, srv, u)
 				},
 			})
 			if err != nil {
+				stopCheck()
 				return nil, err
 			}
+			h.tunnel = tun
 			return tun.Done(), nil
 		}
 		if err := h.startTunnelLocked(); err != nil {
@@ -149,6 +166,56 @@ func (h *host) startServer() (bool, error) {
 		}
 	}
 	return true, nil
+}
+
+// checkPublicURL asks the public URL for /health every 30 s, so the dashboard
+// can say whether the tunnel really reaches this server.
+func checkPublicURL(ctx context.Context, log *slog.Logger, srv *server.Server, url string) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	wasOK := false
+	for {
+		check := server.PublicCheck{At: time.Now()}
+		resp, err := client.Get(url + "/health")
+		switch {
+		case err != nil:
+			check.Detail = err.Error()
+		default:
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+			resp.Body.Close()
+			check.OK = resp.StatusCode == http.StatusOK && strings.Contains(string(body), `"ok"`)
+			if !check.OK {
+				check.Detail = fmt.Sprintf("HTTP %d from %s, not from actp", resp.StatusCode, url)
+			}
+		}
+		if check.OK != wasOK {
+			if check.OK {
+				log.Info("tunnel is reachable", "url", url)
+			} else if wasOK {
+				log.Warn("tunnel stopped answering", "url", url, "detail", check.Detail)
+			}
+			wasOK = check.OK
+		}
+		srv.SetPublicCheck(check)
+		delay := 30 * time.Second
+		if !check.OK {
+			delay = 5 * time.Second // a new quick tunnel can take a little while to work
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+	}
+}
+
+// TunnelError is cloudflared's last error line, if any.
+func (h *host) TunnelError() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.tunnel == nil {
+		return ""
+	}
+	return h.tunnel.LastError()
 }
 
 // startTunnel starts the tunnel once; later calls are no-ops while it runs.
@@ -222,7 +289,19 @@ func runHost(parent context.Context, opts hostOptions) error {
 	}
 	ctx, stop := context.WithCancel(parent)
 	defer stop()
-	h := &host{log: slog.New(slog.NewTextHandler(os.Stderr, nil)), configPath: opts.configPath, ctx: ctx, stop: stop, errs: make(chan error, 1)}
+	var logOut io.Writer = os.Stderr
+	if opts.logFile {
+		// An app started from Finder has no terminal: keep its log where people can find it.
+		dir := filepath.Join(config.Dir(), "logs")
+		if cfg.Server != nil {
+			dir = cfg.Server.LogDir
+		}
+		if f, err := logfile.Open(dir, "actp.log"); err == nil {
+			defer f.Close()
+			logOut = io.MultiWriter(os.Stderr, f)
+		}
+	}
+	h := &host{log: slog.New(slog.NewTextHandler(logOut, nil)), configPath: opts.configPath, ctx: ctx, stop: stop, errs: make(chan error, 1)}
 	if _, err := h.startServer(); err != nil {
 		return err
 	}
@@ -234,6 +313,7 @@ func runHost(parent context.Context, opts hostOptions) error {
 			ConfigFile:  h.configFile(),
 			Version:     version,
 			StartTunnel: h.startTunnel,
+			TunnelError: h.TunnelError,
 			Reload:      h.reload,
 			StartServer: func() error {
 				started, err := h.startServer()

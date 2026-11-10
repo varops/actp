@@ -34,14 +34,24 @@ type Options struct {
 	OnURL func(string)
 	// MaxBackoff caps the restart delay (60 s).
 	MaxBackoff time.Duration
+	// Output receives every line cloudflared writes (for a log file).
+	Output io.Writer
 }
 
 // Tunnel is a supervised cloudflared process.
 type Tunnel struct {
-	opts Options
-	mu   sync.Mutex
-	url  string
-	done chan struct{}
+	opts    Options
+	mu      sync.Mutex
+	url     string
+	lastErr string
+	done    chan struct{}
+}
+
+// LastError is the last error line cloudflared printed, if any.
+func (t *Tunnel) LastError() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.lastErr
 }
 
 var (
@@ -171,8 +181,14 @@ func (t *Tunnel) runOnce(ctx context.Context) error {
 				}
 			}
 		}
+		if t.opts.Output != nil {
+			fmt.Fprintln(t.opts.Output, line)
+		}
 		if errorLine.MatchString(line) {
-			t.opts.Logger.Debug("cloudflared", "line", line)
+			t.opts.Logger.Warn("cloudflared: " + line)
+			t.mu.Lock()
+			t.lastErr = line
+			t.mu.Unlock()
 		}
 	}
 	return cmd.Wait()

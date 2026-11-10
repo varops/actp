@@ -20,7 +20,9 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/varops/actp/internal/agentproc"
 	"github.com/varops/actp/internal/autostart"
+	"github.com/varops/actp/internal/cliinstall"
 	"github.com/varops/actp/internal/config"
 	"github.com/varops/actp/internal/server"
 	"github.com/varops/actp/internal/tunnel"
@@ -46,6 +48,8 @@ type Options struct {
 	Reload func() error
 	// StartTunnel starts the configured tunnel, for example after installing cloudflared.
 	StartTunnel func() error
+	// TunnelError returns cloudflared's last error line, if any.
+	TunnelError func() string
 }
 
 // Dashboard serves the local page.
@@ -109,6 +113,7 @@ func (d *Dashboard) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/tokens/{name}", d.revokeToken)
 	mux.HandleFunc("GET /api/remotes/{name}/agents", d.remoteAgents)
 	mux.HandleFunc("PUT /api/remotes/{name}", d.updateRemote)
+	mux.HandleFunc("POST /api/cli", d.installCLI)
 	mux.HandleFunc("POST /api/setup", d.setup)
 	return d.guard(mux)
 }
@@ -172,6 +177,8 @@ type statusResponse struct {
 	Autostart  bool          `json:"autostart"`
 	// ActpPath is this actp binary, for agent commands a client can paste.
 	ActpPath string `json:"actpPath"`
+	// CLI says whether an actp command is on the PATH, and whether it is this one.
+	CLI cliinstall.Status `json:"cli"`
 }
 
 type serverStatus struct {
@@ -180,7 +187,10 @@ type serverStatus struct {
 	PublicURL string `json:"publicUrl,omitempty"`
 	Tunnel    string `json:"tunnel"`
 	// Cloudflared is "ok", "missing" (installable) or "unavailable" (no pinned build for this platform).
-	Cloudflared string              `json:"cloudflared"`
+	Cloudflared string `json:"cloudflared"`
+	// PublicCheck says whether the public URL reached this server at the last check.
+	PublicCheck *server.PublicCheck `json:"publicCheck,omitempty"`
+	TunnelError string              `json:"tunnelError,omitempty"`
 	Agents      []server.AgentState `json:"agents"`
 	Links       []linkView          `json:"links"`
 	Tokens      []tokenView         `json:"tokens"`
@@ -217,13 +227,20 @@ func (d *Dashboard) status(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	resp := statusResponse{Version: d.opts.Version, ConfigPath: cfg.Path(), Remotes: []remoteView{}, Autostart: autostart.Enabled(), ActpPath: actpPath()}
+	resp := statusResponse{Version: d.opts.Version, ConfigPath: cfg.Path(), Remotes: []remoteView{}, Autostart: autostart.Enabled(), ActpPath: actpPath(),
+		CLI: cliinstall.Check(actpPath(), agentproc.Getenv(agentproc.CachedLoginShellEnv(), "PATH"))}
 	for _, r := range cfg.Remotes {
 		resp.Remotes = append(resp.Remotes, remoteView{Name: r.Name, URL: r.URL})
 	}
 	if srv := d.server(); srv != nil {
 		sc := srv.Config()
 		st := &serverStatus{Name: sc.Name, Listen: sc.Listen, PublicURL: srv.PublicURL(), Tunnel: string(sc.Tunnel.Mode), Agents: srv.Agents(), Links: []linkView{}, Cloudflared: "ok"}
+		if c, ok := srv.LastPublicCheck(); ok {
+			st.PublicCheck = &c
+		}
+		if d.opts.TunnelError != nil {
+			st.TunnelError = d.opts.TunnelError()
+		}
 		if _, err := tunnel.FindBinary(nil); err != nil {
 			st.Cloudflared = "unavailable"
 			if tunnel.CanDownload() {
@@ -491,6 +508,15 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeErr(w http.ResponseWriter, status int, err error) {
 	writeJSON(w, status, map[string]string{"error": err.Error()})
+}
+
+func (d *Dashboard) installCLI(w http.ResponseWriter, r *http.Request) {
+	link, err := cliinstall.Install(actpPath(), agentproc.Getenv(agentproc.CachedLoginShellEnv(), "PATH"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"path": link})
 }
 
 func actpPath() string {

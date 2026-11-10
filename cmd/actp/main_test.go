@@ -1,13 +1,20 @@
 package main
 
 import (
+	"context"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/varops/actp/internal/config"
+	"github.com/varops/actp/internal/server"
 )
 
 func TestResolveServer(t *testing.T) {
@@ -110,5 +117,39 @@ func TestRemoteAddListRemove(t *testing.T) {
 	cfg, _ = config.Load(cfgPath)
 	if cfg.Remote("box") != nil {
 		t.Fatal("not removed")
+	}
+}
+
+func TestCheckPublicURL(t *testing.T) {
+	cfg := &config.Server{StateDir: t.TempDir(), LogDir: t.TempDir()}
+	srv, err := server.New(cfg, server.Options{BaseEnv: os.Environ(), ReadOnly: true, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	good := httptest.NewServer(srv.Handler())
+	defer good.Close()
+	gone := httptest.NewServer(http.NotFoundHandler())
+	defer gone.Close()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	for _, tc := range []struct {
+		url string
+		ok  bool
+	}{{good.URL, true}, {gone.URL, false}} {
+		ctx, cancel := context.WithCancel(context.Background())
+		go checkPublicURL(ctx, log, srv, tc.url)
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if c, ok := srv.LastPublicCheck(); ok && c.OK == tc.ok && !c.At.IsZero() {
+				if !tc.ok && !strings.Contains(c.Detail, "not from actp") {
+					t.Fatalf("detail %q", c.Detail)
+				}
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: no check result", tc.url)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		cancel()
 	}
 }

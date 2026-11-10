@@ -25,7 +25,7 @@ func runTray(ctx context.Context, cfgPath string, open bool) error {
 	ready := make(chan *host, 1)
 	done := make(chan error, 1)
 	go func() {
-		done <- runHost(ctx, hostOptions{configPath: cfgPath, dashboard: true, onReady: func(h *host) { ready <- h }})
+		done <- runHost(ctx, hostOptions{configPath: cfgPath, dashboard: true, logFile: true, onReady: func(h *host) { ready <- h }})
 		systray.Quit()
 	}()
 	var h *host
