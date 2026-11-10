@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>actp</title>
+<style>
+:root {
+  --bg: #f7f7f5; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6b66; --line: #e4e4df;
+  --accent: #2f5bd3; --ok: #1f8a4c; --warn: #b7791f; --bad: #c0392b; --code: #f0f0ec;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161615; --panel: #1f1f1d; --text: #ececea; --muted: #9a9a94; --line: #33332f;
+    --accent: #7c9cf5; --ok: #4cc283; --warn: #e0a84a; --bad: #ef6b5b; --code: #2a2a27;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+main { max-width: 880px; margin: 0 auto; padding: 24px 16px 64px; }
+header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+h1 { font-size: 22px; margin: 0; }
+h1 small { color: var(--muted); font-weight: 400; font-size: 14px; margin-left: 6px; }
+h2 { font-size: 15px; margin: 0 0 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 8px 6px; border-top: 1px solid var(--line); vertical-align: top; overflow-wrap: anywhere; }
+th { border-top: 0; color: var(--muted); font-weight: 500; font-size: 13px; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: var(--muted); }
+.dot.ready, .dot.attached { background: var(--ok); }
+.dot.auth_required, .dot.detached, .dot.unattended { background: var(--warn); }
+.dot.unavailable { background: var(--bad); }
+.muted { color: var(--muted); font-size: 13px; }
+code, .code { background: var(--code); border-radius: 6px; padding: 2px 6px; font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+.code { display: block; padding: 10px 12px; margin: 8px 0; white-space: pre-wrap; }
+button { font: inherit; font-size: 14px; border: 1px solid var(--line); background: var(--panel); color: var(--text); border-radius: 7px; padding: 5px 12px; cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.danger { color: var(--bad); }
+button:hover { filter: brightness(0.97); }
+form { display: grid; gap: 10px; margin-top: 12px; }
+label { display: grid; gap: 4px; font-size: 14px; }
+input, select { font: inherit; padding: 7px 9px; border-radius: 7px; border: 1px solid var(--line); background: var(--bg); color: var(--text); width: 100%; }
+.checks { display: flex; flex-wrap: wrap; gap: 12px; }
+.checks label { display: flex; gap: 6px; align-items: center; }
+.checks input { width: auto; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.warn { border-left: 3px solid var(--warn); padding: 8px 12px; background: var(--code); border-radius: 6px; font-size: 14px; }
+.error { color: var(--bad); font-size: 14px; }
+.hidden { display: none; }
+@media (max-width: 560px) { .hide-sm { display: none; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>actp <small id="version"></small></h1>
+    <span class="muted" id="config"></span>
+  </header>
+
+  <div id="no-server" class="hidden">
+    <section><h2>Server</h2><p class="muted">This machine runs no server. Add a <code>server:</code> section to the config to share agents from here.</p></section>
+  </div>
+
+  <div id="server" class="hidden">
+    <section>
+      <h2>Server</h2>
+      <div class="row"><strong id="srv-name"></strong><span class="muted" id="srv-listen"></span></div>
+      <div id="tunnel" class="row" style="margin-top:8px"></div>
+    </section>
+
+    <section>
+      <h2>Agents</h2>
+      <table><thead><tr><th>Agent</th><th>Status</th><th></th></tr></thead><tbody id="agents"></tbody></table>
+    </section>
+
+    <section>
+      <h2>Connections</h2>
+      <table><thead><tr><th>Agent</th><th>Client</th><th>State</th><th class="hide-sm">Since</th><th></th></tr></thead><tbody id="links"></tbody></table>
+      <p class="muted hidden" id="no-links">No open connections.</p>
+    </section>
+
+    <section>
+      <h2>Clients</h2>
+      <p class="muted" id="tokens"></p>
+      <button class="primary" id="add-client-btn">Add client…</button>
+      <form id="add-client" class="hidden">
+        <div class="warn">A client token lets its holder make these agents do anything this user can do on this machine. Only give it to clients you would give a shell.</div>
+        <label>Name <input name="name" required placeholder="my-bot" pattern="[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}"></label>
+        <div><div class="muted">Agents</div><div class="checks" id="client-agents"></div></div>
+        <label>Starts in workspace <select name="ws" id="client-ws"></select></label>
+        <div class="row"><button class="primary" type="submit">Create token</button><button type="button" id="add-client-cancel">Cancel</button></div>
+        <p class="error" id="client-error"></p>
+      </form>
+      <div id="new-token" class="hidden">
+        <p>Copy this token now. It is shown only once.</p>
+        <div class="code" id="token-value"></div>
+        <div class="row"><button id="copy-token">Copy token</button></div>
+        <p class="muted">On the client machine, put it in <code>ACTP_TOKEN</code> and use this as the agent command:</p>
+        <div class="code" id="bridge-cmd"></div>
+      </div>
+    </section>
+  </div>
+
+  <section>
+    <h2>Remotes</h2>
+    <p class="muted">Servers this machine connects to. Use one as <code>actp &lt;agent&gt;@&lt;name&gt;</code>.</p>
+    <table><thead><tr><th>Name</th><th>URL</th><th></th></tr></thead><tbody id="remotes"></tbody></table>
+    <button id="add-remote-btn" style="margin-top:10px">Add remote…</button>
+    <form id="add-remote" class="hidden">
+      <label>Name <input name="name" required placeholder="workstation" pattern="[A-Za-z0-9][A-Za-z0-9_\-]{0,63}"></label>
+      <label>URL <input name="url" required placeholder="https://agents.example.com"></label>
+      <label>Token <input name="token" required type="password" autocomplete="off"></label>
+      <div class="row"><button class="primary" type="submit">Save</button><button type="button" id="add-remote-cancel">Cancel</button></div>
+      <p class="error" id="remote-error"></p>
+    </form>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+let state = null;
+
+async function api(method, path, body) {
+  const res = await fetch(path, {
+    method,
+    headers: { "X-Actp-Dashboard": "1", ...(body ? { "Content-Type": "application/json" } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
+function ago(iso) {
+  const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 60) return Math.round(s) + " s";
+  if (s < 3600) return Math.round(s / 60) + " min";
+  return Math.round(s / 3600) + " h";
+}
+
+function render() {
+  $("version").textContent = state.version;
+  $("config").textContent = state.configPath;
+  const srv = state.server;
+  $("server").classList.toggle("hidden", !srv);
+  $("no-server").classList.toggle("hidden", !!srv);
+  if (srv) {
+    $("srv-name").textContent = srv.name || "actp server";
+    $("srv-listen").textContent = "listening on " + srv.listen;
+    if (srv.publicUrl) {
+      $("tunnel").innerHTML = `<span class="dot ready"></span><code>${esc(srv.publicUrl)}</code><button data-copy="${esc(srv.publicUrl)}">Copy URL</button>`;
+    } else if (srv.tunnel && srv.tunnel !== "off") {
+      $("tunnel").innerHTML = `<span class="dot detached"></span><span class="muted">Tunnel (${esc(srv.tunnel)}) is starting…</span>`;
+    } else {
+      $("tunnel").innerHTML = `<span class="muted">No tunnel. Reachable only through this machine's own address or a reverse proxy.</span>`;
+    }
+    $("agents").innerHTML = srv.agents.map((a) => `<tr><td><strong>${esc(a.id)}</strong>${a.name && a.name !== a.id ? `<div class="muted">${esc(a.name)}</div>` : ""}</td>
+      <td><span class="dot ${esc(a.status)}"></span>${esc(a.status.replace("_", " "))}${a.authHint && a.status === "auth_required" ? `<div class="muted">${esc(a.authHint)}</div>` : ""}${a.error ? `<div class="muted">${esc(a.error)}</div>` : ""}</td>
+      <td><button data-probe="${esc(a.id)}">Check</button></td></tr>`).join("") || `<tr><td colspan="3" class="muted">No agents configured.</td></tr>`;
+    $("links").innerHTML = srv.links.map((l) => `<tr><td>${esc(l.agent)}</td><td>${esc(l.clientName || l.token)}<div class="muted">${esc(l.token)}</div></td>
+      <td><span class="dot ${esc(l.state)}"></span>${esc(l.state)}${l.running ? " · working" : ""}</td><td class="hide-sm">${ago(l.since)}</td>
+      <td><button class="danger" data-end="${esc(l.id)}">End</button></td></tr>`).join("");
+    $("no-links").classList.toggle("hidden", srv.links.length > 0);
+    $("tokens").textContent = srv.tokens && srv.tokens.length ? "Clients: " + srv.tokens.join(", ") : "No clients yet.";
+    $("client-agents").innerHTML = srv.agents.map((a) => `<label><input type="checkbox" name="agent" value="${esc(a.id)}" checked>${esc(a.id)}</label>`).join("");
+    $("client-ws").innerHTML = `<option value="">(none: clients must name a workspace)</option>` + (srv.workspaces || []).map((w) => `<option>${esc(w)}</option>`).join("");
+  }
+  $("remotes").innerHTML = state.remotes.map((r) => `<tr><td>${esc(r.name)}</td><td><code>${esc(r.url)}</code></td><td><button class="danger" data-remove="${esc(r.name)}">Remove</button></td></tr>`).join("")
+    || `<tr><td colspan="3" class="muted">No saved remotes.</td></tr>`;
+}
+
+async function refresh() {
+  try { state = await api("GET", "/api/status"); render(); } catch (e) { console.error(e); }
+}
+
+document.addEventListener("click", async (ev) => {
+  const t = ev.target.closest("button");
+  if (!t) return;
+  try {
+    if (t.dataset.copy) { await navigator.clipboard.writeText(t.dataset.copy); t.textContent = "Copied"; }
+    if (t.dataset.probe) { t.textContent = "Checking…"; await api("POST", `/api/agents/${encodeURIComponent(t.dataset.probe)}/probe`); }
+    if (t.dataset.end && confirm("End this connection? A running turn is cancelled.")) await api("POST", `/api/links/${encodeURIComponent(t.dataset.end)}/end`);
+    if (t.dataset.remove && confirm(`Remove remote ${t.dataset.remove}?`)) await api("DELETE", `/api/remotes/${encodeURIComponent(t.dataset.remove)}`);
+  } catch (e) { alert(e.message); }
+  refresh();
+});
+
+$("add-client-btn").onclick = () => { $("add-client").classList.remove("hidden"); $("new-token").classList.add("hidden"); };
+$("add-client-cancel").onclick = () => $("add-client").classList.add("hidden");
+$("add-client").onsubmit = async (ev) => {
+  ev.preventDefault();
+  const f = ev.target;
+  $("client-error").textContent = "";
+  try {
+    const agents = [...f.querySelectorAll("input[name=agent]:checked")].map((i) => i.value);
+    if (!agents.length) throw new Error("Pick at least one agent.");
+    const ws = f.ws.value;
+    const res = await api("POST", "/api/tokens", { name: f.name.value, agents, workspaces: ws ? [ws] : ["*"], defaultWorkspace: ws });
+    f.reset(); f.classList.add("hidden");
+    $("token-value").textContent = res.token;
+    $("copy-token").dataset.copy = res.token;
+    const host = res.publicUrl || "https://<server address>";
+    $("bridge-cmd").textContent = `actp ${agents[0]}@${host} --token-env ACTP_TOKEN`;
+    $("new-token").classList.remove("hidden");
+    refresh();
+  } catch (e) { $("client-error").textContent = e.message; }
+};
+
+$("add-remote-btn").onclick = () => $("add-remote").classList.remove("hidden");
+$("add-remote-cancel").onclick = () => $("add-remote").classList.add("hidden");
+$("add-remote").onsubmit = async (ev) => {
+  ev.preventDefault();
+  const f = ev.target;
+  $("remote-error").textContent = "";
+  try {
+    await api("POST", "/api/remotes", { name: f.name.value, url: f.url.value, token: f.token.value });
+    f.reset(); f.classList.add("hidden"); refresh();
+  } catch (e) { $("remote-error").textContent = e.message; }
+};
+
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

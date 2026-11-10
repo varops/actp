@@ -67,7 +67,7 @@ func cmdRemote(args []string) error {
 			if token == "" {
 				return fmt.Errorf("no token on stdin: %v", err)
 			}
-			path := filepath.Join(config.Dir(), "remotes", name+".token")
+			path := config.RemoteTokenPath(cfg, name)
 			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 				return err
 			}
@@ -116,7 +116,7 @@ func cmdRemote(args []string) error {
 		if err := config.WriteRemotesFile(cfg.RemotesFile, rf); err != nil {
 			return err
 		}
-		if removed.TokenFile == filepath.Join(config.Dir(), "remotes", removed.Name+".token") {
+		if removed.TokenFile == config.RemoteTokenPath(cfg, removed.Name) {
 			_ = os.Remove(removed.TokenFile)
 		}
 		fmt.Fprintf(os.Stderr, "Removed remote %q.\n", positional[0])

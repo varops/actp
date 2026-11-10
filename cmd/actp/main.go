@@ -21,7 +21,8 @@ var version = "dev"
 const usage = `actp – Agent Client Transport Protocol (ACP over HTTP)
 
 Usage:
-  actp serve [--config FILE]
+  actp serve [--config FILE] [--dashboard]
+  actp tray [--config FILE] [--no-open]  server, dashboard and menu bar icon
   actp <agent>@<server> [options]        bridge to a remote agent (see "actp bridge -h")
   actp bridge <agent>@<server> [options]
   actp token create --name NAME [--agents a,b] [--workspaces w,x] [--default-workspace w]
@@ -60,6 +61,8 @@ func run(args []string) error {
 		return cmdServe(rest)
 	case "bridge":
 		return cmdBridge(rest)
+	case "tray":
+		return cmdTray(rest)
 	case "token":
 		return cmdToken(rest)
 	case "agents":

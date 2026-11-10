@@ -57,3 +57,9 @@ func WriteRemotesFile(path string, rf *RemotesFile) error {
 	}
 	return os.Rename(tmp, path)
 }
+
+// RemoteTokenPath is where a saved remote's token lives when actp stores it
+// (next to the remotes file, readable only by this user).
+func RemoteTokenPath(c *Config, name string) string {
+	return filepath.Join(filepath.Dir(c.RemotesFile), "remotes", name+".token")
+}

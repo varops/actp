@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/varops/actp/internal/config"
+	"github.com/varops/actp/internal/dashboard"
 	"github.com/varops/actp/internal/server"
 	"github.com/varops/actp/internal/tunnel"
 )
@@ -21,74 +22,130 @@ import (
 func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	cfgPath := fs.String("config", "", "config file (default "+config.DefaultPath()+")")
+	dash := fs.Bool("dashboard", false, "also serve the local dashboard and print its one-time link")
 	if err := fs.Parse(args); err != nil {
 		return exitError(2)
 	}
-	cfg, err := config.Load(*cfgPath)
+	return runHost(context.Background(), hostOptions{configPath: *cfgPath, dashboard: *dash, requireServer: true})
+}
+
+type hostOptions struct {
+	configPath    string
+	dashboard     bool
+	requireServer bool
+	// onReady is called once the server and dashboard are up (dash may be nil).
+	onReady func(h *host)
+}
+
+// host is what `actp serve` and `actp tray` run: the server, its tunnel and the dashboard.
+type host struct {
+	log  *slog.Logger
+	srv  *server.Server // nil when the config has no server section
+	dash *dashboard.Dashboard
+	stop context.CancelFunc
+}
+
+// Quit asks the host to stop, like a signal does.
+func (h *host) Quit() { h.stop() }
+
+func runHost(parent context.Context, opts hostOptions) error {
+	cfg, err := config.Load(opts.configPath)
 	if err != nil {
 		return err
 	}
-	if cfg.Server == nil {
+	if cfg.Server == nil && opts.requireServer {
 		return fmt.Errorf("%s has no server section", cfg.Path())
 	}
-	sc := cfg.Server
-	if err := checkListen(sc); err != nil {
-		return err
-	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	if len(sc.Tokens) == 0 {
-		log.Warn("no tokens configured: nobody can connect. Create one with `actp token create --name NAME`.")
-	}
-	if len(sc.Agents) == 0 {
-		log.Warn("no agents configured")
-	}
+	ctx, stop := context.WithCancel(parent)
+	defer stop()
+	h := &host{log: log, stop: stop}
 
-	srv, err := server.New(sc, server.Options{Version: version, Logger: log, ProbeOnStart: true})
-	if err != nil {
-		return err
-	}
-	httpSrv := &http.Server{
-		Addr:              sc.Listen,
-		Handler:           srv.Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+	var httpSrv *http.Server
 	errs := make(chan error, 1)
-	go func() {
-		log.Info("actp server listening", "addr", sc.Listen, "version", version, "agents", len(sc.Agents))
-		if sc.TLSCert != "" {
-			errs <- httpSrv.ListenAndServeTLS(sc.TLSCert, sc.TLSKey)
-		} else {
-			errs <- httpSrv.ListenAndServe()
+	if sc := cfg.Server; sc != nil {
+		if err := checkListen(sc); err != nil {
+			return err
 		}
-	}()
-
-	ctx, stopTunnel := context.WithCancel(context.Background())
-	defer stopTunnel()
-	if mode := string(sc.Tunnel.Mode); mode != "off" {
-		if sc.TLSCert != "" {
-			return fmt.Errorf("the tunnel needs the server on plain HTTP on loopback; remove tls_cert and tls_key")
+		if len(sc.Tokens) == 0 {
+			log.Warn("no tokens configured: nobody can connect. Create one with `actp token create --name NAME` or the dashboard.")
 		}
-		token := ""
-		if mode == "named" {
-			token = os.Getenv(sc.Tunnel.TokenEnv)
+		if len(sc.Agents) == 0 {
+			log.Warn("no agents configured")
 		}
-		tun, err := tunnel.Start(ctx, tunnel.Options{
-			Mode: mode, Target: "http://" + sc.Listen, Token: token, Logger: log,
-			OnURL: func(u string) {
-				srv.SetPublicURL(u)
-				log.Info("clients can connect with: actp <agent>@" + u)
-			},
-		})
+		h.srv, err = server.New(sc, server.Options{Version: version, Logger: log, ProbeOnStart: true})
 		if err != nil {
-			return fmt.Errorf("tunnel: %w", err)
+			return err
 		}
-		defer func() { stopTunnel(); <-tun.Done() }()
+		ln, err := net.Listen("tcp", sc.Listen)
+		if err != nil {
+			return err
+		}
+		httpSrv = &http.Server{Handler: h.srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
+		go func() {
+			log.Info("actp server listening", "addr", sc.Listen, "version", version, "agents", len(sc.Agents))
+			if sc.TLSCert != "" {
+				errs <- httpSrv.ServeTLS(ln, sc.TLSCert, sc.TLSKey)
+			} else {
+				errs <- httpSrv.Serve(ln)
+			}
+		}()
+		if mode := string(sc.Tunnel.Mode); mode != "off" {
+			if sc.TLSCert != "" {
+				return fmt.Errorf("the tunnel needs the server on plain HTTP on loopback; remove tls_cert and tls_key")
+			}
+			token := ""
+			if mode == "named" {
+				token = os.Getenv(sc.Tunnel.TokenEnv)
+			}
+			srv := h.srv
+			tun, err := tunnel.Start(ctx, tunnel.Options{
+				Mode: mode, Target: "http://" + sc.Listen, Token: token, Logger: log,
+				OnURL: func(u string) {
+					srv.SetPublicURL(u)
+					log.Info("clients can connect with: actp <agent>@" + u)
+				},
+			})
+			if err != nil {
+				return fmt.Errorf("tunnel: %w", err)
+			}
+			defer func() { stop(); <-tun.Done() }()
+		}
+	}
+
+	if opts.dashboard {
+		srv := h.srv
+		path := cfg.Path()
+		h.dash, err = dashboard.Listen(dashboard.Options{Server: srv, ConfigPath: path, Version: version, Reload: func() error {
+			if srv == nil {
+				return nil
+			}
+			c, err := config.Load(path)
+			if err != nil {
+				return err
+			}
+			if c.Server == nil {
+				return errors.New("the server section is gone from the config")
+			}
+			srv.Reload(c.Server)
+			return nil
+		}})
+		if err != nil {
+			return err
+		}
+		defer h.dash.Close()
+		log.Info("dashboard (one-time link, local only): " + h.dash.URL())
+	}
+	if opts.onReady != nil {
+		go opts.onReady(h)
 	}
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(sig)
+	defer signal.Stop(hup)
 loop:
 	for {
 		select {
@@ -98,16 +155,24 @@ loop:
 			}
 			break loop
 		case <-hup:
-			reloadConfig(log, srv, cfg.Path(), sc)
+			if h.srv != nil {
+				reloadConfig(log, h.srv, cfg.Path(), cfg.Server)
+			}
 		case s := <-sig:
 			log.Info("stopping: waiting up to 30 s for running turns", "signal", s.String())
 			break loop
+		case <-ctx.Done():
+			log.Info("stopping: waiting up to 30 s for running turns")
+			break loop
 		}
 	}
-	srv.Close(30 * time.Second)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	return httpSrv.Shutdown(ctx)
+	if h.srv != nil {
+		h.srv.Close(30 * time.Second)
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return httpSrv.Shutdown(sctx)
+	}
+	return nil
 }
 
 // reloadConfig applies a changed config file. Listen address and TLS need a restart.
