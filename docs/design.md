@@ -184,7 +184,7 @@ Served by `actp serve`, JSON, versioned by path.
       "name": "Claude Code",
       "status": "ready",
       "workspaces": [{ "name": "website", "default": true }],
-      "agentInfo": { "name": "claude-code-acp", "version": "0.12.0" },
+      "agentInfo": { "name": "claude-agent-acp", "version": "0.102.0" },
       "agentCapabilities": { "loadSession": true }
     }
   ]
@@ -317,6 +317,8 @@ actp does not queue or reorder prompts. A `session/prompt` sent while a turn is 
 
 Because actp passes prompts, cancellations and `$/cancel_request` through unchanged and in order, both styles work as soon as the agent supports them. When ACP adds explicit queue and steer options, they pass through too.
 
+Some agents already queue on their own: Claude's adapter advertises `_meta.claudeCode.promptQueueing: true`. actp passes that through like any other capability.
+
 Clients can already offer both on ACP v1, on their own side, with plain ACP calls:
 
 - **Queue** – hold the prompt and send it when the current `session/prompt` returns. Pause the queue if a turn fails or the user stops it.
@@ -423,7 +425,7 @@ Everything is `internal/` until a public Go API is worth promising.
 - **Auth tests:** every endpoint except `/health` rejects a missing token, also from loopback.
 - **Disconnect tests:** drop during a permission request, resume, answer, turn completes. Drop during a long turn: the turn finishes while detached and the bridge receives all of it on resume. Detached with nothing running past `idle_close` → link closed, later `session/load` works. Prompt unanswered past `prompt_timeout` → cancelled.
 - **Mixed versions:** current bridge against previous server and the other way round.
-- **Real agents:** `claude-code-acp` and `codex-acp` smoke tests behind a build tag.
+- **Real agents:** `claude-agent-acp` and `codex-acp` smoke tests behind a build tag.
 
 ## 10. Milestones
 
@@ -445,4 +447,4 @@ What the code does today (M1 done, most of M2):
 
 - **Done:** server, bridge (`actp <agent>@<server>`), `token`, `agents`, `doctor`, `version`. Token auth with no local exception. Management endpoints. Wire format with acks, heartbeats, send window, resume and `bye`. Link states (attached, detached, unattended) with `idle_close`, `prompt_timeout`, `max_unattended` and `on_client_exit`. Settle order on link end. Rewrites: fs/terminal stripping, cwd resolution (`actp://`, workspace paths, `map`, opt-in fallback), MCP filtering, permission policies, terminal-auth hints. Session takeover on `session/load`. Probing and login status from traffic. Audit log. Agent process groups and cleanup after a crash. Login-shell environment for agents. CI on Linux, macOS and Windows.
 - **Not yet:** spilling the replay buffer to disk (it stays in memory up to `spool_limit`), config reload on `SIGHUP`, turn tracking for ACP v2 beyond the "recent output" rule, saved-remote commands (`actp remote ...`; edit `remotes:` in the config for now), tray, tunnel, release builds.
-- **Not tested against real agents yet** (M0). The scripted agent covers the protocol paths; real agents need logins on a real machine.
+- **Real agents, partly (M0):** Claude and OpenCode adapters pass `initialize`, `session/new`, updates and extension notifications through actp, and exit cleanly when stdin closes (`docs/agents.md`). Not yet checked: real prompts, a drop mid-turn, `session/load` after an unattended turn, cancelled permissions, and anything through a tunnel.

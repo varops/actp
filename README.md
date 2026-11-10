@@ -72,7 +72,7 @@ server:
       path: ~/code/website
   agents:
     - id: claude
-      preset: claude-code      # needs claude-code-acp on PATH and `claude /login` done
+      preset: claude-code      # needs claude-agent-acp on PATH and `claude /login` done
 ```
 
 Create a token for each client. It is printed once:

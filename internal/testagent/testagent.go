@@ -118,8 +118,17 @@ func (a *agent) handle(m *jsonrpc.Message) {
 	case "initialize":
 		var p struct {
 			ClientCapabilities json.RawMessage `json:"clientCapabilities"`
+			ClientInfo         *struct {
+				Name    *string `json:"name"`
+				Version *string `json:"version"`
+			} `json:"clientInfo"`
 		}
 		_ = json.Unmarshal(m.Params, &p)
+		// Strict like OpenCode: clientInfo needs a name and a version.
+		if p.ClientInfo != nil && (p.ClientInfo.Name == nil || p.ClientInfo.Version == nil) {
+			a.send(jsonrpc.NewError(m.ID, jsonrpc.CodeInvalidParams, "Invalid params", nil))
+			return
+		}
 		a.mu.Lock()
 		a.clientCaps = p.ClientCapabilities
 		a.mu.Unlock()

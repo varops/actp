@@ -368,3 +368,14 @@ func TestQuickRestartLoadsTheSession(t *testing.T) {
 	}
 	c2.chunk("before restart")
 }
+
+func TestProbe(t *testing.T) {
+	e := newEnv(t)
+	if status, detail := e.srv.Probe(&e.cfg.Agents[0]); status != "ready" {
+		t.Fatalf("probe: %s %s", status, detail)
+	}
+	e.cfg.Agents[0].Command = "/nonexistent/agent"
+	if status, _ := e.srv.Probe(&e.cfg.Agents[0]); status != "unavailable" {
+		t.Fatalf("missing agent probed as %s", status)
+	}
+}

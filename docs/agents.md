@@ -10,8 +10,8 @@ Agents change between releases. Each entry should say which version it was check
 
 | Preset | Command | Verified | Capabilities and notes |
 | --- | --- | --- | --- |
-| `claude-code` | `claude-code-acp` (npm `@zed-industries/claude-code-acp`, or `node <pkg>/dist/index.js`) | yes | `loadSession`, list, resume, fork, HTTP and SSE MCP, images. Claude Code only speaks ACP through this adapter. Login rides on the user's Claude Code login (`claude /login`). |
-| `codex` | `codex-acp` (Zed's adapter binary, built per platform) | yes | Full capability set. Plain `codex` does not speak ACP; use the adapter. Reasoning effort may need special handling. |
+| `claude-code` | `claude-agent-acp` (npm `@agentclientprotocol/claude-agent-acp`; the old `@zed-industries/claude-code-acp` is deprecated) | yes | `loadSession`, list, resume, fork, HTTP and SSE MCP, images. Claude Code only speaks ACP through this adapter. Login rides on the user's Claude Code login (`claude /login`). |
+| `codex` | `codex-acp` (npm `@agentclientprotocol/codex-acp`; the old `@zed-industries/codex-acp` is deprecated) | yes | Full capability set. Plain `codex` does not speak ACP; use the adapter. Reasoning effort may need special handling. |
 | `droid` | `droid exec --output-format acp` | yes | `loadSession`, list, resume, close, fork, images, embedded context, HTTP and SSE MCP, modes, ~49 models, config options. Needs `elicitation.form` from the client for its AskUser tool. Many quirks. |
 | `gemini` | `gemini --acp` | yes | `loadSession`, HTTP and SSE MCP, image and audio prompts. Modes `default`, `autoEdit`, `yolo`, `plan`. Default model `auto`. `--experimental-acp` is deprecated. |
 | `opencode` | `opencode acp` | yes | `loadSession`, fork, resume, close, HTTP and SSE MCP, images. Modes `build` and `plan`. Modes and models also appear as duplicate config options. |
@@ -24,6 +24,14 @@ Agents change between releases. Each entry should say which version it was check
 - **OMP**, **Mimo Code**, **Copilot** – terminal agents with no verified ACP launch.
 
 A custom agent is any command that speaks ACP over stdio. Use `command` and `args` in the config instead of `preset`.
+
+## Checked through actp
+
+On 2026-11-10, through `actp serve` and the bridge, with `initialize` and `session/new` only (no prompts):
+
+- **Claude** (`@agentclientprotocol/claude-agent-acp` 0.102.0): handshake, sessions and updates pass through. Sends `_auth/status_update` notifications after `initialize`. Advertises `_meta.claudeCode.promptQueueing: true` in `agentCapabilities`: it can queue prompts itself. Default mode `auto`.
+- **OpenCode** (`opencode-ai` 1.19.5): handshake and sessions pass through. Advertises `sessionCapabilities` close, fork, list and resume. Models come as a `model` config option. **Rejects `initialize` when `clientInfo` has no `version`** (`Invalid params`).
+- Both exit within about 20 ms when their stdin closes.
 
 ## Quirks the server handles
 

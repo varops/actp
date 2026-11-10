@@ -53,7 +53,7 @@ func TestParseAppliesDefaultsAndPresets(t *testing.T) {
 		t.Fatalf("tunnel mode = %q", s.Tunnel.Mode)
 	}
 	claude := s.Agent("claude")
-	if claude.Command != "claude-code-acp" || claude.Name != "Claude Code" || claude.MaxLinks != 16 || claude.OnClientExit != "finish" {
+	if claude.Command != "claude-agent-acp" || claude.Name != "Claude Code" || claude.MaxLinks != 16 || claude.OnClientExit != "finish" {
 		t.Fatalf("preset not applied: %+v", claude)
 	}
 	tok := &s.Tokens[0]

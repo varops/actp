@@ -18,7 +18,7 @@ const ProbeTimeout = 10 * time.Second
 // Probe starts an agent, runs initialize without a session, and records the
 // result for /api/v1/agents (design 3.4). It returns the recorded status.
 func (s *Server) Probe(agent *config.Agent) (status, detail string) {
-	result, err := probeAgent(agent, s.opts.BaseEnv, homeDir())
+	result, err := probeAgent(agent, s.opts.BaseEnv, homeDir(), s.opts.Version)
 	s.setStatus(agent.ID, func(st *agentStatus) {
 		switch {
 		case err != nil:
@@ -48,7 +48,7 @@ type probeResult struct {
 	authHint string
 }
 
-func probeAgent(agent *config.Agent, baseEnv []string, dir string) (*probeResult, error) {
+func probeAgent(agent *config.Agent, baseEnv []string, dir, version string) (*probeResult, error) {
 	proc, err := agentproc.Start(agentproc.Spec{
 		Command: agent.Command, Args: agent.Args, Dir: dir,
 		BaseEnv: baseEnv, Env: agent.Env, EnvRemove: agent.EnvRemove,
@@ -61,7 +61,7 @@ func probeAgent(agent *config.Agent, baseEnv []string, dir string) (*probeResult
 	req, _ := jsonrpc.NewRequest(json.RawMessage(`"actp-probe"`), "initialize", map[string]any{
 		"protocolVersion":    1,
 		"clientCapabilities": map[string]any{},
-		"clientInfo":         map[string]any{"name": "actp", "title": "actp probe"},
+		"clientInfo":         map[string]any{"name": "actp", "title": "actp probe", "version": version},
 	})
 	if err := jsonrpc.NewWriter(proc.Stdin).Write(req); err != nil {
 		return nil, err

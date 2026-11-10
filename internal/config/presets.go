@@ -11,7 +11,7 @@ type Preset struct {
 
 // Presets are built from docs/agents.md. Keep both in step.
 var Presets = map[string]Preset{
-	"claude-code": {Name: "Claude Code", Command: "claude-code-acp"},
+	"claude-code": {Name: "Claude Code", Command: "claude-agent-acp"},
 	"codex":       {Name: "Codex", Command: "codex-acp"},
 	"droid":       {Name: "Droid", Command: "droid", Args: []string{"exec", "--output-format", "acp"}},
 	"gemini":      {Name: "Gemini CLI", Command: "gemini", Args: []string{"--acp"}},
