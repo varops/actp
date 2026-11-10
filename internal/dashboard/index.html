@@ -153,6 +153,15 @@ function render() {
     $("srv-listen").textContent = "listening on " + srv.listen;
     if (srv.publicUrl) {
       $("tunnel").innerHTML = `<span class="dot ready"></span><code>${esc(srv.publicUrl)}</code><button data-copy="${esc(srv.publicUrl)}">Copy URL</button>`;
+    } else if (srv.tunnel && srv.tunnel !== "off" && srv.cloudflared === "missing") {
+      $("tunnel").innerHTML = `<span class="dot unavailable"></span><span class="muted">The tunnel needs cloudflared ${"(about 40 MB)"}.</span><button class="primary" id="install-cf">Install cloudflared</button>`;
+      $("install-cf").onclick = async (ev) => {
+        ev.target.disabled = true; ev.target.textContent = "Downloading…";
+        try { const r = await api("POST", "/api/cloudflared"); if (r.tunnelError) alert(r.tunnelError); } catch (e) { alert(e.message); }
+        refresh();
+      };
+    } else if (srv.tunnel && srv.tunnel !== "off" && srv.cloudflared === "unavailable") {
+      $("tunnel").innerHTML = `<span class="dot unavailable"></span><span class="muted">The tunnel needs cloudflared, and there is no build for this platform. Install it yourself and put it on PATH.</span>`;
     } else if (srv.tunnel && srv.tunnel !== "off") {
       $("tunnel").innerHTML = `<span class="dot detached"></span><span class="muted">Tunnel (${esc(srv.tunnel)}) is starting…</span>`;
     } else {

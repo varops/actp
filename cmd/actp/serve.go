@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -43,6 +44,36 @@ type host struct {
 	srv  *server.Server // nil when the config has no server section
 	dash *dashboard.Dashboard
 	stop context.CancelFunc
+	// tunnelLaunch starts the configured tunnel; nil when the tunnel is off.
+	tunnelLaunch func() (<-chan struct{}, error)
+	tunnelMu     sync.Mutex
+	tunnelDone   <-chan struct{}
+}
+
+// startTunnel starts the tunnel once; later calls are no-ops while it runs.
+func (h *host) startTunnel() error {
+	h.tunnelMu.Lock()
+	defer h.tunnelMu.Unlock()
+	if h.tunnelLaunch == nil {
+		return errors.New("the tunnel is off in the config")
+	}
+	if h.tunnelDone != nil {
+		return nil
+	}
+	done, err := h.tunnelLaunch()
+	if err == nil {
+		h.tunnelDone = done
+	}
+	return err
+}
+
+func (h *host) waitTunnel() {
+	h.tunnelMu.Lock()
+	done := h.tunnelDone
+	h.tunnelMu.Unlock()
+	if done != nil {
+		<-done
+	}
 }
 
 // Quit asks the host to stop, like a signal does.
@@ -94,29 +125,39 @@ func runHost(parent context.Context, opts hostOptions) error {
 			if sc.TLSCert != "" {
 				return fmt.Errorf("the tunnel needs the server on plain HTTP on loopback; remove tls_cert and tls_key")
 			}
-			token := ""
-			if mode == "named" {
-				token = os.Getenv(sc.Tunnel.TokenEnv)
+			h.tunnelLaunch = func() (<-chan struct{}, error) {
+				token := ""
+				if mode == "named" {
+					token = os.Getenv(sc.Tunnel.TokenEnv)
+				}
+				srv := h.srv
+				tun, err := tunnel.Start(ctx, tunnel.Options{
+					Mode: mode, Target: "http://" + sc.Listen, Token: token, Logger: log,
+					OnURL: func(u string) {
+						srv.SetPublicURL(u)
+						log.Info("clients can connect with: actp <agent>@" + u)
+					},
+				})
+				if err != nil {
+					return nil, err
+				}
+				return tun.Done(), nil
 			}
-			srv := h.srv
-			tun, err := tunnel.Start(ctx, tunnel.Options{
-				Mode: mode, Target: "http://" + sc.Listen, Token: token, Logger: log,
-				OnURL: func(u string) {
-					srv.SetPublicURL(u)
-					log.Info("clients can connect with: actp <agent>@" + u)
-				},
-			})
-			if err != nil {
-				return fmt.Errorf("tunnel: %w", err)
+			if err := h.startTunnel(); err != nil {
+				// A missing cloudflared should not stop the server: it can be installed from the dashboard.
+				log.Warn("tunnel not started: "+err.Error(), "fix", "actp tunnel install, or the dashboard")
 			}
-			defer func() { stop(); <-tun.Done() }()
+			defer func() {
+				stop()
+				h.waitTunnel()
+			}()
 		}
 	}
 
 	if opts.dashboard {
 		srv := h.srv
 		path := cfg.Path()
-		h.dash, err = dashboard.Listen(dashboard.Options{Server: srv, ConfigPath: path, Version: version, Reload: func() error {
+		h.dash, err = dashboard.Listen(dashboard.Options{Server: srv, ConfigPath: path, Version: version, StartTunnel: h.startTunnel, Reload: func() error {
 			if srv == nil {
 				return nil
 			}

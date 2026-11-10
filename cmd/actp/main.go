@@ -32,6 +32,7 @@ Usage:
   actp remote list
   actp remote remove NAME
   actp agents <server> [--token-env NAME | --token-file PATH]
+  actp tunnel install                    download the pinned cloudflared into ~/.actp/bin
   actp doctor [--config FILE]
   actp version
 `
@@ -69,6 +70,8 @@ func run(args []string) error {
 		return cmdAgents(rest)
 	case "remote":
 		return cmdRemote(rest)
+	case "tunnel":
+		return cmdTunnel(rest)
 	case "doctor":
 		return cmdDoctor(rest)
 	case "version", "--version", "-v":

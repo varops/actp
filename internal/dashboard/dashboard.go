@@ -22,6 +22,7 @@ import (
 	"github.com/varops/actp/internal/autostart"
 	"github.com/varops/actp/internal/config"
 	"github.com/varops/actp/internal/server"
+	"github.com/varops/actp/internal/tunnel"
 )
 
 //go:embed index.html
@@ -36,6 +37,8 @@ type Options struct {
 	Version    string
 	// Reload re-reads the config after the dashboard changed tokens.
 	Reload func() error
+	// StartTunnel starts the configured tunnel, for example after installing cloudflared.
+	StartTunnel func() error
 }
 
 // Dashboard serves the local page.
@@ -92,6 +95,7 @@ func (d *Dashboard) Handler() http.Handler {
 	mux.HandleFunc("POST /api/remotes", d.addRemote)
 	mux.HandleFunc("DELETE /api/remotes/{name}", d.removeRemote)
 	mux.HandleFunc("POST /api/autostart", d.setAutostart)
+	mux.HandleFunc("POST /api/cloudflared", d.installCloudflared)
 	return d.guard(mux)
 }
 
@@ -155,14 +159,16 @@ type statusResponse struct {
 }
 
 type serverStatus struct {
-	Name       string              `json:"name"`
-	Listen     string              `json:"listen"`
-	PublicURL  string              `json:"publicUrl,omitempty"`
-	Tunnel     string              `json:"tunnel"`
-	Agents     []server.AgentState `json:"agents"`
-	Links      []linkView          `json:"links"`
-	Tokens     []string            `json:"tokens"`
-	Workspaces []string            `json:"workspaces"`
+	Name      string `json:"name"`
+	Listen    string `json:"listen"`
+	PublicURL string `json:"publicUrl,omitempty"`
+	Tunnel    string `json:"tunnel"`
+	// Cloudflared is "ok", "missing" (installable) or "unavailable" (no pinned build for this platform).
+	Cloudflared string              `json:"cloudflared"`
+	Agents      []server.AgentState `json:"agents"`
+	Links       []linkView          `json:"links"`
+	Tokens      []string            `json:"tokens"`
+	Workspaces  []string            `json:"workspaces"`
 }
 
 type linkView struct {
@@ -192,7 +198,13 @@ func (d *Dashboard) status(w http.ResponseWriter, r *http.Request) {
 	}
 	if srv := d.opts.Server; srv != nil {
 		sc := srv.Config()
-		st := &serverStatus{Name: sc.Name, Listen: sc.Listen, PublicURL: srv.PublicURL(), Tunnel: string(sc.Tunnel.Mode), Agents: srv.Agents(), Links: []linkView{}}
+		st := &serverStatus{Name: sc.Name, Listen: sc.Listen, PublicURL: srv.PublicURL(), Tunnel: string(sc.Tunnel.Mode), Agents: srv.Agents(), Links: []linkView{}, Cloudflared: "ok"}
+		if _, err := tunnel.FindBinary(nil); err != nil {
+			st.Cloudflared = "unavailable"
+			if tunnel.CanDownload() {
+				st.Cloudflared = "missing"
+			}
+		}
 		for _, l := range srv.Links() {
 			st.Links = append(st.Links, linkView{ID: l.ID, Agent: l.Agent, Token: l.Token, ClientName: l.ClientName, State: l.State, Since: l.Since.UTC().Format("2006-01-02T15:04:05Z"), Running: l.Running})
 		}
@@ -384,6 +396,21 @@ func (d *Dashboard) removeRemote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (d *Dashboard) installCloudflared(w http.ResponseWriter, r *http.Request) {
+	path, err := tunnel.Download(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err)
+		return
+	}
+	resp := map[string]string{"path": path}
+	if d.opts.StartTunnel != nil {
+		if err := d.opts.StartTunnel(); err != nil {
+			resp["tunnelError"] = err.Error()
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (d *Dashboard) setAutostart(w http.ResponseWriter, r *http.Request) {

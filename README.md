@@ -99,7 +99,7 @@ server:
     mode: quick        # a random https://….trycloudflare.com URL, new on each restart
 ```
 
-`mode: named` with `token_env` gives a stable hostname from your Cloudflare account.
+`mode: named` with `token_env` gives a stable hostname from your Cloudflare account. If `cloudflared` is missing, `actp tunnel install` (or a button in the dashboard) downloads a version whose checksum is pinned in actp.
 
 On the client machine, point any ACP client at the bridge instead of a local agent:
 
