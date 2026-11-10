@@ -27,6 +27,11 @@ A custom agent is any command that speaks ACP over stdio. Use `command` and `arg
 
 ## Checked through actp
 
+On 2026-11-10, a full prompt with **Droid** went through a quick Cloudflare tunnel from one Mac to another: streamed thinking, the answer and `end_turn` in 13.6 s. Droid, Grok and OpenCode all probed as ready on the same Mac.
+
+### Earlier checks
+
+
 On 2026-11-10, through `actp serve` and the bridge, with `initialize` and `session/new` only (no prompts):
 
 - **Claude** (`@agentclientprotocol/claude-agent-acp` 0.102.0): handshake, sessions and updates pass through. Sends `_auth/status_update` notifications after `initialize`. Advertises `_meta.claudeCode.promptQueueing: true` in `agentCapabilities`: it can queue prompts itself. Default mode `auto`.

@@ -1,6 +1,6 @@
 # actp design
 
-Status: draft 5 (2026-11-10). Section 12 lists what the code does today.
+Status: v0.1.0 (2026-11-10). Section 12 lists what the code does today.
 
 `actp` (Agent Client Transport Protocol) is a tool that runs ACP agents on one machine and lets ACP clients use them from another. It is ACP over HTTP, packaged as one Go binary.
 
@@ -83,21 +83,26 @@ Options:
 | `--map FROM=TO` | Rewrite `cwd` values starting with `FROM`. Repeatable. |
 | `--name NAME` | Client name shown on the server. Default: hostname. |
 | `--log-file PATH` | Debug log. stdout is ACP, so logs never go there. |
+| `-p TEXT`, `--prompt TEXT` | Instead of bridging stdio: send one prompt and print the answer, like `claude -p`. For trying a setup from a terminal; ACP clients never use it. |
+| `--yes`, `--no` | With `-p`: allow or deny every permission request instead of asking on the terminal. |
 
 Tokens are never accepted as a plain argument, because command lines are visible to other users.
 
 Exit codes: `0` when the client closed stdin (the link is detached, not stopped; see 3.1), `1` on failure (reason on stderr).
 
+Started by hand in a terminal, the bridge says it expects JSON-RPC on stdin and points to `-p`. A stray argument (a prompt without `-p`) is an error that suggests `-p`.
+
 ### 2.3 Other CLI commands
 
 ```
-actp serve
-actp tray
+actp serve [--dashboard]                 run the server (and print a one-time dashboard link)
+actp tray [--no-open]                    server, dashboard and menu bar icon
 actp token create --name N [--agents a,b] [--workspaces w] [--default-workspace w]   prints the token once
 actp token list | revoke <name>
-actp remote add <name> <url> [--token-stdin]
+actp remote add <name> <url> [--token-stdin | --token-env NAME | --token-file PATH]
 actp remote list | remove <name>
 actp agents <server>                     list agents on a server
+actp tunnel install                      download the pinned cloudflared into ~/.actp/bin
 actp doctor                              check agent commands, probe agents, check remotes
 actp version
 ```
@@ -446,8 +451,19 @@ Everything is `internal/` until a public Go API is worth promising.
 
 ## 12. Implementation status
 
-What the code does today (M1 done, most of M2):
+What v0.1.0 does:
 
-- **Done:** server, bridge (`actp <agent>@<server>`), `token`, `remote` (kept in `remotes_file`, tokens from `--token-stdin` saved in a private file), `agents`, `doctor`, `version`. Token auth with no local exception. Management endpoints. Wire format with acks, heartbeats, send window, resume and `bye`. Link states (attached, detached, unattended) with `idle_close`, `prompt_timeout`, `max_unattended` and `on_client_exit`. Settle order on link end. Rewrites: fs/terminal stripping, cwd resolution (`actp://`, workspace paths, `map`, opt-in fallback), MCP filtering, permission policies, terminal-auth hints. Session takeover on `session/load`. Replay buffer spilled to a private spool file. Local dashboard (`actp serve --dashboard`, `actp tray`): server and tunnel status, agents with re-check, connections with End, adding clients (token shown once) and remotes. It listens on loopback only and needs a one-time link, a session cookie, the right `Host` and a custom header on writes. Tray icon behind the `tray` build tag (`fyne.io/systray`); without it, `actp tray` opens the dashboard page. Remote tokens in the OS keychain (private file as fallback). Start at login (LaunchAgent, XDG autostart, Run key) from the dashboard and the tray. `cloudflared` download with checksums pinned in actp (`actp tunnel install` or a dashboard button); a missing `cloudflared` no longer stops the server. Release workflow: tagging `v*` builds the CLI for all platforms, desktop builds for Linux and Windows, and a universal macOS desktop build on a Mac runner, into a draft release. Cloudflare tunnel (quick and named) supervised by `actp serve`, with the public URL in `/api/v1/info`; the named-tunnel token goes through the environment, never the command line. Config reload on `SIGHUP` (a revoked token cannot open or resume links; open links run on until they drop). Probing and login status from traffic. Audit log. Agent process groups and cleanup after a crash. Login-shell environment for agents. CI on Linux, macOS and Windows.
-- **Not yet:** turn tracking for ACP v2 beyond the "recent output" rule, signed and notarized installers. The tray icon is built and compiles for Linux and Windows but has not been run on a desktop yet; macOS builds need a Mac.
-- **Real agents, partly (M0):** Claude and OpenCode adapters pass `initialize`, `session/new`, updates and extension notifications through actp, and exit cleanly when stdin closes (`docs/agents.md`). Not yet checked: real prompts, a drop mid-turn, `session/load` after an unattended turn, cancelled permissions, and anything through a tunnel.
+- **Server and bridge:** token auth with no local exception, management endpoints, and the wire format with acks, heartbeats, send window, resume and `bye`. Link states (attached, detached, unattended) with `idle_close`, `prompt_timeout`, `max_unattended` and `on_client_exit`, the settle order on link end, and output for a client that comes back after the agent exited. Rewrites: file and terminal stripping, cwd resolution (`actp://`, workspace paths, `map`, opt-in fallback), MCP filtering, permission policies, terminal-auth hints. Session takeover on `session/load`. Replay buffer spilled to a private spool file. Probing and login status from traffic. Audit log. Agent process groups and cleanup after a crash. Login-shell environment for agents. Config reload on `SIGHUP`.
+- **CLI:** `serve`, the bridge with `-p` for one-shot prompts, `token`, `remote`, `agents`, `tunnel install`, `doctor`, `tray`, `version`. Remote tokens in the OS keychain, with a private file as fallback.
+- **Tunnel:** quick and named Cloudflare tunnels supervised by `actp serve`. `cloudflared` runs with its own empty config, so a `~/.cloudflared/config.yml` cannot take the tunnel over. `cloudflared` can be downloaded with a checksum pinned in actp. The server checks its own public URL (resolving through 1.1.1.1, after a short wait) and reports whether it is reachable. `cloudflared`'s output is kept in `~/.actp/logs/cloudflared.log`.
+- **Desktop:** a local dashboard with a server tab (setup from scratch, agents, folders, client tokens with revoke, connections, tunnel status) and a bridge tab (remotes with edit, the agents each offers, commands to copy, installing the `actp` command). It listens on loopback only and needs a one-time link, a session cookie, the right `Host` and a custom header on writes. A menu bar app (`actp.app` on macOS, tray builds for Linux and Windows) with start at login. The app logs to `~/.actp/logs/actp.log`.
+- **Release:** CI on Linux, macOS and Windows, including building `actp.app` on a Mac runner. Tagging `v*` builds every platform into a draft GitHub release.
+- **Checked with real agents:** a full prompt with Droid through a quick tunnel, from one Mac to another (thinking, answer, stop reason). Handshakes and sessions with the Claude, OpenCode and Grok adapters (`docs/agents.md`).
+
+Not yet:
+
+- Signed and notarized builds (the macOS app is ad-hoc signed: fine on your own Mac, Gatekeeper warns elsewhere).
+- Named tunnels set up locally with `cloudflared tunnel create` (credentials file and `config.yml`). Named mode takes a dashboard token today.
+- Turn tracking for ACP v2 beyond the "recent output" rule.
+- Tray icon on real Linux and Windows desktops (built and tested in CI, not tried by hand).
+- Not yet checked with real agents: a network drop mid-turn, `session/load` after an unattended turn, cancelled permissions.

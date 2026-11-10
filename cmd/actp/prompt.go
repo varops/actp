@@ -187,6 +187,9 @@ func defaultFolder(baseURL, token, agent string) (string, error) {
 	return "", fmt.Errorf("the server offers no agent %q to this token", agent)
 }
 
+// lastKind is the previous update kind, so a new kind of output starts on its own line.
+var lastKind string
+
 // printUpdate shows the parts of a session/update a person wants to see.
 func printUpdate(m *jsonrpc.Message) {
 	if m.Method != "session/update" {
@@ -207,6 +210,11 @@ func printUpdate(m *jsonrpc.Message) {
 		return
 	}
 	u := p.Update
+	if lastKind == "agent_thought_chunk" && u.Kind != lastKind {
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr)
+	}
+	lastKind = u.Kind
 	switch u.Kind {
 	case "agent_message_chunk":
 		fmt.Print(u.Content.Text)

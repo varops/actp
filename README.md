@@ -2,86 +2,100 @@
 
 **ACP over HTTP.** Run coding agents on one machine, use them from anywhere.
 
-> Status: early. The server and bridge work and are tested against a scripted agent. Checked with real Claude and OpenCode adapters for handshakes and sessions. The tray icon has not been tried on a real desktop yet. See [`docs/design.md`](docs/design.md) section 12.
+ACTP lets any [ACP](https://agentclientprotocol.com) client – an app, a bot, an editor – use a coding agent such as Claude Code, Codex, Droid or Pi that runs on another machine, as if it were local. The agent keeps its own login, files and tools on its machine. The client keeps speaking plain ACP. Neither side needs to change.
 
-## Mission
+```
+ ACP client (app, bot, editor)                       machine with the agents
+ ─────────────────────────────                       ──────────────────────────────────
+ spawns: actp droid@workstation                      actp server
+        │  plain ACP over stdio                         │  plain ACP over stdio
+        ▼                                               ▼
+   actp bridge  ════ HTTPS / WebSocket, token ════►  Droid · Claude Code · Codex · Pi …
+```
 
-Agents should run where the power, the code and the credentials are. Apps that use them should run wherever suits them. ACTP connects the two, so any ACP client can use any ACP agent on any machine, as if it were local.
-
-## Objective
-
-The [Agent Client Protocol (ACP)](https://agentclientprotocol.com) connects clients to coding agents such as Claude Code, Codex and Pi. Today it runs over stdio, so the client and the agent must live on the same machine.
-
-ACTP is a tool that removes that limit. It is one binary, `actp`, with:
-
-- **A server** that runs next to your agents and serves them over the network.
-- **A bridge** that any ACP client spawns instead of a local agent. To the client it is just another ACP agent.
-- **A tray app** for macOS, Windows and Linux, with built-in Cloudflare tunnels for machines without a public address.
-
-What you get:
-
-- **Nothing to change in clients or agents** – both sides speak plain ACP.
-- **Durable connections** – a dropped network does not end the agent's work. The bridge reconnects and picks up where it left off.
-- **Authentication** – tokens, scoped per client to agents and workspaces.
-- **Safe defaults** – files, terminals and processes stay on the agent's machine, inside allowed workspaces.
-
-v1 is built for chat-style clients: apps, bots and assistants that talk to an agent and show what it does. The files live on the agent's machine, so clients that edit files themselves (IDEs) are out of scope for now.
-
-ACTP is a tool, not a new standard. Its promises are the CLI, the config file, a small management API and its behaviour. The wire between bridge and server is internal, so it can follow ACP's own web transport as that matures.
+> **v0.1.0** – the first release. It works end to end, including through a Cloudflare tunnel, and has been tried with real agents. Builds are not signed yet. See [what is done and what is not](docs/design.md#12-implementation-status).
 
 ## Why
 
 - **Distributed agents** – keep agents on a strong workstation while your app runs on a small VPS.
 - **Personal agents** – connect an assistant running on your Mac to a family or business space.
-- **Own infrastructure** – connect agents from machines you already own.
-- **Portable integrations** – any ACP client can talk to remote agents.
+- **Your own machines** – use the computers you already have, with the logins you already have.
+- **Any ACP client** – nothing to add to the client: it starts `actp` instead of a local agent.
 
-## How it fits together
+## What you get
 
-```
- Any ACP client (app, bot, editor)
-      │ spawns: actp claude@https://agents.example.com
-      ▼
- actp bridge ──── HTTPS / WebSocket ────► actp server  (agent machine)
-                                               │ ACP (stdio)
-                                               ▼
-                                    Claude Code · Codex · Pi · ...
-```
+- **Plain ACP on both ends.** Clients and agents do not know actp is there.
+- **Connections that survive drops.** A closed lid or a Wi-Fi change does not stop the agent. The bridge reconnects and catches up without losing or repeating a message.
+- **Tokens per client**, limited to the agents and folders you choose, and revocable at any time.
+- **Safe defaults.** Agents only start in folders you allow. Files, terminals and local MCP servers stay on the agent's machine.
+- **A menu bar app** for macOS (and tray builds for Linux and Windows) with a dashboard, so you do not need to edit config files.
+- **Built-in Cloudflare tunnel** for machines without a public address.
 
-In a client's agent config:
+v0.1.0 is built for chat-style clients: apps, bots and assistants that talk to an agent and show what it does. The files live on the agent's machine, so clients that edit files themselves (IDE-style) are not a target yet.
 
-```json
-{ "command": "actp", "args": ["claude@https://agents.example.com", "--token-env", "ACTP_TOKEN"] }
-```
+## Install
 
-## Quickstart
+Download a build from the [releases page](https://github.com/varops/actp/releases):
 
-Build it (Go 1.25+):
+| File | For |
+| --- | --- |
+| `actp_<version>_macos.zip` | macOS menu bar app (`actp.app`), Apple Silicon and Intel. |
+| `actp-desktop_<version>_<os>_<arch>` | Linux and Windows builds with the tray icon. |
+| `actp_<version>_<os>_<arch>` | The command line only, for servers and scripts. |
+
+macOS builds are not signed yet. The first time, right-click `actp.app` and choose **Open**.
+
+Or build from source with Go 1.25+:
 
 ```bash
 go install github.com/varops/actp/cmd/actp@latest
 ```
+
+On a Mac, `packaging/macos/build-app.sh` builds `dist/actp.app`.
+
+## Quick start with the app
+
+On the **machine with the agents**:
+
+1. Open `actp.app`. It lives in the menu bar and opens its dashboard.
+2. In **Share agents**, pick the agents you want to share (actp lists the ones installed), the folders they may work in, and whether to use a Cloudflare tunnel. Click **Start sharing**.
+3. Under **Client tokens**, click **Create token…** for each machine or app that will connect. Copy the token; it is shown once.
+4. Copy the server URL. With a tunnel, wait until it says **reachable** (a new tunnel can take a minute).
+
+On the **client machine**:
+
+1. Open `actp.app` and go to **Use remote agents**.
+2. Click **Install the actp command**, then **Add remote…** with a name (for example `workstation`), the URL and the token.
+3. Under that remote, copy the command for the agent you want (for example `actp droid@workstation`) and use it as the agent command in your ACP client (see below).
+
+Try it from a terminal:
+
+```bash
+actp droid@workstation -p "Say hello and list the files here"
+```
+
+## Quick start on the command line
 
 On the machine with the agents, create `~/.actp/actp.yaml`:
 
 ```yaml
 server:
   listen: 127.0.0.1:7860
+  tunnel:
+    mode: quick                # or off, behind your own TLS proxy
   workspaces:
     - name: website
       path: ~/code/website
   agents:
     - id: claude
-      preset: claude-code      # needs claude-agent-acp on PATH and `claude /login` done
+      preset: claude-code      # needs claude-agent-acp on PATH and `claude /login`
+    - id: droid
+      preset: droid
 ```
-
-Create a token for each client. It is printed once:
 
 ```bash
-actp token create --name my-bot --default-workspace website
+actp token create --name laptop --default-workspace website
 ```
-
-Check the setup, then start the server:
 
 ```bash
 actp doctor
@@ -91,45 +105,110 @@ actp doctor
 actp serve
 ```
 
-The server listens on loopback. To reach it from another machine, put it behind a TLS reverse proxy, or let actp run a Cloudflare tunnel (needs `cloudflared` on PATH):
+`actp serve` prints the tunnel URL once it is up. On the client machine:
 
-```yaml
-server:
-  tunnel:
-    mode: quick        # a random https://….trycloudflare.com URL, new on each restart
+```bash
+echo 'actp_…' | actp remote add workstation https://….trycloudflare.com --token-stdin
 ```
 
-`mode: named` with `token_env` gives a stable hostname from your Cloudflare account. If `cloudflared` is missing, `actp tunnel install` (or a button in the dashboard) downloads a version whose checksum is pinned in actp.
+```bash
+actp agents workstation
+```
 
-On the client machine, point any ACP client at the bridge instead of a local agent:
+```bash
+actp claude@workstation -p "What is in this folder?"
+```
+
+## Use it from an ACP client
+
+Use `actp <agent>@<remote>` as the agent command. For example, in Zed's settings:
 
 ```json
-{ "command": "actp", "args": ["claude@https://agents.example.com", "--token-env", "ACTP_TOKEN", "--cwd", "actp://website"] }
+"agent_servers": {
+  "Droid (workstation)": {
+    "command": "/opt/homebrew/bin/actp",
+    "args": ["droid@workstation"]
+  }
+}
 ```
 
-`--cwd actp://website` sends every session to the `website` workspace on the server, whatever folder the client is in. To try a remote agent from a terminal, add `-p` for a one-shot prompt:
+Other clients take the same command and arguments; **Copy as JSON** in the dashboard gives you both. Use the full path to `actp`: apps started from Finder often do not see your shell's PATH.
+
+Useful bridge options:
+
+| Option | What it does |
+| --- | --- |
+| `--cwd actp://website` | Start every session in the `website` folder on the server, whatever folder the client sends. |
+| `--map /local/path=actp://website` | Translate one client folder to a server folder. |
+| `--token-env NAME` | Read the token from an environment variable instead of a saved remote. |
+| `-p "text"` | Send one prompt and print the answer – for people at a terminal, not for clients. |
+
+The server also accepts a URL directly: `actp droid@https://agents.example.com --token-env ACTP_TOKEN`.
+
+## How it behaves
+
+- **The network drops:** the agent keeps working. The bridge reconnects in the background and receives everything it missed. A permission prompt waits for you.
+- **The client quits:** the agent finishes its turn, then the session closes. The client can load the session again later and see what happened. To stop work, the client cancels the turn as usual.
+- **The agent asks a question nobody can answer** (the client is gone): it is cancelled at once, so the session does not hang.
+- **Folders:** a client folder means nothing on the server. Clients name a server folder as `actp://<name>`, or you map folders in the token or with `--cwd`.
+
+The details are in [`docs/design.md`](docs/design.md), section 3.
+
+## Tunnels
+
+- **`mode: quick`** needs no account. The URL is random and **changes every time the server restarts**. Update your remotes with **Edit** in the dashboard. A new quick tunnel can take a minute to resolve.
+- **`mode: named`** with `token_env` gives a stable hostname from your Cloudflare account (a dashboard-managed tunnel token).
+- **No tunnel:** put `actp serve` behind your own TLS reverse proxy, or set `tls_cert` and `tls_key`.
+
+If `cloudflared` is missing, the dashboard offers to install it, or run `actp tunnel install`. actp downloads a fixed version and checks a SHA-256 built into actp.
+
+## Troubleshooting
+
+| Symptom | What to check |
+| --- | --- |
+| "no actp server answers at …" | The URL is wrong or the quick tunnel restarted. Copy the current URL from the server's dashboard. |
+| Tunnel "not reachable yet" | Wait a minute. If it lasts, see `~/.actp/logs/cloudflared.log`. |
+| "no such host" after a while | Your computer cached "not found": `sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder` on macOS. |
+| An agent shows `auth_required` | Log that agent in on the server machine (for example `claude /login`). |
+| Something else | `~/.actp/logs/actp.log` (the app) and `actp doctor`. |
+
+A quick check that a server answers:
 
 ```bash
-actp claude@workstation -p "Say hello and list the files here"
-``` List what a server offers:
-
-```bash
-actp agents https://agents.example.com --token-env ACTP_TOKEN
+curl https://your-server/health
 ```
 
-### macOS app
+It should print `{"ok":true}`.
 
-On a Mac with Go and the Xcode command line tools:
+## Security
 
-```bash
-packaging/macos/build-app.sh
+- **A client token is close to a shell.** Whoever holds it can make the agents do anything your user can do on that machine. Folders limit where agents start, not what they can do. Only give tokens to clients you trust, and revoke them when you are done.
+- Every request needs a token, including from the same machine: a tunnel makes outside traffic look local.
+- Tokens are stored as hashes on the server and in the OS keychain on clients. They never go on a command line.
+- The dashboard only listens on `127.0.0.1` and only opens through a one-time link.
+
+## Commands
+
+```
+actp serve [--dashboard]                     run the server
+actp tray                                    server, dashboard and menu bar icon
+actp <agent>@<server> [options]              the bridge an ACP client spawns
+actp <agent>@<server> -p "text"              one prompt from a terminal
+actp token create|list|revoke                client tokens on a server
+actp remote add|list|remove                  saved servers on a client
+actp agents <server>                         what a server offers
+actp tunnel install                          download cloudflared
+actp doctor                                  check the config and the agents
+actp version
 ```
 
-This builds `dist/actp.app`, a menu bar app with no Dock icon. Move it to Applications and open it. On first launch it opens the dashboard; "Start at login" is in the menu. Tagged releases include a ready-made `actp_<version>_macos.zip`.
+## Documents
 
-### Dashboard and tray
-
-`actp serve --dashboard` prints a one-time link to a local page with the server status, agents, open connections, and buttons to add clients and remotes. `actp tray` starts the server and opens that page; built with `-tags tray`, it also shows a menu bar icon (macOS builds need a Mac).
+- [`docs/design.md`](docs/design.md) – public API, configuration, behaviour, and what is done.
+- [`docs/agents.md`](docs/agents.md) – supported agents, how to start them, and their quirks.
+- [`api/openapi.yaml`](api/openapi.yaml) – the HTTP API.
+- [`docs/wire.md`](docs/wire.md) – the internal bridge-to-server format (may change).
+- [`docs/brainstorm.md`](docs/brainstorm.md) – early notes and decisions.
 
 ## Development
 
@@ -141,15 +220,7 @@ go test -race ./...
 go generate ./api/
 ```
 
-The second command regenerates the HTTP code after a change to `api/openapi.yaml`.
-
-## Documents
-
-- [`api/openapi.yaml`](api/openapi.yaml) – the HTTP API.
-- [`docs/design.md`](docs/design.md) – the design: public API, behaviour, milestones.
-- [`docs/agents.md`](docs/agents.md) – known ACP agents: how to start them and their quirks.
-- [`docs/wire.md`](docs/wire.md) – the internal bridge-to-server format (subject to change).
-- [`docs/brainstorm.md`](docs/brainstorm.md) – early notes and decisions.
+The second command regenerates the HTTP code after a change to `api/openapi.yaml`. CI runs the tests on Linux, macOS and Windows and builds `actp.app` on a Mac. Pushing a `v*` tag builds every platform into a draft GitHub release.
 
 ## License
 

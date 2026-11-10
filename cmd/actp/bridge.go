@@ -52,6 +52,12 @@ func cmdBridge(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return exitError(2)
 	}
+	if fs.NArg() > 0 {
+		if prompt == "" && fs.NArg() == 1 {
+			return fmt.Errorf("unexpected argument %q. To send it as a prompt, use: actp %s -p %q", fs.Arg(0), target, fs.Arg(0))
+		}
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " "))
+	}
 
 	agent, server, ok := strings.Cut(target, "@")
 	if !ok || agent == "" || server == "" {
@@ -71,6 +77,9 @@ func cmdBridge(args []string) error {
 	}
 	if *name == "" {
 		*name, _ = os.Hostname()
+	}
+	if isTerminal(os.Stdin) {
+		fmt.Fprintf(os.Stderr, "actp: bridging %s for an ACP client: it expects JSON-RPC on stdin. To type a prompt, use: actp %s -p \"…\"\n", target, target)
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	if *logFile != "" {
@@ -191,4 +200,10 @@ func (c *cancelableReader) Read(p []byte) (int, error) {
 	n := copy(p, c.buf)
 	c.buf = c.buf[n:]
 	return n, nil
+}
+
+// isTerminal reports whether f is an interactive terminal rather than a pipe.
+func isTerminal(f *os.File) bool {
+	info, err := f.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
 }
