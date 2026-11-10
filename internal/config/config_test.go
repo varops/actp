@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -16,7 +17,7 @@ server:
     mode: off
   workspaces:
     - name: website
-      path: /srv/website
+      path: WORKSPACE
   agents:
     - id: claude
       preset: claude-code
@@ -34,8 +35,13 @@ remotes:
     url: https://agents.example.com
 `
 
+// sampleConfig uses an absolute workspace path for this platform.
+func sampleConfig(t *testing.T) string {
+	return strings.ReplaceAll(sample, "WORKSPACE", strconv.Quote(t.TempDir()))
+}
+
 func TestParseAppliesDefaultsAndPresets(t *testing.T) {
-	cfg, err := Parse([]byte(sample))
+	cfg, err := Parse([]byte(sampleConfig(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +72,7 @@ func TestParseAppliesDefaultsAndPresets(t *testing.T) {
 }
 
 func TestValidateCatchesBadReferences(t *testing.T) {
-	bad := strings.ReplaceAll(sample, "agents: [claude]", "agents: [nope]")
+	bad := strings.ReplaceAll(sampleConfig(t), "agents: [claude]", "agents: [nope]")
 	bad = strings.ReplaceAll(bad, "default_workspace: website", "default_workspace: other")
 	cfg, err := Parse([]byte(bad))
 	if err != nil {

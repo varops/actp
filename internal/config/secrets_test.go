@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/zalando/go-keyring"
@@ -36,7 +37,7 @@ func TestRemoteTokenFallsBackToAPrivateFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	info, err := os.Stat(r.TokenFile)
-	if r.TokenKeychain || err != nil || info.Mode().Perm()&0o077 != 0 {
+	if r.TokenKeychain || err != nil || (runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0) {
 		t.Fatalf("remote %+v, file %v %v", r, info, err)
 	}
 	if tok, _ := RemoteToken(r); tok != "actp_secret" {

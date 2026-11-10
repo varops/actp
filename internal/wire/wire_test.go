@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -218,7 +219,7 @@ func TestSpoolSpillsToDiskAndReplays(t *testing.T) {
 	if err := server.SpoolError(); err != nil {
 		t.Fatal(err)
 	}
-	if info, err := os.Stat(opts.SpoolPath); err != nil || info.Size() == 0 || info.Mode().Perm()&0o077 != 0 {
+	if info, err := os.Stat(opts.SpoolPath); err != nil || info.Size() == 0 || (runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0) {
 		t.Fatalf("spool file: %v %v", info, err)
 	}
 	dial, _ := pair(t, server)

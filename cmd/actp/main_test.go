@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -53,7 +54,7 @@ func TestTokenCreateListRevoke(t *testing.T) {
 		t.Fatalf("tokens: %+v", cfg.Server.Tokens)
 	}
 	info, _ := os.Stat(filepath.Join(dir, "tokens.yaml"))
-	if info.Mode().Perm()&0o077 != 0 {
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
 		t.Fatalf("tokens file mode %v", info.Mode())
 	}
 	if err := run([]string{"token", "revoke", "--config", cfgPath, "bot"}); err != nil {

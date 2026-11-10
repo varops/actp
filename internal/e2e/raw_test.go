@@ -119,9 +119,18 @@ func TestDetachedIdleLinkClosesAndCannotResume(t *testing.T) {
 	if d := time.Since(start); d > 3*time.Second {
 		t.Fatalf("idle link lived %s", d)
 	}
+	// A late client either finds the link gone (410), or, if it had output it never
+	// confirmed, gets that output and then the reason the link ended.
 	resp, err := r.connect(r.id)
-	if err == nil || resp == nil || resp.StatusCode != http.StatusGone {
-		t.Fatalf("resume after close: %v %v", resp, err)
+	if err != nil {
+		if resp == nil || resp.StatusCode != http.StatusGone {
+			t.Fatalf("resume after close: %v %v", resp, err)
+		}
+		return
+	}
+	var re *wire.RemoteError
+	if serveErr := <-r.served; !errors.As(serveErr, &re) || re.Code != wire.ErrLinkEnded {
+		t.Fatalf("resume after close ended with %v", serveErr)
 	}
 }
 

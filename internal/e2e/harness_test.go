@@ -238,8 +238,10 @@ func (c *client) call(method string, params any) *jsonrpc.Message {
 
 func (c *client) chunk(text string) *jsonrpc.Message {
 	c.t.Helper()
+	enc, _ := json.Marshal(text) // match the text as it appears inside JSON (Windows paths)
+	escaped := string(enc[1 : len(enc)-1])
 	return c.waitMsg("chunk "+text, func(m *jsonrpc.Message) bool {
-		return m.Method == "session/update" && strings.Contains(string(m.Params), text)
+		return m.Method == "session/update" && (strings.Contains(string(m.Params), escaped) || strings.Contains(string(m.Params), text))
 	})
 }
 
