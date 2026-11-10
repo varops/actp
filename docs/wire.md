@@ -1,14 +1,16 @@
-# actp wire format (internal)
+# actp wire format
 
-Status: draft 4 (matches the code in `internal/wire`) (2026-11-09)
+Status: `actp.v1`, as implemented in `internal/wire` (v0.1.0, 2026-11-10)
 
-> **Internal and subject to change.** This is how the `actp` bridge and server talk to each other today. It is not a public protocol. Users and apps depend on the public API in `docs/design.md` (CLI, config, management endpoints, and plain ACP on both ends), never on this. We will change or replace this format when there is a good reason, for example to adopt the official ACP web transport once it is stable.
+> This is how the `actp` bridge and server talk to each other, and what a native client implements. To write one, start with the guide in [`native-clients.md`](native-clients.md).
+>
+> **Compatibility:** servers accept `actp.v1` for all of actp 1.x. A new format gets a new subprotocol name and is negotiated, so a client that only offers `actp.v1` keeps working. Fields may be added at any time; receivers ignore what they do not know. If actp adopts the official ACP web transport later, it is added next to `actp.v1`, not instead of it.
 
 ## 1. Rules for changing it
 
 - The bridge and the server update separately. A laptop bridge and a workstation server will often run different versions.
 - Every wire format has a version (`actp.v1`, `actp.v2`, ...). The bridge offers the versions it knows. The server picks the highest one both sides know.
-- A server supports its current wire version and the previous one. A new bridge supports the current and previous one too.
+- A server keeps supporting `actp.v1` for all of actp 1.x, because native clients depend on it. A new bridge supports the current and previous wire versions.
 - Changing this file is fine. Breaking the rule above is not.
 
 ## 2. Transport

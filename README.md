@@ -207,7 +207,8 @@ actp version
 - [`docs/design.md`](docs/design.md) – public API, configuration, behaviour, and what is done.
 - [`docs/agents.md`](docs/agents.md) – supported agents, how to start them, and their quirks.
 - [`api/openapi.yaml`](api/openapi.yaml) – the HTTP API.
-- [`docs/wire.md`](docs/wire.md) – the internal bridge-to-server format (may change).
+- [`docs/native-clients.md`](docs/native-clients.md) – how to make an ACP client talk to actp directly, without the bridge.
+- [`docs/wire.md`](docs/wire.md) – the `actp.v1` wire format between bridges (or native clients) and servers.
 - [`docs/brainstorm.md`](docs/brainstorm.md) – early notes and decisions.
 
 ## Development

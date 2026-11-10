@@ -4,7 +4,7 @@ Status: v0.1.0 (2026-11-10). Section 12 lists what the code does today.
 
 `actp` (Agent Client Transport Protocol) is a tool that runs ACP agents on one machine and lets ACP clients use them from another. It is ACP over HTTP, packaged as one Go binary.
 
-ACTP is a **tool, not a protocol standard**. Its promises are its public API (section 2) and its behaviour (section 3). How the bridge and the server talk to each other is internal (`docs/wire.md`) and will change when something better comes along, such as a stable official ACP web transport.
+ACTP is a **tool, not a protocol standard**. Its promises are its public API (section 2) and its behaviour (section 3). How the bridge and the server talk to each other is described in `docs/wire.md`. Native clients may implement it directly (`docs/native-clients.md`); servers keep accepting `actp.v1` for all of actp 1.x, and newer formats are negotiated next to it.
 
 ## 1. Roles
 
@@ -18,7 +18,7 @@ ACTP is a **tool, not a protocol standard**. Its promises are its public API (se
  Any ACP client (app, bot, editor)
       │ spawns: actp claude@https://agents.example.com     ← plain ACP over stdio
       ▼
- actp bridge  ── internal wire (WebSocket over TLS) ──►  actp server  (agent machine)
+ actp bridge  ── actp.v1 (WebSocket over TLS) ──►  actp server  (agent machine)
                                                             │ plain ACP over stdio
                                                             ▼
                                                  Claude Code · Codex · Pi · ...
