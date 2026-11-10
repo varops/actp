@@ -14,10 +14,12 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
 
+	"github.com/varops/actp/internal/autostart"
 	"github.com/varops/actp/internal/config"
 	"github.com/varops/actp/internal/server"
 )
@@ -89,6 +91,7 @@ func (d *Dashboard) Handler() http.Handler {
 	mux.HandleFunc("POST /api/tokens", d.createToken)
 	mux.HandleFunc("POST /api/remotes", d.addRemote)
 	mux.HandleFunc("DELETE /api/remotes/{name}", d.removeRemote)
+	mux.HandleFunc("POST /api/autostart", d.setAutostart)
 	return d.guard(mux)
 }
 
@@ -148,6 +151,7 @@ type statusResponse struct {
 	ConfigPath string        `json:"configPath"`
 	Server     *serverStatus `json:"server,omitempty"`
 	Remotes    []remoteView  `json:"remotes"`
+	Autostart  bool          `json:"autostart"`
 }
 
 type serverStatus struct {
@@ -182,7 +186,7 @@ func (d *Dashboard) status(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	resp := statusResponse{Version: d.opts.Version, ConfigPath: cfg.Path(), Remotes: []remoteView{}}
+	resp := statusResponse{Version: d.opts.Version, ConfigPath: cfg.Path(), Remotes: []remoteView{}, Autostart: autostart.Enabled()}
 	for _, r := range cfg.Remotes {
 		resp.Remotes = append(resp.Remotes, remoteView{Name: r.Name, URL: r.URL})
 	}
@@ -380,6 +384,30 @@ func (d *Dashboard) removeRemote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (d *Dashboard) setAutostart(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<10)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	var err error
+	if req.Enabled {
+		var exe string
+		if exe, err = os.Executable(); err == nil {
+			err = autostart.Enable(exe)
+		}
+	} else {
+		err = autostart.Disable()
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"enabled": autostart.Enabled()})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

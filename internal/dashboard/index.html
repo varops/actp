@@ -54,7 +54,10 @@ input, select { font: inherit; padding: 7px 9px; border-radius: 7px; border: 1px
 <main>
   <header>
     <h1>actp <small id="version"></small></h1>
-    <span class="muted" id="config"></span>
+    <div class="row">
+      <label class="row muted" style="display:flex"><input type="checkbox" id="autostart" style="width:auto"> Start at login</label>
+      <span class="muted" id="config"></span>
+    </div>
   </header>
 
   <div id="no-server" class="hidden">
@@ -141,6 +144,7 @@ function ago(iso) {
 function render() {
   $("version").textContent = state.version;
   $("config").textContent = state.configPath;
+  $("autostart").checked = !!state.autostart;
   const srv = state.server;
   $("server").classList.toggle("hidden", !srv);
   $("no-server").classList.toggle("hidden", !!srv);
@@ -204,6 +208,11 @@ $("add-client").onsubmit = async (ev) => {
     $("new-token").classList.remove("hidden");
     refresh();
   } catch (e) { $("client-error").textContent = e.message; }
+};
+
+$("autostart").onchange = async (ev) => {
+  try { await api("POST", "/api/autostart", { enabled: ev.target.checked }); } catch (e) { alert(e.message); }
+  refresh();
 };
 
 $("add-remote-btn").onclick = () => $("add-remote").classList.remove("hidden");

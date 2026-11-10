@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -153,5 +154,25 @@ func TestCreateTokenAndRemotes(t *testing.T) {
 	}
 	if _, err := config.RemoteToken(r); err == nil {
 		t.Fatal("keychain token kept after remove")
+	}
+}
+
+func TestAutostartToggle(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("touches the real registry")
+	}
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", "")
+	d, c, _ := setup(t)
+	base := "http://" + d.addr
+	do(t, c, "GET", d.URL(), "", false)
+	if code, body := do(t, c, "POST", base+"/api/autostart", `{"enabled":true}`, true); code != 200 || !strings.Contains(body, `"enabled":true`) {
+		t.Fatalf("enable: %d %s", code, body)
+	}
+	if _, body := do(t, c, "GET", base+"/api/status", "", false); !strings.Contains(body, `"autostart":true`) {
+		t.Fatalf("status: %s", body)
+	}
+	if code, body := do(t, c, "POST", base+"/api/autostart", `{"enabled":false}`, true); code != 200 || !strings.Contains(body, `"enabled":false`) {
+		t.Fatalf("disable: %d %s", code, body)
 	}
 }

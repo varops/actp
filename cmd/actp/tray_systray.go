@@ -10,10 +10,13 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"os"
 	"runtime"
 	"time"
 
 	"fyne.io/systray"
+
+	"github.com/varops/actp/internal/autostart"
 )
 
 // runTray shows a menu bar icon. systray.Run must own the main thread (macOS),
@@ -45,6 +48,7 @@ func trayReady(h *host, open bool) {
 	tunnelItem.Hide()
 	systray.AddSeparator()
 	openItem := systray.AddMenuItem("Open dashboard", "Agents, connections, clients and remotes")
+	loginItem := systray.AddMenuItemCheckbox("Start at login", "Start actp when you log in", autostart.Enabled())
 	systray.AddSeparator()
 	quit := systray.AddMenuItem("Quit actp", "Stop the server; running turns get 30 s to finish")
 
@@ -63,6 +67,17 @@ func trayReady(h *host, open bool) {
 			select {
 			case <-openItem.ClickedCh:
 				_ = openBrowser(h.dash.NewLink())
+			case <-loginItem.ClickedCh:
+				if loginItem.Checked() {
+					_ = autostart.Disable()
+				} else if exe, err := os.Executable(); err == nil {
+					_ = autostart.Enable(exe)
+				}
+				if autostart.Enabled() {
+					loginItem.Check()
+				} else {
+					loginItem.Uncheck()
+				}
 			case <-quit.ClickedCh:
 				h.Quit()
 				return
