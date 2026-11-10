@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>actp – ACP over HTTP</title>
+<meta name="description" content="Run coding agents on one machine, use them from anywhere. actp lets any ACP client use Claude Code, Codex, Droid or Pi running on another machine, as if it were local.">
+<meta property="og:title" content="actp – ACP over HTTP">
+<meta property="og:description" content="Run coding agents on one machine, use them from anywhere.">
+<meta property="og:image" content="icon.png">
+<link rel="icon" type="image/png" href="favicon.png">
+<style>
+:root {
+  --bg: #fafaf8; --text: #1b1b19; --muted: #66665f; --line: #e6e6e0; --panel: #ffffff;
+  --accent: #2f5bd3; --accent-text: #ffffff; --code: #f1f1ec;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #131312; --text: #ececea; --muted: #9b9b94; --line: #2c2c29; --panel: #1b1b19; --accent: #7c9cf5; --accent-text: #0e1220; --code: #222220; }
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif; }
+main { max-width: 760px; margin: 0 auto; padding: 56px 20px 40px; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code, pre { font: 14px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+code { background: var(--code); padding: 2px 6px; border-radius: 5px; }
+pre { background: var(--code); padding: 14px 16px; border-radius: 10px; overflow-x: auto; margin: 10px 0 0; }
+pre code { background: none; padding: 0; }
+
+.hero { text-align: center; }
+.hero img { width: 88px; height: 88px; }
+.hero h1 { font-size: 44px; letter-spacing: -0.02em; margin: 12px 0 0; }
+.tagline { font-size: 22px; color: var(--muted); margin: 4px 0 18px; }
+.lead { font-size: 19px; max-width: 600px; margin: 0 auto; }
+.buttons { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; margin: 28px 0 0; }
+.btn { display: inline-block; padding: 10px 18px; border-radius: 9px; border: 1px solid var(--line); color: var(--text); background: var(--panel); font-weight: 500; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+.btn:hover { text-decoration: none; filter: brightness(0.97); }
+.small { font-size: 14px; color: var(--muted); margin-top: 10px; }
+
+.diagram { margin: 56px 0 8px; }
+.diagram svg { width: 100%; height: auto; display: block; color: var(--text); }
+.diagram .box { fill: var(--panel); stroke: var(--line); }
+.diagram .mid { fill: var(--muted); }
+.diagram .accent { stroke: var(--accent); }
+.diagram .accent-fill { fill: var(--accent); }
+.diagram .vertical { display: none; max-width: 320px; margin: 0 auto; }
+
+h2 { font-size: 26px; letter-spacing: -0.01em; margin: 64px 0 8px; }
+h3 { font-size: 17px; margin: 0 0 4px; }
+.sub { color: var(--muted); margin: 0 0 20px; }
+
+.grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px; }
+.card p { margin: 0; color: var(--muted); font-size: 15px; }
+
+.steps { counter-reset: step; display: grid; grid-template-columns: minmax(0, 1fr); gap: 18px; }
+.step { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px; }
+.step h3::before { counter-increment: step; content: counter(step); display: inline-grid; place-items: center; width: 24px; height: 24px; border-radius: 50%; background: var(--accent); color: var(--accent-text); font-size: 13px; margin-right: 10px; vertical-align: 1px; }
+.step p { margin: 6px 0 0; color: var(--muted); font-size: 15px; }
+
+.chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip { border: 1px solid var(--line); background: var(--panel); border-radius: 999px; padding: 5px 14px; font-size: 15px; }
+
+.note { border-left: 3px solid var(--accent); padding: 4px 0 4px 14px; color: var(--muted); font-size: 15px; margin-top: 18px; }
+
+footer { max-width: 760px; margin: 0 auto; padding: 32px 20px 48px; color: var(--muted); font-size: 14px; border-top: 1px solid var(--line); display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+
+@media (max-width: 620px) {
+  main { padding-top: 36px; }
+  .hero h1 { font-size: 36px; }
+  .tagline { font-size: 19px; }
+  .lead { font-size: 17px; }
+  .grid { grid-template-columns: minmax(0, 1fr); }
+  .diagram { margin-top: 40px; }
+  .diagram .horizontal { display: none; }
+  .diagram .vertical { display: block; }
+  h2 { margin-top: 48px; }
+}
+</style>
+</head>
+<body>
+<main>
+  <section class="hero">
+    <img src="icon.png" alt="" width="88" height="88">
+    <h1>actp</h1>
+    <p class="tagline">ACP over HTTP</p>
+    <p class="lead">Run coding agents on one machine, use them from anywhere. Any ACP client can use Claude Code, Codex, Droid or Pi on another machine, as if it were local.</p>
+    <div class="buttons">
+      <a class="btn primary" href="https://github.com/varops/actp/releases/latest">Download</a>
+      <a class="btn" href="https://github.com/varops/actp">GitHub</a>
+    </div>
+    <p class="small">macOS, Linux and Windows · Apache 2.0</p>
+  </section>
+
+  <figure class="diagram" aria-label="An ACP client starts the actp bridge, which connects over HTTPS to the actp server on the machine with the agents.">
+    <svg viewBox="0 0 720 170" role="img" class="horizontal">
+      <rect class="box" x="1" y="40" width="190" height="90" rx="12"/>
+      <text x="96" y="78" text-anchor="middle" font-size="15" font-weight="600" fill="currentColor">Your ACP client</text>
+      <text x="96" y="100" text-anchor="middle" font-size="13" class="mid">app · bot · editor</text>
+
+      <rect class="box" x="265" y="40" width="190" height="90" rx="12"/>
+      <text x="360" y="78" text-anchor="middle" font-size="15" font-weight="600" fill="currentColor">actp</text>
+      <text x="360" y="100" text-anchor="middle" font-size="13" class="mid">bridge ⇄ server</text>
+
+      <rect class="box" x="529" y="40" width="190" height="90" rx="12"/>
+      <text x="624" y="70" text-anchor="middle" font-size="15" font-weight="600" fill="currentColor">Agents</text>
+      <text x="624" y="92" text-anchor="middle" font-size="13" class="mid">Claude Code · Codex</text>
+      <text x="624" y="110" text-anchor="middle" font-size="13" class="mid">Droid · Pi · …</text>
+
+      <line x1="195" y1="85" x2="257" y2="85" stroke="currentColor" stroke-width="1.5"/>
+      <path d="M257 80 L265 85 L257 90 Z" fill="currentColor"/>
+      <text x="230" y="74" text-anchor="middle" font-size="12" class="mid">ACP</text>
+
+      <line x1="459" y1="85" x2="521" y2="85" class="accent" stroke-width="2" stroke-dasharray="5 4"/>
+      <path d="M521 80 L529 85 L521 90 Z" class="accent-fill"/>
+      <text x="494" y="74" text-anchor="middle" font-size="12" class="mid">HTTPS</text>
+
+      <text x="96" y="160" text-anchor="middle" font-size="12" class="mid">your laptop or VPS</text>
+      <text x="624" y="160" text-anchor="middle" font-size="12" class="mid">your workstation</text>
+    </svg>
+    <svg viewBox="0 0 300 330" role="img" class="vertical">
+      <rect class="box" x="40" y="1" width="220" height="70" rx="12"/>
+      <text x="150" y="32" text-anchor="middle" font-size="15" font-weight="600" fill="currentColor">Your ACP client</text>
+      <text x="150" y="54" text-anchor="middle" font-size="13" class="mid">laptop or VPS</text>
+      <line x1="150" y1="75" x2="150" y2="117" stroke="currentColor" stroke-width="1.5"/>
+      <path d="M145 117 L150 125 L155 117 Z" fill="currentColor"/>
+      <text x="160" y="104" font-size="12" class="mid">ACP</text>
+      <rect class="box" x="40" y="129" width="220" height="70" rx="12"/>
+      <text x="150" y="160" text-anchor="middle" font-size="15" font-weight="600" fill="currentColor">actp</text>
+      <text x="150" y="182" text-anchor="middle" font-size="13" class="mid">bridge ⇄ server</text>
+      <line x1="150" y1="203" x2="150" y2="245" class="accent" stroke-width="2" stroke-dasharray="5 4"/>
+      <path d="M145 245 L150 253 L155 245 Z" class="accent-fill"/>
+      <text x="160" y="232" font-size="12" class="mid">HTTPS</text>
+      <rect class="box" x="40" y="257" width="220" height="70" rx="12"/>
+      <text x="150" y="285" text-anchor="middle" font-size="15" font-weight="600" fill="currentColor">Agents</text>
+      <text x="150" y="307" text-anchor="middle" font-size="13" class="mid">Claude Code · Codex · Droid · Pi</text>
+    </svg>
+  </figure>
+
+  <h2>Why</h2>
+  <p class="sub">Agents should run where the power, the code and the logins are. The apps that use them should run wherever suits them.</p>
+  <div class="grid">
+    <div class="card"><h3>Nothing to change</h3><p>Clients and agents both speak plain ACP. Your client starts <code>actp</code> instead of a local agent, and that is all.</p></div>
+    <div class="card"><h3>Survives a closed lid</h3><p>If the network drops, the agent keeps working. The bridge reconnects and catches up without losing a message.</p></div>
+    <div class="card"><h3>A token per client</h3><p>Each client gets its own token, limited to the agents and folders you choose. Revoke it at any time.</p></div>
+    <div class="card"><h3>No server needed</h3><p>A menu bar app with a built-in Cloudflare tunnel. Share the agents on your Mac in a few clicks.</p></div>
+  </div>
+
+  <h2>How it works</h2>
+  <p class="sub">Two machines, a few clicks or a few commands.</p>
+  <div class="steps">
+    <div class="step">
+      <h3>Share agents from the machine that has them</h3>
+      <p>Open the actp app and choose <em>Share agents</em>: pick the agents, the folders they may work in, and a tunnel. Then create a token for each client. Or on a server:</p>
+      <pre><code>actp token create --name laptop
+actp serve</code></pre>
+    </div>
+    <div class="step">
+      <h3>Add that server on the client machine</h3>
+      <p>In the app, choose <em>Use remote agents</em> and add the URL and token. Or:</p>
+      <pre><code>echo 'actp_…' | actp remote add workstation https://… --token-stdin</code></pre>
+    </div>
+    <div class="step">
+      <h3>Point your ACP client at it</h3>
+      <p>Use <code>actp droid@workstation</code> as the agent command, in any client that speaks ACP. To try it from a terminal first:</p>
+      <pre><code>actp droid@workstation -p "Say hello and list the files here"</code></pre>
+    </div>
+  </div>
+
+  <h2>Works with</h2>
+  <p class="sub">Any agent that speaks ACP over stdio, with ready-made settings for these:</p>
+  <div class="chips">
+    <span class="chip">Claude Code</span><span class="chip">Codex</span><span class="chip">Droid</span><span class="chip">Pi</span>
+    <span class="chip">Gemini CLI</span><span class="chip">OpenCode</span><span class="chip">Grok</span>
+  </div>
+  <p class="note">A client token lets its holder make these agents do anything your user can do on that machine. Share tokens only with clients you trust.</p>
+
+  <h2>Get it</h2>
+  <p class="sub">Download the app or the command line for your system from the <a href="https://github.com/varops/actp/releases/latest">latest release</a>, or build it with Go:</p>
+  <pre><code>go install github.com/varops/actp/cmd/actp@latest</code></pre>
+  <p class="small">The macOS app is not signed yet: the first time, right-click it and choose Open.</p>
+</main>
+<footer>
+  <span>actp · Agent Client Transport Protocol</span>
+  <span><a href="https://github.com/varops/actp#readme">Documentation</a> · <a href="https://github.com/varops/actp">GitHub</a> · <a href="https://agentclientprotocol.com">About ACP</a></span>
+</footer>
+</body>
+</html>
