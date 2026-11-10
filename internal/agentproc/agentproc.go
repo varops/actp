@@ -199,6 +199,17 @@ func isExecutable(path string) bool {
 	return runtime.GOOS == "windows" || info.Mode()&0o111 != 0
 }
 
+var (
+	cachedEnvOnce sync.Once
+	cachedEnv     []string
+)
+
+// CachedLoginShellEnv is LoginShellEnv, read once per process.
+func CachedLoginShellEnv() []string {
+	cachedEnvOnce.Do(func() { cachedEnv = LoginShellEnv(context.Background()) })
+	return cachedEnv
+}
+
 // LoginShellEnv returns the environment of the user's login shell, which has
 // the PATH agents usually need. Apps started from a desktop or a service
 // manager get a minimal PATH otherwise. Falls back to os.Environ().

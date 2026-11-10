@@ -113,6 +113,16 @@ On the client machine, point any ACP client at the bridge instead of a local age
 actp agents https://agents.example.com --token-env ACTP_TOKEN
 ```
 
+### macOS app
+
+On a Mac with Go and the Xcode command line tools:
+
+```bash
+packaging/macos/build-app.sh
+```
+
+This builds `dist/actp.app`, a menu bar app with no Dock icon. Move it to Applications and open it. On first launch it opens the dashboard; "Start at login" is in the menu. Tagged releases include a ready-made `actp_<version>_macos.zip`.
+
 ### Dashboard and tray
 
 `actp serve --dashboard` prints a one-time link to a local page with the server status, agents, open connections, and buttons to add clients and remotes. `actp tray` starts the server and opens that page; built with `-tags tray`, it also shows a menu bar icon (macOS builds need a Mac).

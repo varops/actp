@@ -39,7 +39,12 @@ func runTray(ctx context.Context, cfgPath string, open bool) error {
 }
 
 func trayReady(h *host, open bool) {
-	systray.SetIcon(trayIcon())
+	if runtime.GOOS == "darwin" {
+		// A template icon follows the menu bar's light or dark look.
+		systray.SetTemplateIcon(trayIcon(), trayIcon())
+	} else {
+		systray.SetIcon(trayIcon())
+	}
 	systray.SetTooltip("actp")
 	status := systray.AddMenuItem("Starting…", "")
 	status.Disable()

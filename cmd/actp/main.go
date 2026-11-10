@@ -9,10 +9,14 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
+
+	"github.com/varops/actp/internal/config"
 )
 
 // version is set at build time with -ldflags "-X main.version=...".
@@ -54,6 +58,11 @@ func (e exitError) Error() string { return fmt.Sprintf("exit %d", int(e)) }
 
 func run(args []string) error {
 	if len(args) == 0 {
+		// Double-clicking actp.app starts the tray; the plain binary prints help.
+		if inAppBundle() {
+			_, err := os.Stat(config.DefaultPath())
+			return runTray(context.Background(), "", os.IsNotExist(err))
+		}
 		fmt.Print(usage)
 		return exitError(2)
 	}
@@ -87,4 +96,16 @@ func run(args []string) error {
 		fmt.Fprint(os.Stderr, usage)
 		return fmt.Errorf("unknown command %q", cmd)
 	}
+}
+
+// inAppBundle reports whether this binary runs from a macOS .app bundle.
+func inAppBundle() bool {
+	exe, err := os.Executable()
+	if err != nil {
+		return false
+	}
+	if real, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = real
+	}
+	return strings.Contains(filepath.ToSlash(exe), ".app/Contents/MacOS/")
 }

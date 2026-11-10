@@ -50,7 +50,12 @@ var (
 )
 
 // FindBinary locates cloudflared on PATH or in ~/.actp/bin.
+// A nil env means the login shell's environment: an app started from Finder or
+// a service manager has a minimal PATH that misses Homebrew and similar.
 func FindBinary(env []string) (string, error) {
+	if env == nil {
+		env = agentproc.CachedLoginShellEnv()
+	}
 	if p, err := agentproc.LookPath("cloudflared", env); err == nil {
 		return p, nil
 	}

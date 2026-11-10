@@ -34,22 +34,13 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - name: Build universal desktop binary (tray needs cgo on macOS)
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          for arch in arm64 amd64; do
-            CGO_ENABLED=1 GOARCH=$arch go build -tags tray -trimpath \
-              -ldflags "-s -w -X main.version=$version" -o "actp-$arch" ./cmd/actp
-          done
-          lipo -create -output actp actp-arm64 actp-amd64
-          ./actp version
-          tar czf "actp-desktop_${version}_darwin_universal.tar.gz" actp LICENSE README.md
-          shasum -a 256 "actp-desktop_${version}_darwin_universal.tar.gz" > "actp-desktop_${version}_darwin_universal.tar.gz.sha256"
+      - name: Build actp.app (menu bar app, universal binary)
+        run: packaging/macos/build-app.sh "${GITHUB_REF_NAME#v}"
       - name: Upload to the draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           version="${GITHUB_REF_NAME#v}"
-          gh release upload "$GITHUB_REF_NAME" \
-            "actp-desktop_${version}_darwin_universal.tar.gz" \
-            "actp-desktop_${version}_darwin_universal.tar.gz.sha256" --clobber
+          zip="dist/actp_${version}_macos.zip"
+          shasum -a 256 "$zip" > "$zip.sha256"
+          gh release upload "$GITHUB_REF_NAME" "$zip" "$zip.sha256" --clobber
