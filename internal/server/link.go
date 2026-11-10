@@ -274,7 +274,10 @@ func (l *Link) rewriteClientRequest(m *jsonrpc.Message) (*jsonrpc.Message, *json
 				if other.token.Name == l.token.Name {
 					other.becomeUnattended("session taken over by a new connection")
 				}
-				return nil, jsonrpc.NewError(m.ID, jsonrpc.CodeServerError, "session still running on the agent host", nil)
+				// A link with nothing running is closing right now; wait for it instead of failing.
+				if other.turnRunning() || !other.waitEnded(5*time.Second) {
+					return nil, jsonrpc.NewError(m.ID, jsonrpc.CodeServerError, "session still running on the agent host", nil)
+				}
 			}
 		}
 	case m.Method == "session/prompt":
@@ -726,6 +729,16 @@ func (l *Link) endWithData(code, reason string, data json.RawMessage) {
 		l.srv.recordPIDs()
 		close(l.ended)
 	})
+}
+
+// waitEnded waits for the link to end, up to d.
+func (l *Link) waitEnded(d time.Duration) bool {
+	select {
+	case <-l.ended:
+		return true
+	case <-time.After(d):
+		return false
+	}
 }
 
 func (l *Link) waitServerReqs(ctx context.Context) {

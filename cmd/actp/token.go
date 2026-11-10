@@ -52,8 +52,9 @@ func cmdToken(args []string) error {
 			return err
 		}
 		entry := config.Token{Name: *name, Hash: hash, Agents: split(*agents), Workspaces: split(*workspaces), DefaultWorkspace: *defWS}
-		check, sc := *cfg, *cfg.Server
-		sc.Tokens = append(append([]config.Token(nil), cfg.Server.Tokens...), entry)
+		check, sc, withDefaults := *cfg, *cfg.Server, entry
+		config.ApplyTokenDefaults(&withDefaults)
+		sc.Tokens = append(append([]config.Token(nil), cfg.Server.Tokens...), withDefaults)
 		check.Server = &sc
 		if err := check.Validate(); err != nil {
 			return err

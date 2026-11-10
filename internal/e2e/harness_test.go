@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -31,6 +32,9 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	agentBin = filepath.Join(dir, "actp-testagent")
+	if runtime.GOOS == "windows" {
+		agentBin += ".exe"
+	}
 	out, err := exec.Command("go", "build", "-o", agentBin, "github.com/varops/actp/cmd/actp-testagent").CombinedOutput()
 	if err != nil {
 		panic(fmt.Sprintf("building test agent: %v\n%s", err, out))

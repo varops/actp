@@ -237,12 +237,13 @@ func (c *Config) finish() error {
 		}
 	}
 	for i := range s.Tokens {
-		defaultToken(&s.Tokens[i])
+		ApplyTokenDefaults(&s.Tokens[i])
 	}
 	return nil
 }
 
-func defaultToken(t *Token) {
+// ApplyTokenDefaults fills in default values for a token entry.
+func ApplyTokenDefaults(t *Token) {
 	if t.MCPServers == "" {
 		t.MCPServers = "remote"
 	}

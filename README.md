@@ -2,7 +2,7 @@
 
 **ACP over HTTP.** Run coding agents on one machine, use them from anywhere.
 
-> Status: early design. No code yet.
+> Status: early. The server and bridge work and are tested against a scripted agent. Not yet tested with real agents; no tray, tunnel or release builds yet. See [`docs/design.md`](docs/design.md) section 12.
 
 ## Mission
 
@@ -54,8 +54,72 @@ In a client's agent config:
 { "command": "actp", "args": ["claude@https://agents.example.com", "--token-env", "ACTP_TOKEN"] }
 ```
 
+## Quickstart
+
+Build it (Go 1.25+):
+
+```bash
+go install github.com/varops/actp/cmd/actp@latest
+```
+
+On the machine with the agents, create `~/.actp/actp.yaml`:
+
+```yaml
+server:
+  listen: 127.0.0.1:7860
+  workspaces:
+    - name: website
+      path: ~/code/website
+  agents:
+    - id: claude
+      preset: claude-code      # needs claude-code-acp on PATH and `claude /login` done
+```
+
+Create a token for each client. It is printed once:
+
+```bash
+actp token create --name my-bot --default-workspace website
+```
+
+Check the setup, then start the server:
+
+```bash
+actp doctor
+```
+
+```bash
+actp serve
+```
+
+The server listens on loopback. To reach it from another machine, put it behind a TLS reverse proxy or a tunnel (built-in Cloudflare tunnel support is planned).
+
+On the client machine, point any ACP client at the bridge instead of a local agent:
+
+```json
+{ "command": "actp", "args": ["claude@https://agents.example.com", "--token-env", "ACTP_TOKEN", "--cwd", "actp://website"] }
+```
+
+`--cwd actp://website` sends every session to the `website` workspace on the server, whatever folder the client is in. List what a server offers:
+
+```bash
+actp agents https://agents.example.com --token-env ACTP_TOKEN
+```
+
+## Development
+
+```bash
+go test -race ./...
+```
+
+```bash
+go generate ./api/
+```
+
+The second command regenerates the HTTP code after a change to `api/openapi.yaml`.
+
 ## Documents
 
+- [`api/openapi.yaml`](api/openapi.yaml) – the HTTP API.
 - [`docs/design.md`](docs/design.md) – the design: public API, behaviour, milestones.
 - [`docs/agents.md`](docs/agents.md) – known ACP agents: how to start them and their quirks.
 - [`docs/wire.md`](docs/wire.md) – the internal bridge-to-server format (subject to change).

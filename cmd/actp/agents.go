@@ -68,7 +68,7 @@ func cmdAgents(args []string) error {
 			ws = append(ws, name)
 		}
 		status := string(a.Status)
-		if a.AuthHint != nil {
+		if a.AuthHint != nil && a.Status == api.AuthRequired {
 			status += " (" + *a.AuthHint + ")"
 		}
 		if a.Error != nil {

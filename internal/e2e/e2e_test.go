@@ -350,3 +350,21 @@ func TestAuthRequiredIsReported(t *testing.T) {
 		t.Fatalf("agents: %s", body)
 	}
 }
+
+func TestQuickRestartLoadsTheSession(t *testing.T) {
+	e := newEnv(t)
+	c := e.bridge()
+	c.initialize()
+	sid := c.newSession("actp://site")
+	c.response(c.prompt(sid, "echo before restart"))
+	c.closeStdin()
+	_ = c.wait()
+
+	c2 := e.bridge() // no pause: the old link may still be closing
+	c2.initialize()
+	r := c2.call("session/load", map[string]any{"sessionId": sid, "cwd": "actp://site", "mcpServers": []any{}})
+	if r.Error != nil {
+		t.Fatalf("load right after restart: %s", r.Raw)
+	}
+	c2.chunk("before restart")
+}

@@ -17,7 +17,9 @@ func testServerConfig(t *testing.T) (*config.Server, string) {
 	for _, d := range []string{"site", "site/sub", "other"} {
 		_ = os.MkdirAll(filepath.Join(root, d), 0o755)
 	}
-	_ = os.Symlink(filepath.Join(root, "other"), filepath.Join(root, "site", "escape"))
+	if err := os.Symlink(filepath.Join(root, "other"), filepath.Join(root, "site", "escape")); err != nil {
+		t.Logf("no symlink support, skipping that case: %v", err)
+	}
 	return &config.Server{Workspaces: []config.Workspace{
 		{Name: "site", Path: filepath.Join(root, "site")},
 		{Name: "other", Path: filepath.Join(root, "other")},
@@ -48,6 +50,10 @@ func TestResolveCwd(t *testing.T) {
 		filepath.Join(root, "other"),  // not allowed
 		"/client/repository",          // prefix of a map key, not a match
 		"/somewhere/else",             // no fallback
+	}
+	if _, err := os.Lstat(filepath.Join(site, "escape")); err != nil {
+		bad = bad[:2:2]
+		bad = append(bad, filepath.Join(root, "other"), "/client/repository", "/somewhere/else")
 	}
 	for _, in := range bad {
 		if got, err := resolveCwd(s, tok, in); !errors.Is(err, errCwdNotAllowed) {

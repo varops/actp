@@ -1,6 +1,6 @@
 # actp design
 
-Status: draft 4 (2026-11-09)
+Status: draft 5 (2026-11-10). Section 12 lists what the code does today.
 
 `actp` (Agent Client Transport Protocol) is a tool that runs ACP agents on one machine and lets ACP clients use them from another. It is ACP over HTTP, packaged as one Go binary.
 
@@ -93,7 +93,7 @@ Exit codes: `0` when the client closed stdin (the link is detached, not stopped;
 ```
 actp serve
 actp tray
-actp token create --name N [--agents a,b] [--workspaces w]   prints the token once
+actp token create --name N [--agents a,b] [--workspaces w] [--default-workspace w]   prints the token once
 actp token list | revoke <name>
 actp remote add <name> <url> [--token-stdin]
 actp remote list | remove <name>
@@ -116,6 +116,9 @@ server:
   prompt_timeout: 24h             # how long an unanswered prompt waits for a dropped client
   spool_limit: 1GB                # disk space for output kept while detached
   log_dir: ~/.actp/logs
+  state_dir: ~/.actp/state        # agent process ids, for cleanup after a crash
+  tokens_file: ~/.actp/tokens.yaml  # tokens managed by `actp token`
+  shell_env: true                 # start agents with the login shell's environment
 
   tunnel:
     provider: cloudflare
@@ -142,7 +145,7 @@ server:
       env: {}
       env_remove: [ANTHROPIC_API_KEY]   # drop ambient keys so the agent uses its own login
 
-  tokens:
+  tokens:                         # hand-written tokens; `actp token` writes to tokens_file instead
     - name: bot-vps
       hash: "sha256:9f2c..."
       agents: [claude, codex]     # "*" for all
@@ -337,7 +340,7 @@ Each agent runs as a child process with its own login on the server machine. `pr
 
 - One agent process per link.
 - Keep the last 8 KB of each agent's stderr for error messages.
-- Tokens: `actp_` + 32 random bytes in base32, stored as SHA-256 hashes, compared in constant time, shown once.
+- Tokens: `actp_` + 32 random bytes in base32, stored as SHA-256 hashes, compared in constant time, shown once. `actp token` keeps its tokens in a separate `tokens_file` (mode 0600), so it never rewrites the hand-edited config. Both sources are loaded.
 - Audit log (JSON lines): link opened, resumed, ended (with reason), session created, permission answered (by client or policy), cwd rejected. Prompts only with `audit.log_prompts: true`.
 - **Environment.** Desktop apps and system services start with a minimal PATH, so agent commands are often not found. At start the server reads the user's login-shell environment (as editors do) and uses it for agents. `actp doctor` shows the PATH agents will get.
 - **Process groups.** Each agent runs in its own process group (Windows: job object), so stopping it stops its children. The server records agent process ids, and on start it stops any left over from a crash.
@@ -390,21 +393,25 @@ One app with a server section and a remotes section.
 
 ## 8. Code layout
 
-Module `github.com/varops/actp`, Go 1.24+. Libraries: `github.com/coder/websocket`, `github.com/goccy/go-yaml`, `fyne.io/systray`. No ACP SDK: messages stay `json.RawMessage`, and only routed or rewritten fields are parsed, so unknown fields survive.
+Module `github.com/varops/actp`, Go 1.25+. Libraries: `github.com/coder/websocket`, `github.com/goccy/go-yaml`, `fyne.io/systray`. No ACP SDK: messages stay `json.RawMessage`, and only routed or rewritten fields are parsed, so unknown fields survive.
 
 ```
-cmd/actp/            CLI entry
-internal/wire/       envelope, seq/ack, replay buffer, version negotiation
-internal/link/       link client: open, resume, reconnect
+api/                 openapi.yaml and the code generated from it (go generate ./api/)
+cmd/actp/            CLI: serve, bridge, token, agents, doctor, version
+cmd/actp-testagent/  scripted ACP agent for tests
+internal/config/     YAML config, presets, tokens
 internal/jsonrpc/    ndjson framing, peek/patch helpers
-internal/server/     routes, auth, links, rewrites, policy
-internal/agentproc/  spawn, stderr tail, stop (POSIX + Windows)
-internal/bridge/     stdio ↔ link client
-internal/config/
-internal/tunnel/
-internal/tray/
-testdata/agent/      scripted ACP agent
+internal/wire/       envelope, seq/ack, heartbeat, send window, replay
+internal/server/     HTTP API, auth, links and their states, rewrites, probing, audit
+internal/bridge/     stdio ↔ link, reconnect, bye, lost-session handling
+internal/agentproc/  spawn, environment, stderr tail, process groups (POSIX + Windows)
+internal/testagent/  the scripted agent's logic
+internal/e2e/        end-to-end tests: stdio client → bridge → server → scripted agent
+internal/tunnel/     (planned) cloudflared manager
+internal/tray/       (planned) tray app
 ```
+
+The OpenAPI file is the source of truth for the HTTP API. CI fails if the generated code is stale.
 
 Everything is `internal/` until a public Go API is worth promising.
 
@@ -431,3 +438,11 @@ Everything is `internal/` until a public Go API is worth promising.
 
 1. **Pi** – preset uses the community `pi-acp` adapter. Verify it over a live handshake before release.
 2. **ACP v2** – when v2 ships, check that the rewrites in 3.3 and the settle order in 3.2 still match (for example, held prompts are answered with `-32800` on cancel).
+
+## 12. Implementation status
+
+What the code does today (M1 done, most of M2):
+
+- **Done:** server, bridge (`actp <agent>@<server>`), `token`, `agents`, `doctor`, `version`. Token auth with no local exception. Management endpoints. Wire format with acks, heartbeats, send window, resume and `bye`. Link states (attached, detached, unattended) with `idle_close`, `prompt_timeout`, `max_unattended` and `on_client_exit`. Settle order on link end. Rewrites: fs/terminal stripping, cwd resolution (`actp://`, workspace paths, `map`, opt-in fallback), MCP filtering, permission policies, terminal-auth hints. Session takeover on `session/load`. Probing and login status from traffic. Audit log. Agent process groups and cleanup after a crash. Login-shell environment for agents. CI on Linux, macOS and Windows.
+- **Not yet:** spilling the replay buffer to disk (it stays in memory up to `spool_limit`), config reload on `SIGHUP`, turn tracking for ACP v2 beyond the "recent output" rule, saved-remote commands (`actp remote ...`; edit `remotes:` in the config for now), tray, tunnel, release builds.
+- **Not tested against real agents yet** (M0). The scripted agent covers the protocol paths; real agents need logins on a real machine.

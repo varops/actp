@@ -34,7 +34,10 @@ func (s *Server) Probe(agent *config.Agent) (status, detail string) {
 		if result != nil {
 			st.AgentInfo, st.Capabilities = result.info, result.caps
 		}
-		status, detail = st.Status, st.Error+st.AuthHint
+		status, detail = st.Status, st.Error
+		if st.Status == string(api.AuthRequired) {
+			detail = st.AuthHint
+		}
 	})
 	return status, detail
 }

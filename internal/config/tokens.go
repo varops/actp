@@ -64,7 +64,7 @@ func (c *Config) loadTokensFile() error {
 		return err
 	}
 	for _, t := range tf.Tokens {
-		defaultToken(&t)
+		ApplyTokenDefaults(&t)
 		c.Server.Tokens = append(c.Server.Tokens, t)
 	}
 	return nil
