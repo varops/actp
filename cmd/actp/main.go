@@ -28,6 +28,7 @@ Usage:
   actp serve [--config FILE] [--dashboard]
   actp tray [--config FILE] [--no-open]  server, dashboard and menu bar icon
   actp <agent>@<server> [options]        bridge to a remote agent (see "actp bridge -h")
+  actp <agent>@<server> -p "text"        send one prompt and print the answer [--cwd actp://folder] [--yes|--no]
   actp bridge <agent>@<server> [options]
   actp token create --name NAME [--agents a,b] [--workspaces w,x] [--default-workspace w]
   actp token list

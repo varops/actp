@@ -42,6 +42,11 @@ func cmdBridge(args []string) error {
 	name := fs.String("name", "", "client name shown on the server (default: host name)")
 	logFile := fs.String("log-file", "", "write debug logs here (stdout is ACP)")
 	cfgPath := fs.String("config", "", "config file with saved remotes")
+	var prompt string
+	fs.StringVar(&prompt, "p", "", "send one prompt and print the answer, instead of bridging stdio")
+	fs.StringVar(&prompt, "prompt", "", "same as -p")
+	yes := fs.Bool("yes", false, "with -p: allow every permission request")
+	no := fs.Bool("no", false, "with -p: deny every permission request")
 	var maps mapFlags
 	fs.Var(&maps, "map", "rewrite cwd values starting with FROM to TO (FROM=TO, repeatable)")
 	if err := fs.Parse(args); err != nil {
@@ -60,6 +65,9 @@ func cmdBridge(args []string) error {
 	token, err := resolveToken(*tokenEnv, *tokenFile, remote)
 	if err != nil {
 		return err
+	}
+	if prompt != "" {
+		return runPrompt(promptOptions{target: target, agent: agent, baseURL: baseURL, token: token, text: prompt, cwd: *cwd, yes: *yes, no: *no})
 	}
 	if *name == "" {
 		*name, _ = os.Hostname()

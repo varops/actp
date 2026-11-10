@@ -107,7 +107,11 @@ On the client machine, point any ACP client at the bridge instead of a local age
 { "command": "actp", "args": ["claude@https://agents.example.com", "--token-env", "ACTP_TOKEN", "--cwd", "actp://website"] }
 ```
 
-`--cwd actp://website` sends every session to the `website` workspace on the server, whatever folder the client is in. List what a server offers:
+`--cwd actp://website` sends every session to the `website` workspace on the server, whatever folder the client is in. To try a remote agent from a terminal, add `-p` for a one-shot prompt:
+
+```bash
+actp claude@workstation -p "Say hello and list the files here"
+``` List what a server offers:
 
 ```bash
 actp agents https://agents.example.com --token-env ACTP_TOKEN
