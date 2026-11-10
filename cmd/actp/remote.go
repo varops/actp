@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"text/tabwriter"
@@ -67,14 +66,14 @@ func cmdRemote(args []string) error {
 			if token == "" {
 				return fmt.Errorf("no token on stdin: %v", err)
 			}
-			path := config.RemoteTokenPath(cfg, name)
-			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			if err := config.SaveRemoteToken(cfg, &r, token); err != nil {
 				return err
 			}
-			if err := os.WriteFile(path, []byte(token+"\n"), 0o600); err != nil {
-				return err
+			if r.TokenKeychain {
+				fmt.Fprintln(os.Stderr, "Token saved in the OS keychain.")
+			} else {
+				fmt.Fprintln(os.Stderr, "No OS keychain available; token saved in", r.TokenFile)
 			}
-			r.TokenFile = path
 		}
 		rf.Remotes = append(rf.Remotes, r)
 		if err := config.WriteRemotesFile(cfg.RemotesFile, rf); err != nil {
@@ -92,6 +91,8 @@ func cmdRemote(args []string) error {
 				src = "$" + r.TokenEnv
 			case r.TokenFile != "":
 				src = r.TokenFile
+			case r.TokenKeychain:
+				src = "OS keychain"
 			}
 			fmt.Fprintf(w, "%s\t%s\t%s\n", r.Name, r.URL, src)
 		}
@@ -116,9 +117,7 @@ func cmdRemote(args []string) error {
 		if err := config.WriteRemotesFile(cfg.RemotesFile, rf); err != nil {
 			return err
 		}
-		if removed.TokenFile == config.RemoteTokenPath(cfg, removed.Name) {
-			_ = os.Remove(removed.TokenFile)
-		}
+		config.DeleteRemoteToken(cfg, removed)
 		fmt.Fprintf(os.Stderr, "Removed remote %q.\n", positional[0])
 		return nil
 	}

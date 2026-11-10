@@ -134,8 +134,8 @@ func resolveToken(env, file string, remote *config.Remote) (string, error) {
 	if v := strings.TrimSpace(os.Getenv("ACTP_TOKEN")); v != "" {
 		return v, nil
 	}
-	if remote != nil && (remote.TokenEnv != "" || remote.TokenFile != "") {
-		return read(remote.TokenEnv, remote.TokenFile)
+	if remote != nil && (remote.TokenEnv != "" || remote.TokenFile != "" || remote.TokenKeychain) {
+		return config.RemoteToken(remote)
 	}
 	return "", errors.New("no token: use --token-env, --token-file, ACTP_TOKEN, or a saved remote with a token")
 }

@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/zalando/go-keyring"
+
 	"github.com/varops/actp/internal/config"
 	"github.com/varops/actp/internal/server"
 )
@@ -107,6 +109,7 @@ func TestOneTimeLinkAndSession(t *testing.T) {
 }
 
 func TestCreateTokenAndRemotes(t *testing.T) {
+	keyring.MockInit()
 	d, c, cfgPath := setup(t)
 	base := "http://" + d.addr
 	do(t, c, "GET", d.URL(), "", false)
@@ -135,12 +138,11 @@ func TestCreateTokenAndRemotes(t *testing.T) {
 	}
 	cfg, _ := config.Load(cfgPath)
 	r := cfg.Remote("box")
-	if r == nil || r.TokenFile == "" {
+	if r == nil || !r.TokenKeychain {
 		t.Fatalf("remote %+v", r)
 	}
-	info, err := os.Stat(r.TokenFile)
-	if err != nil || info.Mode().Perm()&0o077 != 0 {
-		t.Fatalf("token file %v %v", info, err)
+	if tok, err := config.RemoteToken(r); err != nil || tok != "actp_abc" {
+		t.Fatalf("keychain token %q %v", tok, err)
 	}
 	_, body = do(t, c, "GET", base+"/api/status", "", false)
 	if !strings.Contains(body, `"name":"box"`) || strings.Contains(body, "actp_abc") {
@@ -149,7 +151,7 @@ func TestCreateTokenAndRemotes(t *testing.T) {
 	if code, _ := do(t, c, "DELETE", base+"/api/remotes/"+url.PathEscape("box"), "", true); code != 200 {
 		t.Fatalf("remove: %d", code)
 	}
-	if _, err := os.Stat(r.TokenFile); !os.IsNotExist(err) {
-		t.Fatal("token file kept after remove")
+	if _, err := config.RemoteToken(r); err == nil {
+		t.Fatal("keychain token kept after remove")
 	}
 }

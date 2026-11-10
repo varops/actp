@@ -14,8 +14,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -332,13 +330,8 @@ func (d *Dashboard) addRemote(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, fmt.Errorf("a remote named %q already exists", req.Name))
 		return
 	}
-	// The OS keychain is planned; until then the token sits in a file only this user can read.
-	tokenPath := config.RemoteTokenPath(cfg, req.Name)
-	if err := os.MkdirAll(filepath.Dir(tokenPath), 0o700); err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	if err := os.WriteFile(tokenPath, []byte(req.Token+"\n"), 0o600); err != nil {
+	remote := config.Remote{Name: req.Name, URL: strings.TrimSuffix(req.URL, "/")}
+	if err := config.SaveRemoteToken(cfg, &remote, req.Token); err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -347,7 +340,7 @@ func (d *Dashboard) addRemote(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	rf.Remotes = append(rf.Remotes, config.Remote{Name: req.Name, URL: strings.TrimSuffix(req.URL, "/"), TokenFile: tokenPath})
+	rf.Remotes = append(rf.Remotes, remote)
 	if err := config.WriteRemotesFile(cfg.RemotesFile, rf); err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
@@ -372,9 +365,7 @@ func (d *Dashboard) removeRemote(w http.ResponseWriter, r *http.Request) {
 	for _, rm := range rf.Remotes {
 		if rm.Name == name {
 			found = true
-			if rm.TokenFile == config.RemoteTokenPath(cfg, rm.Name) {
-				_ = os.Remove(rm.TokenFile)
-			}
+			config.DeleteRemoteToken(cfg, &rm)
 			continue
 		}
 		kept = append(kept, rm)

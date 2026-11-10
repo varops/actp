@@ -114,6 +114,8 @@ type Remote struct {
 	URL       string `yaml:"url"`
 	TokenEnv  string `yaml:"token_env"`
 	TokenFile string `yaml:"token_file"`
+	// TokenKeychain means the token is in the OS keychain (service "actp", account "remote:<name>").
+	TokenKeychain bool `yaml:"token_keychain,omitempty"`
 }
 
 // Path is the file the config was loaded from ("" when built in code).
