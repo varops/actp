@@ -1,19 +1,20 @@
 package autostart
 
 import (
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 )
 
 func TestEntries(t *testing.T) {
-	if p := filePath("darwin", "/Users/me", ""); p != "/Users/me/Library/LaunchAgents/dev.actp.tray.plist" {
+	if p := filepath.ToSlash(filePath("darwin", "/Users/me", "")); p != "/Users/me/Library/LaunchAgents/dev.actp.tray.plist" {
 		t.Errorf("darwin path %s", p)
 	}
-	if p := filePath("linux", "/home/me", ""); p != "/home/me/.config/autostart/actp.desktop" {
+	if p := filepath.ToSlash(filePath("linux", "/home/me", "")); p != "/home/me/.config/autostart/actp.desktop" {
 		t.Errorf("linux path %s", p)
 	}
-	if p := filePath("linux", "/home/me", "/cfg"); p != "/cfg/autostart/actp.desktop" {
+	if p := filepath.ToSlash(filePath("linux", "/home/me", "/cfg")); p != "/cfg/autostart/actp.desktop" {
 		t.Errorf("xdg path %s", p)
 	}
 	plist := fileContents("darwin", "/Applications/A & B/actp")
