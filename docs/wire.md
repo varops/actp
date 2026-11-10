@@ -117,7 +117,7 @@ WebSocket close codes: `1000` after `bye`, `4001` replaced by a newer socket, `4
 ## 7. Limits
 
 - One frame: at most 16 MB.
-- Replay buffer per link: up to `spool_limit` (default 1 GB). Today it is kept in memory; spilling to disk is planned.
+- Replay buffer per link: in memory up to 8 MB, then in a spool file (mode 0600, under `state_dir/spool`) up to `spool_limit` (default 1 GB). The file is emptied when everything is acked, deleted when the link ends, and purged when the server starts.
 
 ## 8. Likely future changes
 

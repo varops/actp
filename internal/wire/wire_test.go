@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -200,5 +201,41 @@ func TestWindowStopsSendingWithoutAcks(t *testing.T) {
 	}
 	if got != 5 {
 		t.Fatalf("sent %d messages without acks, want 5", got)
+	}
+}
+
+func TestSpoolSpillsToDiskAndReplays(t *testing.T) {
+	var cc collector
+	opts := fastOpts()
+	opts.SpoolPath = t.TempDir() + "/link.spool"
+	opts.MemoryLimit = 100
+	server := NewEndpoint(opts, func(json.RawMessage) error { return nil })
+	defer server.Close()
+	// Nobody attached: everything waits, most of it on disk.
+	for i := 1; i <= 50; i++ {
+		server.Send(json.RawMessage(fmt.Sprintf(`{"n":%d,"pad":"%s"}`, i, strings.Repeat("x", 20))))
+	}
+	if err := server.SpoolError(); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(opts.SpoolPath); err != nil || info.Size() == 0 || info.Mode().Perm()&0o077 != 0 {
+		t.Fatalf("spool file: %v %v", info, err)
+	}
+	dial, _ := pair(t, server)
+	client := NewEndpoint(fastOpts(), cc.deliver)
+	go client.Serve(context.Background(), dial(), 0)
+	waitFor(t, "replay of 50", func() bool { return len(cc.list()) == 50 })
+	for i, m := range cc.list() {
+		if !strings.HasPrefix(m, fmt.Sprintf(`{"n":%d,`, i+1)) {
+			t.Fatalf("message %d is %s", i+1, m)
+		}
+	}
+	waitFor(t, "acks to empty the spool", func() bool {
+		info, err := os.Stat(opts.SpoolPath)
+		return err == nil && info.Size() == 0
+	})
+	server.Close()
+	if _, err := os.Stat(opts.SpoolPath); !os.IsNotExist(err) {
+		t.Fatal("spool file not removed")
 	}
 }

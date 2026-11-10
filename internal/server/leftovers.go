@@ -30,10 +30,21 @@ func (s *Server) recordPIDs() {
 	}
 }
 
-// cleanupLeftovers stops agents left running by a server that crashed.
+func (s *Server) spoolDir() string { return filepath.Join(s.cfg.StateDir, "spool") }
+
+// cleanupLeftovers stops agents left running by a server that crashed, and
+// deletes spool files, which can hold code and secrets.
 func (s *Server) cleanupLeftovers() {
+	purgeSpool := func() {
+		if entries, err := os.ReadDir(s.spoolDir()); err == nil {
+			for _, e := range entries {
+				_ = os.Remove(filepath.Join(s.spoolDir(), e.Name()))
+			}
+		}
+	}
 	data, err := os.ReadFile(s.statePath())
 	if err != nil {
+		purgeSpool()
 		return
 	}
 	var st struct {
@@ -47,6 +58,7 @@ func (s *Server) cleanupLeftovers() {
 		s.log.Warn("another actp server seems to be running with the same state folder", "pid", st.ServerPID, "state", filepath.Dir(s.statePath()))
 		return
 	}
+	purgeSpool()
 	for _, pid := range st.AgentPIDs {
 		if processAlive(pid) {
 			s.log.Info("stopping agent left over from an earlier run", "pid", pid)

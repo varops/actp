@@ -19,9 +19,14 @@ func killGroup(cmd *exec.Cmd) {
 	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 }
 
-// KillGroupByPID stops a leftover process group from an earlier run.
+// KillGroupByPID stops a leftover process group from an earlier run. Agents
+// lead their own group, so a reused pid that leads no group is left alone.
 func KillGroupByPID(pid int) {
-	if pid > 1 {
-		_ = syscall.Kill(-pid, syscall.SIGKILL)
+	if pid <= 1 {
+		return
 	}
+	if pgid, err := syscall.Getpgid(pid); err != nil || pgid != pid {
+		return
+	}
+	_ = syscall.Kill(-pid, syscall.SIGKILL)
 }

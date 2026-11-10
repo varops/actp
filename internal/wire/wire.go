@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -100,6 +102,10 @@ type Options struct {
 	WindowBytes    int64         // or this many bytes unacked (4 MB)
 	HeartbeatPing  bool          // heartbeat with ping instead of ack
 	Tick           time.Duration // writer housekeeping interval (100 ms)
+	// SpoolPath, when set, is a file that unacked messages spill into once
+	// MemoryLimit bytes are held in memory (8 MB). The file is private to the user.
+	SpoolPath   string
+	MemoryLimit int64
 }
 
 func (o *Options) defaults() {
@@ -124,11 +130,16 @@ func (o *Options) defaults() {
 	if o.Tick == 0 {
 		o.Tick = 100 * time.Millisecond
 	}
+	if o.MemoryLimit == 0 {
+		o.MemoryLimit = 8 << 20
+	}
 }
 
 type outItem struct {
-	seq int64
-	raw json.RawMessage
+	seq  int64
+	raw  json.RawMessage // nil when the message is in the spool file
+	off  int64
+	size int64
 }
 
 // Endpoint is one side of a link. It outlives sockets: messages sent while no
@@ -141,6 +152,10 @@ type Endpoint struct {
 	nextSeq   int64
 	outbox    []outItem
 	outBytes  int64
+	memBytes  int64
+	spool     *os.File
+	spoolEnd  int64
+	spoolErr  error
 	peerAck   int64
 	sentSeq   int64
 	lastRecv  int64
@@ -171,8 +186,17 @@ func (e *Endpoint) Send(raw json.RawMessage) {
 		return
 	}
 	e.nextSeq++
-	e.outbox = append(e.outbox, outItem{seq: e.nextSeq, raw: raw})
-	e.outBytes += int64(len(raw))
+	it := outItem{seq: e.nextSeq, raw: raw, size: int64(len(raw))}
+	if e.opts.SpoolPath != "" && e.memBytes+it.size > e.opts.MemoryLimit {
+		if err := e.spill(&it); err != nil {
+			e.spoolErr = err
+		}
+	}
+	if it.raw != nil {
+		e.memBytes += it.size
+	}
+	e.outbox = append(e.outbox, it)
+	e.outBytes += it.size
 	e.mu.Unlock()
 	e.poke()
 }
@@ -184,6 +208,8 @@ func (e *Endpoint) SetDiscard(on bool) {
 	if on {
 		e.outbox = nil
 		e.outBytes = 0
+		e.memBytes = 0
+		e.resetSpool()
 		e.peerAck = e.nextSeq
 		e.sentSeq = e.nextSeq
 	}
@@ -385,6 +411,65 @@ func (e *Endpoint) handleAck(a int64) {
 	}
 }
 
+// spill writes a message to the spool file; the caller holds mu.
+func (e *Endpoint) spill(it *outItem) error {
+	if e.spool == nil {
+		if err := os.MkdirAll(filepath.Dir(e.opts.SpoolPath), 0o700); err != nil {
+			return err
+		}
+		f, err := os.OpenFile(e.opts.SpoolPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
+		if err != nil {
+			return err
+		}
+		e.spool, e.spoolEnd = f, 0
+	}
+	if _, err := e.spool.WriteAt(it.raw, e.spoolEnd); err != nil {
+		return err
+	}
+	it.off, it.raw = e.spoolEnd, nil
+	e.spoolEnd += it.size
+	return nil
+}
+
+// load returns a message's bytes, reading the spool when needed; the caller holds mu.
+func (e *Endpoint) load(it outItem) (json.RawMessage, error) {
+	if it.raw != nil {
+		return it.raw, nil
+	}
+	buf := make([]byte, it.size)
+	if _, err := e.spool.ReadAt(buf, it.off); err != nil {
+		return nil, fmt.Errorf("reading spool: %w", err)
+	}
+	return buf, nil
+}
+
+// resetSpool empties the spool file once nothing in it is needed; the caller holds mu.
+func (e *Endpoint) resetSpool() {
+	if e.spool != nil && e.spoolEnd > 0 {
+		_ = e.spool.Truncate(0)
+		e.spoolEnd = 0
+	}
+}
+
+// SpoolError reports a failure to use the spool file, if any.
+func (e *Endpoint) SpoolError() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.spoolErr
+}
+
+// Close deletes the spool file. The endpoint must not be used afterwards.
+func (e *Endpoint) Close() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.spool != nil {
+		_ = e.spool.Close()
+		_ = os.Remove(e.opts.SpoolPath)
+		e.spool = nil
+	}
+	e.outbox, e.outBytes, e.memBytes = nil, 0, 0
+}
+
 // ackPeer trims the outbox up to a; the caller holds mu.
 func (e *Endpoint) ackPeer(a int64) bool {
 	if a <= e.peerAck {
@@ -396,10 +481,16 @@ func (e *Endpoint) ackPeer(a int64) bool {
 	e.peerAck = a
 	n := 0
 	for n < len(e.outbox) && e.outbox[n].seq <= a {
-		e.outBytes -= int64(len(e.outbox[n].raw))
+		e.outBytes -= e.outbox[n].size
+		if e.outbox[n].raw != nil {
+			e.memBytes -= e.outbox[n].size
+		}
 		n++
 	}
 	e.outbox = append(e.outbox[:0:0], e.outbox[n:]...)
+	if len(e.outbox) == 0 {
+		e.resetSpool()
+	}
 	if e.sentSeq < a {
 		e.sentSeq = a
 	}
@@ -481,7 +572,7 @@ func (e *Endpoint) collect() (frames []Frame, dead bool, closeAfter websocket.St
 				break
 			}
 			if it.seq > e.peerAck {
-				inflightBytes += int64(len(it.raw))
+				inflightBytes += it.size
 			}
 		}
 		for e.sentSeq < e.nextSeq && len(e.outbox) > 0 {
@@ -493,8 +584,13 @@ func (e *Endpoint) collect() (frames []Frame, dead bool, closeAfter websocket.St
 				break
 			}
 			it := e.outbox[idx]
-			frames = append(frames, Frame{T: TMsg, Seq: it.seq, Ack: e.lastRecv, Msg: it.raw})
-			inflightBytes += int64(len(it.raw))
+			raw, err := e.load(it)
+			if err != nil {
+				e.spoolErr = err
+				break
+			}
+			frames = append(frames, Frame{T: TMsg, Seq: it.seq, Ack: e.lastRecv, Msg: raw})
+			inflightBytes += it.size
 			e.sentSeq = it.seq
 			e.ackSent = e.lastRecv
 		}

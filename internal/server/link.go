@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -110,7 +111,9 @@ func (s *Server) startLink(agent *config.Agent, tok *config.Token, clientName st
 		sessions: map[string]*linkSession{}, serverReqs: map[string]bool{},
 		ended: make(chan struct{}),
 	}
-	l.ep = wire.NewEndpoint(s.opts.Wire, l.fromClient)
+	wopts := s.opts.Wire
+	wopts.SpoolPath = filepath.Join(s.spoolDir(), l.id+".spool")
+	l.ep = wire.NewEndpoint(wopts, l.fromClient)
 	s.mu.Lock()
 	s.links[l.id] = l
 	s.mu.Unlock()
@@ -661,6 +664,8 @@ func (l *Link) supervise() {
 			switch {
 			case l.ep.OutboxBytes() > int64(cfg.SpoolLimit):
 				l.end(wire.ErrSpoolFull, "output spool is full")
+			case l.ep.SpoolError() != nil:
+				l.end(wire.ErrSpoolFull, "output spool failed: "+l.ep.SpoolError().Error())
 			case !oldest.IsZero() && time.Since(oldest) >= cfg.PromptTimeout.D():
 				l.end(wire.ErrLinkEnded, "prompt unanswered past prompt_timeout")
 			case !running && oldest.IsZero() && time.Since(since) >= cfg.IdleClose.D():
@@ -720,6 +725,7 @@ func (l *Link) endWithData(code, reason string, data json.RawMessage) {
 		}
 		time.AfterFunc(2*time.Second, func() { l.ep.Detach(wire.CloseLinkEnded, reason) })
 		l.ep.SetDiscard(true)
+		time.AfterFunc(3*time.Second, l.ep.Close)
 		for _, id := range open {
 			l.srv.releaseSession(l.agent.ID, id, l)
 		}

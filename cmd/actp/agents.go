@@ -105,7 +105,7 @@ func cmdDoctor(args []string) error {
 			fmt.Printf("workspace %s: ok %s\n", w.Name, w.Path)
 		}
 	}
-	srv, err := server.New(cfg.Server, server.Options{Version: version, BaseEnv: env, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	srv, err := server.New(cfg.Server, server.Options{Version: version, BaseEnv: env, ReadOnly: true, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	if err != nil {
 		return err
 	}

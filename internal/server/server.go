@@ -29,6 +29,8 @@ type Options struct {
 	Tick time.Duration
 	// ProbeOnStart runs an initialize probe against every agent at start.
 	ProbeOnStart bool
+	// ReadOnly is for tools like `actp doctor`: no crash cleanup, no audit log.
+	ReadOnly bool
 }
 
 // Server holds configuration, links and agent status.
@@ -86,12 +88,14 @@ func New(cfg *config.Server, opts Options) (*Server, error) {
 	for _, a := range cfg.Agents {
 		s.status[a.ID] = &agentStatus{Status: string(api.Unknown)}
 	}
-	audit, err := openAudit(cfg.LogDir)
-	if err != nil {
-		s.log.Warn("audit log disabled", "error", err)
+	if !opts.ReadOnly {
+		audit, err := openAudit(cfg.LogDir)
+		if err != nil {
+			s.log.Warn("audit log disabled", "error", err)
+		}
+		s.audit = audit
+		s.cleanupLeftovers()
 	}
-	s.audit = audit
-	s.cleanupLeftovers()
 	if opts.ProbeOnStart {
 		for i := range cfg.Agents {
 			go s.Probe(&cfg.Agents[i])
