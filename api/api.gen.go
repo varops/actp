@@ -128,8 +128,8 @@ type Unauthorized = Error
 
 // OpenLinkParams defines parameters for OpenLink.
 type OpenLinkParams struct {
-	// SecWebSocketProtocol Wire versions the bridge supports, for example `actp.v1`.
-	SecWebSocketProtocol string `json:"Sec-WebSocket-Protocol"`
+	// SecWebSocketProtocol Wire versions the bridge supports, for example `actp.v1`. Without a supported version the server answers 426.
+	SecWebSocketProtocol *string `json:"Sec-WebSocket-Protocol,omitempty"`
 
 	// ActpClientName Display name of the client, for logs and the tray.
 	ActpClientName *string `json:"Actp-Client-Name,omitempty"`
@@ -333,14 +333,16 @@ func NewOpenLinkRequest(server string, agentId AgentId, params *OpenLinkParams) 
 
 	if params != nil {
 
-		var headerParam0 string
+		if params.SecWebSocketProtocol != nil {
+			var headerParam0 string
 
-		headerParam0, err = runtime.StyleParamWithOptions("simple", false, "Sec-WebSocket-Protocol", params.SecWebSocketProtocol, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationHeader, Type: "string", Format: ""})
-		if err != nil {
-			return nil, err
+			headerParam0, err = runtime.StyleParamWithOptions("simple", false, "Sec-WebSocket-Protocol", *params.SecWebSocketProtocol, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationHeader, Type: "string", Format: ""})
+			if err != nil {
+				return nil, err
+			}
+
+			req.Header.Set("Sec-WebSocket-Protocol", headerParam0)
 		}
-
-		req.Header.Set("Sec-WebSocket-Protocol", headerParam0)
 
 		if params.ActpClientName != nil {
 			var headerParam1 string
@@ -538,6 +540,7 @@ type ClientWithResponsesInterface interface {
 
 // OpenLinkResponse101Headers the declared response headers of an HTTP 101 response for OpenLink
 type OpenLinkResponse101Headers struct {
+	ActpLastSeq       *int64
 	ActpLinkId        *string
 	ActpPromptTimeout *int
 }
@@ -924,6 +927,13 @@ func ParseOpenLinkResponse(rsp *http.Response) (*OpenLinkResponse, error) {
 	switch {
 	case rsp.StatusCode == 101:
 		var headers OpenLinkResponse101Headers
+		if values := rsp.Header.Values("Actp-Last-Seq"); len(values) > 0 {
+			var value int64
+			if err := runtime.BindStyledParameterWithOptions("simple", "Actp-Last-Seq", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: "int64"}); err != nil {
+				return nil, err
+			}
+			headers.ActpLastSeq = &value
+		}
 		if values := rsp.Header.Values("Actp-Link-Id"); len(values) > 0 {
 			var value string
 			if err := runtime.BindStyledParameterWithOptions("simple", "Actp-Link-Id", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
@@ -1091,7 +1101,7 @@ func (siw *ServerInterfaceWrapper) OpenLink(w http.ResponseWriter, r *http.Reque
 
 	headers := r.Header
 
-	// ------------- Required header parameter "Sec-WebSocket-Protocol" -------------
+	// ------------- Optional header parameter "Sec-WebSocket-Protocol" -------------
 	if valueList, found := headers[http.CanonicalHeaderKey("Sec-WebSocket-Protocol")]; found {
 		var SecWebSocketProtocol string
 		n := len(valueList)
@@ -1100,18 +1110,14 @@ func (siw *ServerInterfaceWrapper) OpenLink(w http.ResponseWriter, r *http.Reque
 			return
 		}
 
-		err = runtime.BindStyledParameterWithOptions("simple", "Sec-WebSocket-Protocol", valueList[0], &SecWebSocketProtocol, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""})
+		err = runtime.BindStyledParameterWithOptions("simple", "Sec-WebSocket-Protocol", valueList[0], &SecWebSocketProtocol, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""})
 		if err != nil {
 			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "Sec-WebSocket-Protocol", Err: err})
 			return
 		}
 
-		params.SecWebSocketProtocol = SecWebSocketProtocol
+		params.SecWebSocketProtocol = &SecWebSocketProtocol
 
-	} else {
-		err := fmt.Errorf("Header parameter Sec-WebSocket-Protocol is required, but not found")
-		siw.ErrorHandlerFunc(w, r, &RequiredHeaderError{ParamName: "Sec-WebSocket-Protocol", Err: err})
-		return
 	}
 
 	// ------------- Optional header parameter "Actp-Client-Name" -------------

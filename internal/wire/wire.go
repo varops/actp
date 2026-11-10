@@ -455,16 +455,21 @@ func (e *Endpoint) collect() (frames []Frame, dead bool, closeAfter websocket.St
 	if now.Sub(e.lastHeard) > e.opts.DeadAfter {
 		return nil, true, 0
 	}
+	// Errors go out at once. A bye waits until every queued message is on the wire,
+	// so a last session/cancel is not lost behind it.
+	var bye []Frame
 	for _, c := range e.control {
-		frames = append(frames, c)
 		switch c.T {
 		case TBye:
-			closeAfter = websocket.StatusNormalClosure
+			bye = append(bye, c)
 		case TError:
+			frames = append(frames, c)
 			closeAfter = CloseLinkEnded
+		default:
+			frames = append(frames, c)
 		}
 	}
-	e.control = nil
+	e.control = bye
 	if e.pongDue {
 		frames = append(frames, Frame{T: TPong})
 		e.pongDue = false
@@ -493,6 +498,11 @@ func (e *Endpoint) collect() (frames []Frame, dead bool, closeAfter websocket.St
 			e.sentSeq = it.seq
 			e.ackSent = e.lastRecv
 		}
+	}
+	if len(e.control) > 0 && closeAfter == 0 && e.sentSeq >= e.nextSeq {
+		frames = append(frames, e.control...)
+		e.control = nil
+		closeAfter = websocket.StatusNormalClosure
 	}
 	ackOwed := e.lastRecv > e.ackSent && !e.ackDue.IsZero() && !now.Before(e.ackDue)
 	heartbeat := now.Sub(e.lastSent) >= e.opts.HeartbeatEvery

@@ -84,8 +84,8 @@ paths:
             $ref: "#/components/schemas/AgentId"
         - name: Sec-WebSocket-Protocol
           in: header
-          required: true
-          description: Wire versions the bridge supports, for example `actp.v1`.
+          required: false
+          description: Wire versions the bridge supports, for example `actp.v1`. Without a supported version the server answers 426.
           schema:
             type: string
         - name: Actp-Client-Name
@@ -121,6 +121,11 @@ paths:
               description: Seconds an unanswered prompt waits for a dropped client.
               schema:
                 type: integer
+            Actp-Last-Seq:
+              description: Highest bridge sequence number the server has processed. The bridge resends everything after it.
+              schema:
+                type: integer
+                format: int64
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":

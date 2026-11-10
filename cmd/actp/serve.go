@@ -1,0 +1,98 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/varops/actp/internal/config"
+	"github.com/varops/actp/internal/server"
+)
+
+func cmdServe(args []string) error {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	cfgPath := fs.String("config", "", "config file (default "+config.DefaultPath()+")")
+	if err := fs.Parse(args); err != nil {
+		return exitError(2)
+	}
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+	if cfg.Server == nil {
+		return fmt.Errorf("%s has no server section", cfg.Path())
+	}
+	sc := cfg.Server
+	if err := checkListen(sc); err != nil {
+		return err
+	}
+	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	if len(sc.Tokens) == 0 {
+		log.Warn("no tokens configured: nobody can connect. Create one with `actp token create --name NAME`.")
+	}
+	if len(sc.Agents) == 0 {
+		log.Warn("no agents configured")
+	}
+
+	srv, err := server.New(sc, server.Options{Version: version, Logger: log, ProbeOnStart: true})
+	if err != nil {
+		return err
+	}
+	httpSrv := &http.Server{
+		Addr:              sc.Listen,
+		Handler:           srv.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	errs := make(chan error, 1)
+	go func() {
+		log.Info("actp server listening", "addr", sc.Listen, "version", version, "agents", len(sc.Agents))
+		if sc.TLSCert != "" {
+			errs <- httpSrv.ListenAndServeTLS(sc.TLSCert, sc.TLSKey)
+		} else {
+			errs <- httpSrv.ListenAndServe()
+		}
+	}()
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	select {
+	case err := <-errs:
+		if !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+	case s := <-sig:
+		log.Info("stopping: waiting up to 30 s for running turns", "signal", s.String())
+	}
+	srv.Close(30 * time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return httpSrv.Shutdown(ctx)
+}
+
+// checkListen refuses plain HTTP on a public address unless told it sits behind a TLS proxy.
+func checkListen(sc *config.Server) error {
+	host, _, err := net.SplitHostPort(sc.Listen)
+	if err != nil {
+		return fmt.Errorf("listen %q: %w", sc.Listen, err)
+	}
+	if isLoopback(host) || sc.TLSCert != "" || sc.InsecureListen {
+		return nil
+	}
+	return fmt.Errorf("listen %q is not a loopback address: set tls_cert and tls_key, or insecure_listen: true behind a TLS proxy", sc.Listen)
+}
+
+func isLoopback(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
