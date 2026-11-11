@@ -31,6 +31,8 @@ ACTP lets any [ACP](https://agentclientprotocol.com) client – an app, a bot, a
 - **A menu bar app** for macOS (and tray builds for Linux and Windows) with a dashboard, so you do not need to edit config files.
 - **Built-in Cloudflare tunnel** for machines without a public address.
 
+![The actp dashboard: agents, folders, client tokens and open connections](docs/images/dashboard.png)
+
 v0.1.0 is built for chat-style clients: apps, bots and assistants that talk to an agent and show what it does. The files live on the agent's machine, so clients that edit files themselves (IDE-style) are not a target yet.
 
 ## Install
@@ -222,6 +224,10 @@ go generate ./api/
 ```
 
 The second command regenerates the HTTP code after a change to `api/openapi.yaml`. CI runs the tests on Linux, macOS and Windows and builds `actp.app` on a Mac. Pushing a `v*` tag builds every platform into a draft GitHub release.
+
+## Contributing
+
+Bug reports, fixes and new agent presets are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md). Please report security problems privately, as described in [SECURITY.md](.github/SECURITY.md).
 
 ## License
 

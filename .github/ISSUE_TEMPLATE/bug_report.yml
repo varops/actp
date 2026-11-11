@@ -1,0 +1,38 @@
+name: Bug report
+description: Something does not work as described.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "Security problem? Please do not file it here: see SECURITY.md. Remove tokens from anything you paste."
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: actp version
+      description: Output of `actp version`, on the server and the client if they differ.
+    validations:
+      required: true
+  - type: dropdown
+    id: part
+    attributes:
+      label: Which part
+      multiple: true
+      options: [Server, Bridge / ACP client, Dashboard or app, Tunnel, Other]
+  - type: input
+    id: env
+    attributes:
+      label: OS and agent
+      placeholder: macOS 26 server, Ubuntu 24.04 client, Droid 1.6.0
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Lines from ~/.actp/logs/actp.log (and cloudflared.log for tunnel problems) around the problem.
+      render: text
