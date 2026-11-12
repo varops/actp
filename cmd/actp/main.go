@@ -32,6 +32,7 @@ Usage:
   actp bridge <agent>@<server> [options]
   actp token create --name NAME [--agents a,b] [--workspaces w,x] [--default-workspace w]
   actp token list
+  actp token generate                    print a new token without saving it (for ACTP_TOKEN)
   actp token revoke NAME
   actp remote add NAME URL [--token-stdin | --token-env NAME | --token-file PATH]
   actp remote list
@@ -39,6 +40,7 @@ Usage:
   actp agents <server> [--token-env NAME | --token-file PATH]
   actp tunnel install                    download the pinned cloudflared into ~/.actp/bin
   actp doctor [--config FILE]
+  actp container                         run in the Docker image (see "actp container -h")
   actp version
 `
 
@@ -74,6 +76,8 @@ func run(args []string) error {
 		return cmdBridge(rest)
 	case "tray":
 		return cmdTray(rest)
+	case "container":
+		return cmdContainer(rest)
 	case "token":
 		return cmdToken(rest)
 	case "agents":

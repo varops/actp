@@ -14,6 +14,11 @@ func loginShellEnv(ctx context.Context) []string { return agentproc.LoginShellEn
 // recordPIDs writes the running agents' process ids, so a crashed server can
 // stop them on its next start.
 func (s *Server) recordPIDs() {
+	s.pidMu.Lock()
+	defer s.pidMu.Unlock()
+	if s.pidsClosed {
+		return
+	}
 	s.mu.Lock()
 	pids := make([]int, 0, len(s.links))
 	for _, l := range s.links {

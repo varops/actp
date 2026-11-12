@@ -262,3 +262,23 @@ func (t *tail) String() string {
 	defer t.mu.Unlock()
 	return string(t.buf)
 }
+
+// AppendPath adds folders to the end of PATH in env, skipping ones already there.
+func AppendPath(env []string, dirs ...string) []string {
+	path := Getenv(env, "PATH")
+	have := map[string]bool{}
+	for _, d := range filepath.SplitList(path) {
+		have[d] = true
+	}
+	for _, d := range dirs {
+		if d == "" || have[d] {
+			continue
+		}
+		if path != "" {
+			path += string(os.PathListSeparator)
+		}
+		path += d
+		have[d] = true
+	}
+	return BuildEnv(env, map[string]string{"PATH": path}, nil)
+}

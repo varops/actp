@@ -47,7 +47,7 @@ input, select { font: inherit; padding: 7px 9px; border-radius: 7px; border: 1px
 .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .warn { border-left: 3px solid var(--warn); padding: 8px 12px; background: var(--code); border-radius: 6px; font-size: 14px; }
 .error { color: var(--bad); font-size: 14px; }
-.hidden { display: none; }
+.hidden { display: none !important; }
 @media (max-width: 560px) { .hide-sm { display: none; } }
 .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin-bottom: 16px; flex-wrap: wrap; }
 .tab { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none; padding: 8px 12px; color: var(--muted); font-weight: 500; }
@@ -57,6 +57,9 @@ input, select { font: inherit; padding: 7px 9px; border-radius: 7px; border: 1px
 section h2 { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 section h2 button { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .agent-cmds { display: grid; gap: 6px; margin: 6px 0 4px; }
+.log { max-height: 280px; overflow: auto; font-size: 12px; }
+#term { height: 70vh; min-height: 320px; background: #000; border-radius: 8px; padding: 6px; overflow: hidden; }
+main.wide { max-width: 1200px; }
 </style>
 </head>
 <body>
@@ -64,8 +67,9 @@ section h2 button { text-transform: none; letter-spacing: 0; font-weight: 400; }
   <header>
     <h1>actp <small id="version"></small></h1>
     <div class="row">
-      <label class="row muted" style="display:flex"><input type="checkbox" id="autostart" style="width:auto"> Start at login</label>
+      <label class="row muted" style="display:flex" id="autostart-label"><input type="checkbox" id="autostart" style="width:auto"> Start at login</label>
       <span class="muted" id="config"></span>
+      <button id="logout" class="hidden">Log out</button>
     </div>
   </header>
 
@@ -74,6 +78,7 @@ section h2 button { text-transform: none; letter-spacing: 0; font-weight: 400; }
   <nav class="tabs">
     <button class="tab" data-tab="server">Share agents <small>(server)</small></button>
     <button class="tab" data-tab="bridge">Use remote agents <small>(bridge)</small></button>
+    <button class="tab hidden" data-tab="terminal">Terminal</button>
   </nav>
 
   <div id="tab-server" class="hidden">
@@ -155,6 +160,16 @@ section h2 button { text-transform: none; letter-spacing: 0; font-weight: 400; }
         <p class="muted hidden" id="no-links">No open connections.</p>
       </section>
     </div>
+
+    <section id="installer" class="hidden">
+      <h2>Install agents</h2>
+      <p class="muted" style="margin-top:0">actp installs agents with npm into <code id="installer-prefix"></code> and turns them on. Most agents then need a login once (in a terminal) or an API key in their environment.</p>
+      <table><thead><tr><th>Agent</th><th>Installed</th><th></th></tr></thead><tbody id="recipes"></tbody></table>
+      <div id="job" class="hidden">
+        <p class="muted" id="job-title" style="margin-bottom:0"></p>
+        <pre class="code log" id="job-log"></pre>
+      </div>
+    </section>
   </div>
 
   <div id="tab-bridge" class="hidden">
@@ -174,6 +189,11 @@ section h2 button { text-transform: none; letter-spacing: 0; font-weight: 400; }
       </form>
       <div id="remotes"></div>
     </section>
+  </div>
+
+  <div id="tab-terminal" class="hidden">
+    <p class="intro">A shell on the agent machine, as the user agents run as. Use it to log agents in (for example <code>claude /login</code>) or to look around. <span id="term-state"></span></p>
+    <div id="term"></div>
   </div>
 </main>
 <script>
@@ -206,6 +226,10 @@ function showTab(name) {
   document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
   $("tab-server").classList.toggle("hidden", name !== "server");
   $("tab-bridge").classList.toggle("hidden", name !== "bridge");
+  $("tab-terminal").classList.toggle("hidden", name !== "terminal");
+  document.querySelector("main").classList.toggle("wide", name === "terminal");
+  if (name === "terminal") openTerminal();
+  if (name === "server") loadInstaller();
 }
 document.querySelectorAll(".tab").forEach((b) => (b.onclick = () => showTab(b.dataset.tab)));
 
@@ -216,6 +240,11 @@ function render() {
   $("version").textContent = state.version;
   $("config").textContent = state.configPath;
   $("autostart").checked = !!state.autostart;
+  const f = state.features || {};
+  $("autostart-label").classList.toggle("hidden", !!f.password);
+  $("logout").classList.toggle("hidden", !f.password);
+  document.querySelector('[data-tab="bridge"]').classList.toggle("hidden", !!f.password);
+  document.querySelector('[data-tab="terminal"]').classList.toggle("hidden", !f.terminal);
   const srv = state.server;
   $("server").classList.toggle("hidden", !srv);
   $("no-server").classList.toggle("hidden", !!srv);
@@ -309,13 +338,17 @@ async function fillSetup() {
   if ($("setup-agents").dataset.filled) return;
   $("setup-agents").dataset.filled = "1";
   const info = await loadSetup();
+  fillSetupAgents(info);
+  addFolderInput("setup-folders", info.folder);
+  $("setup").name.value = info.name || "";
+  $("setup-file").textContent = "Saved to " + info.configFile;
+}
+
+function fillSetupAgents(info) {
   const found = info.agents.filter((a) => a.path), missing = info.agents.filter((a) => !a.path);
   $("setup-agents").innerHTML = found.map((a) => `<label title="${esc(a.path)}"><input type="checkbox" name="agent" value="${esc(a.preset)}" checked>${esc(a.name)}</label>`).join("")
     || `<span class="muted">No supported agents found on this machine.</span>`;
   $("setup-missing").innerHTML = missingText(missing);
-  addFolderInput("setup-folders", info.folder);
-  $("setup").name.value = info.name || "";
-  $("setup-file").textContent = "Saved to " + info.configFile;
 }
 
 const missingText = (missing) => missing.length ? "Not installed: " + missing.map((a) => a.hint ? `${esc(a.name)} (<code>${esc(a.hint)}</code>)` : esc(a.name)).join(", ") : "";
@@ -333,6 +366,7 @@ $("setup").onsubmit = async (ev) => {
   $("setup-error").textContent = "";
   try {
     const agents = [...f.querySelectorAll("input[name=agent]:checked")].map((i) => i.value);
+    if (!agents.length) throw new Error("Pick at least one agent. Install one below if none is listed.");
     const folders = [...f.querySelectorAll("input[name=folder]")].map((i) => i.value.trim()).filter(Boolean);
     btn.textContent = "Starting…";
     await api("POST", "/api/setup", { name: f.name.value, agents, folders, tunnel: f.tunnel.checked });
@@ -434,6 +468,7 @@ document.addEventListener("click", async (ev) => {
       showAgents(t.dataset.editRemote);
       return;
     }
+    if (t.dataset.install) { await startJob(t.dataset.install, t.dataset.action); return; }
     if (t.dataset.probe) { t.textContent = "Checking…"; await api("POST", `/api/agents/${encodeURIComponent(t.dataset.probe)}/probe`); }
     if (t.dataset.end && confirm("End this connection? A running turn is cancelled.")) await api("POST", `/api/links/${encodeURIComponent(t.dataset.end)}/end`);
     if (t.dataset.revoke && confirm(`Revoke the token for ${t.dataset.revoke}? That client can no longer connect.`)) await api("DELETE", `/api/tokens/${encodeURIComponent(t.dataset.revoke)}`);
@@ -454,15 +489,114 @@ async function refresh() {
     if (!tab) {
       let saved = null;
       try { saved = localStorage.getItem("actp-tab"); } catch (e) {}
-      showTab(saved || (state.server || !state.remotes.length ? "server" : "bridge"));
+      const f = state.features || {};
+      if ((saved === "terminal" && !f.terminal) || (saved === "bridge" && f.password)) saved = null;
+      showTab(saved || (state.server || f.password || !state.remotes.length ? "server" : "bridge"));
     }
     render();
     if (!state.server) fillSetup().catch((e) => { $("setup-error").textContent = e.message; });
   } catch (e) {
+    if (e.message === "log in first") { location.href = "/login"; return; }
     $("status-error").textContent = "Could not load the status: " + e.message;
     $("status-error").classList.remove("hidden");
   }
 }
+
+// Agent installer.
+let installer = null, jobFrom = 0, jobTimer = null;
+
+async function loadInstaller() {
+  try { installer = await api("GET", "/api/installer"); } catch (e) { return; }
+  $("installer").classList.toggle("hidden", !installer.available);
+  if (!installer.available) return;
+  $("installer-prefix").textContent = installer.prefix;
+  renderRecipes();
+  if (installer.job && !jobTimer) { jobFrom = 0; $("job-log").textContent = ""; pollJob(); }
+}
+
+function renderRecipes() {
+  const busy = installer.job && !installer.job.done;
+  $("recipes").innerHTML = installer.recipes.map((r) => {
+    const vers = Object.entries(r.versions || {}).map(([p, v]) => `${esc(p)} ${esc(v)}`).join("<br>");
+    const mine = vers !== "";
+    const state = mine ? `<div class="muted">${vers}</div>` : r.elsewhere ? `<span class="muted">outside actp: ${esc(r.elsewhere)}</span>` : `<span class="muted">no</span>`;
+    const btns = mine
+      ? `<button data-install="${esc(r.preset)}" data-action="install" ${busy ? "disabled" : ""}>Update</button> <button class="danger" data-install="${esc(r.preset)}" data-action="remove" ${busy ? "disabled" : ""}>Remove</button>`
+      : `<button class="primary" data-install="${esc(r.preset)}" data-action="install" ${busy ? "disabled" : ""}>Install</button>`;
+    return `<tr><td><strong>${esc(r.name)}</strong>${r.login ? `<div class="muted">Login: <code>${esc(r.login)}</code></div>` : ""}</td><td>${state}</td><td style="white-space:nowrap">${btns}</td></tr>`;
+  }).join("");
+}
+
+async function startJob(preset, action) {
+  if (action === "remove" && !confirm(`Remove ${preset}? It is also turned off for clients.`)) return;
+  const res = await api("POST", `/api/installer/${encodeURIComponent(preset)}/${action}`);
+  installer.job = res.job; jobFrom = 0; $("job-log").textContent = "";
+  renderRecipes();
+  pollJob();
+}
+
+async function pollJob() {
+  clearTimeout(jobTimer);
+  let job;
+  try { job = (await api("GET", `/api/installer/job?from=${jobFrom}`)).job; } catch (e) { jobTimer = setTimeout(pollJob, 2000); return; }
+  if (!job) { jobTimer = null; return; }
+  $("job").classList.remove("hidden");
+  $("job-title").textContent = `${job.action === "remove" ? "Removing" : "Installing"} ${job.preset}${job.done ? (job.error ? " failed." : " done.") : "…"}`;
+  const log = $("job-log"), atEnd = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+  log.textContent += job.output; jobFrom = job.next;
+  if (atEnd) log.scrollTop = log.scrollHeight;
+  if (job.done) {
+    jobTimer = null; installer.job = job;
+    setupInfo = null;
+    if (!state.server && $("setup-agents").dataset.filled) fillSetupAgents(await loadSetup());
+    loadInstaller(); refresh();
+    return;
+  }
+  jobTimer = setTimeout(pollJob, 700);
+}
+
+// Terminal.
+let term = null, termSocket = null;
+
+function loadAsset(tag, attrs) {
+  return new Promise((resolve, reject) => {
+    const el = document.createElement(tag);
+    Object.assign(el, attrs);
+    el.onload = resolve; el.onerror = () => reject(new Error("could not load " + (attrs.src || attrs.href)));
+    document.head.appendChild(el);
+  });
+}
+
+async function openTerminal() {
+  if (termSocket && termSocket.readyState <= 1) { term && term.focus(); return; }
+  if (!window.Terminal) {
+    await Promise.all([loadAsset("link", { rel: "stylesheet", href: "/static/xterm/xterm.css" }), loadAsset("script", { src: "/static/xterm/xterm.js" })]);
+    await loadAsset("script", { src: "/static/xterm/addon-fit.js" });
+  }
+  if (!term) {
+    term = new Terminal({ cursorBlink: true, fontSize: 13, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', theme: { background: "#000000" } });
+    term.fit = new FitAddon.FitAddon();
+    term.loadAddon(term.fit);
+    term.open($("term"));
+    term.onData((d) => termSocket && termSocket.readyState === 1 && termSocket.send(new TextEncoder().encode(d)));
+    term.onResize(({ cols, rows }) => termSocket && termSocket.readyState === 1 && termSocket.send(JSON.stringify({ cols, rows })));
+    new ResizeObserver(() => tab === "terminal" && term.fit.fit()).observe($("term"));
+  }
+  term.fit.fit();
+  const ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/api/terminal");
+  ws.binaryType = "arraybuffer";
+  termSocket = ws;
+  $("term-state").textContent = "";
+  ws.onopen = () => { ws.send(JSON.stringify({ cols: term.cols, rows: term.rows })); term.focus(); };
+  ws.onmessage = (ev) => term.write(typeof ev.data === "string" ? ev.data : new Uint8Array(ev.data));
+  ws.onclose = () => {
+    if (termSocket !== ws) return;
+    $("term-state").innerHTML = `The shell ended. <button id="term-again">Open a new shell</button>`;
+    $("term-again").onclick = () => { term.reset(); openTerminal(); };
+  };
+}
+
+$("logout").onclick = async () => { try { await api("POST", "/api/logout"); } catch (e) {} location.href = "/login"; };
 
 refresh();
 setInterval(refresh, 3000);

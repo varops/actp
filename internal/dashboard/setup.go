@@ -17,15 +17,7 @@ import (
 	"github.com/varops/actp/internal/config"
 )
 
-// Agent ids the setup uses for presets, so bridge commands read naturally (claude@host).
-var setupIDs = map[string]string{"claude-code": "claude"}
-
-func setupID(preset string) string {
-	if id, ok := setupIDs[preset]; ok {
-		return id
-	}
-	return preset
-}
+func setupID(preset string) string { return config.PresetID(preset) }
 
 type detectedAgent struct {
 	Preset string `json:"preset"`
@@ -45,7 +37,7 @@ var installHints = map[string]string{
 
 // setupInfo tells the page what it can offer: agents found on this machine and a starting folder.
 func (d *Dashboard) setupInfo(w http.ResponseWriter, r *http.Request) {
-	env := agentproc.CachedLoginShellEnv()
+	env := agentproc.AppendPath(agentproc.CachedLoginShellEnv(), config.AgentBinDir())
 	var agents []detectedAgent
 	for name, p := range config.Presets {
 		a := detectedAgent{Preset: name, ID: setupID(name), Name: p.Name, Hint: installHints[name]}

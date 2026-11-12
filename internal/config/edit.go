@@ -48,10 +48,14 @@ func SetServerList(path, key string, value any) error {
 	if err != nil {
 		return err
 	}
-	if err := p.ReplaceWithReader(f, bytes.NewReader(block)); err != nil {
-		if !errors.Is(err, yaml.ErrNotFoundNode) {
+	// ReplaceWithReader does nothing for a missing key, so look first.
+	if _, err := p.FilterFile(f); err == nil {
+		if err := p.ReplaceWithReader(f, bytes.NewReader(block)); err != nil {
 			return err
 		}
+	} else if !errors.Is(err, yaml.ErrNotFoundNode) {
+		return err
+	} else {
 		// The key is not there yet: merge it into the server section.
 		merge, mErr := yaml.Marshal(map[string]any{key: value})
 		if mErr != nil {
@@ -72,6 +76,65 @@ func SetServerList(path, key string, value any) error {
 	if _, err := Load(path); err != nil {
 		_ = os.WriteFile(path, old, 0o600)
 		return fmt.Errorf("the change would break the config, so nothing was changed: %w", err)
+	}
+	return nil
+}
+
+// presetIDs are agent ids for presets whose name is long, so bridge commands
+// read naturally (claude@host).
+var presetIDs = map[string]string{"claude-code": "claude"}
+
+// PresetID is the agent id actp gives a preset it adds to the config.
+func PresetID(preset string) string {
+	if id, ok := presetIDs[preset]; ok {
+		return id
+	}
+	return preset
+}
+
+// SetPresetEnabled adds an agent for the preset to the server section of the
+// config file, or removes the agents using it. Agents without a preset are
+// left alone. It reports whether the file changed.
+func SetPresetEnabled(path, preset string, on bool) (bool, error) {
+	cfg, err := Load(path)
+	if err != nil {
+		return false, err
+	}
+	if cfg.Server == nil {
+		return false, errors.New("the config has no server section")
+	}
+	current, err := ReadServerList(path, "agents")
+	if err != nil {
+		return false, err
+	}
+	out := []yaml.MapSlice{}
+	found := false
+	for _, a := range current {
+		if p, _ := mapValue(a, "preset").(string); p == preset {
+			found = true
+			if !on {
+				continue
+			}
+		}
+		out = append(out, a)
+	}
+	if on == found {
+		return false, nil
+	}
+	if on {
+		if cfg.Server.Agent(PresetID(preset)) != nil {
+			return false, fmt.Errorf("an agent with id %q already exists", PresetID(preset))
+		}
+		out = append(out, yaml.MapSlice{{Key: "id", Value: PresetID(preset)}, {Key: "preset", Value: preset}})
+	}
+	return true, SetServerList(path, "agents", out)
+}
+
+func mapValue(m yaml.MapSlice, key string) any {
+	for _, it := range m {
+		if k, _ := it.Key.(string); k == key {
+			return it.Value
+		}
 	}
 	return nil
 }

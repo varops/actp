@@ -1,0 +1,22 @@
+# docker compose -f packaging/docker/compose.yaml up -d
+services:
+  actp:
+    image: ghcr.io/varops/actp:latest
+    restart: unless-stopped
+    environment:
+      ACTP_AGENTS: claude-code,codex      # installed on first start
+      ACTP_TOKEN: ${ACTP_TOKEN:-}         # from: actp token generate
+      ACTP_ADMIN_PASSWORD: ${ACTP_ADMIN_PASSWORD:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      # PUID: 1000                        # owner of the files in ./code
+      # PGID: 1000
+    volumes:
+      - actp-data:/data                   # config, tokens, agents and their logins
+      - ./code:/workspaces                # each subfolder is a folder agents may use
+    ports:
+      - 127.0.0.1:7861:7861               # dashboard: reach it through an SSH tunnel or your own TLS proxy
+      # - 7860:7860                       # the server, if you do not use the Cloudflare tunnel
+
+volumes:
+  actp-data:
