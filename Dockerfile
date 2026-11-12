@@ -11,7 +11,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/actp ./cmd/actp
 
-FROM node:22-bookworm-slim
+FROM node:25-bookworm-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl git gosu less openssh-client procps ripgrep tini \
  && rm -rf /var/lib/apt/lists/*
