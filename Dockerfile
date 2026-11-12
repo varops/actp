@@ -23,8 +23,10 @@ RUN HOME=/tmp/cf actp tunnel install \
 COPY packaging/docker/entrypoint.sh /usr/local/bin/actp-entrypoint
 ENV HOME=/data \
     PATH=/data/.actp/agents/bin:/data/.local/bin:$PATH
-# Login shells (the dashboard terminal) reset PATH in /etc/profile: add the agents back.
-RUN echo 'export PATH=/data/.actp/agents/bin:/data/.local/bin:$PATH' > /etc/profile.d/actp.sh
+# gosu sets HOME from the user's entry, so /data must be node's home. Login
+# shells (the dashboard terminal) reset PATH in /etc/profile: add the agents back.
+RUN usermod -d /data node \
+ && echo 'export PATH=/data/.actp/agents/bin:/data/.local/bin:$PATH' > /etc/profile.d/actp.sh
 VOLUME /data
 EXPOSE 7860 7861
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s CMD curl -fsS http://127.0.0.1:7860/health || exit 1
