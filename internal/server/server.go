@@ -51,6 +51,10 @@ type Server struct {
 	links    map[string]*Link
 	sessions map[string]*Link // agentID + "\x00" + sessionId → link holding it
 	status   map[string]*agentStatus
+
+	// pidMu orders state-file writes; after Close, pidsClosed stops them.
+	pidMu      sync.Mutex
+	pidsClosed bool
 }
 
 type agentStatus struct {
@@ -171,6 +175,11 @@ func (s *Server) Close(grace time.Duration) {
 	}
 	s.stop()
 	s.audit.close()
+	// No agents are left: a clean stop leaves no state for the next start to clean up.
+	s.pidMu.Lock()
+	s.pidsClosed = true
+	_ = os.Remove(s.statePath())
+	s.pidMu.Unlock()
 }
 
 func (s *Server) anyTurnRunning() bool {
