@@ -99,11 +99,13 @@ actp serve [--dashboard]                 run the server (and print a one-time da
 actp tray [--no-open]                    server, dashboard and menu bar icon
 actp token create --name N [--agents a,b] [--workspaces w] [--default-workspace w]   prints the token once
 actp token list | revoke <name>
+actp token generate                      print a new token without saving it (for ACTP_TOKEN in Docker)
 actp remote add <name> <url> [--token-stdin | --token-env NAME | --token-file PATH]
 actp remote list | remove <name>
 actp agents <server>                     list agents on a server
 actp tunnel install                      download the pinned cloudflared into ~/.actp/bin
 actp doctor                              check agent commands, probe agents, check remotes
+actp container                           run in the Docker image, set up from environment variables (docs/docker.md)
 actp version
 ```
 
@@ -167,7 +169,13 @@ remotes:
   - name: workstation
     url: https://agents.example.com
     token_env: ACTP_WORKSTATION_TOKEN   # or token_file, or keychain (tray)
+
+# The local dashboard
+dashboard:
+  terminal: false                 # a shell in the browser; on in the Docker image
 ```
+
+Agents the dashboard installs live in `~/.actp/agents` (an npm prefix). actp adds its `bin` folder to the end of the agents' `PATH`.
 
 ### 2.5 Management endpoints
 
@@ -383,6 +391,8 @@ One app with a server section and a remotes section.
 - A token is always required. There is no "local connections are trusted" rule, because tunnels and proxies make remote traffic look local.
 - TLS off loopback. Tokens hashed at rest, shown once, never on a command line.
 - The tray's local pages check the `Host` header and a one-time token, so other websites cannot drive them.
+- In Docker the dashboard is reached over the network, so it uses a password instead: a login form, a session cookie (`SameSite=Strict`, `Secure` behind HTTPS), five wrong passwords a minute at most, and the same `Origin` and custom-header checks on writes. It is never served through the tunnel.
+- The dashboard terminal is a shell as the agents' user. It is off on desktops (`dashboard.terminal`) and on in Docker, behind the password. The log records when a terminal opens and closes, not what is typed.
 - File, terminal and `stdio` MCP rewrites stop clients from using ACP itself as a remote shell. They do not limit the agent.
 - Link ids are secrets tied to a token. Resume checks both.
 
@@ -402,7 +412,7 @@ One app with a server section and a remotes section.
 
 ## 8. Code layout
 
-Module `github.com/varops/actp`, Go 1.25+. Libraries: `github.com/coder/websocket`, `github.com/goccy/go-yaml`, `fyne.io/systray`. No ACP SDK: messages stay `json.RawMessage`, and only routed or rewritten fields are parsed, so unknown fields survive.
+Module `github.com/varops/actp`, Go 1.26+. Libraries: `github.com/coder/websocket`, `github.com/goccy/go-yaml`, `fyne.io/systray`, `github.com/creack/pty`. The dashboard terminal embeds xterm.js (MIT). No ACP SDK: messages stay `json.RawMessage`, and only routed or rewritten fields are parsed, so unknown fields survive.
 
 ```
 api/                 openapi.yaml and the code generated from it (go generate ./api/)
@@ -417,7 +427,9 @@ internal/agentproc/  spawn, environment, stderr tail, process groups (POSIX + Wi
 internal/testagent/  the scripted agent's logic
 internal/e2e/        end-to-end tests: stdio client → bridge → server → scripted agent
 internal/tunnel/     cloudflared manager
-internal/dashboard/  local dashboard page behind the tray
+internal/dashboard/  local dashboard page behind the tray (and the Docker dashboard)
+internal/installer/  installs agents with npm into ~/.actp/agents
+internal/terminal/   the dashboard's shell over a WebSocket (pty on Unix)
 cmd/actp/tray*.go    tray icon (build tag `tray`) and the page-only fallback
 ```
 
@@ -457,6 +469,7 @@ What v0.1.0 does:
 - **CLI:** `serve`, the bridge with `-p` for one-shot prompts, `token`, `remote`, `agents`, `tunnel install`, `doctor`, `tray`, `version`. Remote tokens in the OS keychain, with a private file as fallback.
 - **Tunnel:** quick and named Cloudflare tunnels supervised by `actp serve`. `cloudflared` runs with its own empty config, so a `~/.cloudflared/config.yml` cannot take the tunnel over. `cloudflared` can be downloaded with a checksum pinned in actp. The server checks its own public URL (resolving through 1.1.1.1, after a short wait) and reports whether it is reachable. `cloudflared`'s output is kept in `~/.actp/logs/cloudflared.log`.
 - **Desktop:** a local dashboard with a server tab (setup from scratch, agents, folders, client tokens with revoke, connections, tunnel status) and a bridge tab (remotes with edit, the agents each offers, commands to copy, installing the `actp` command). It listens on loopback only and needs a one-time link, a session cookie, the right `Host` and a custom header on writes. A menu bar app (`actp.app` on macOS, tray builds for Linux and Windows) with start at login. The app logs to `~/.actp/logs/actp.log`.
+- **Docker (after v0.1.0):** an image with actp, Node.js and `cloudflared`, but no agents. `actp container` sets it up from environment variables and installs the agents named in `ACTP_AGENTS`. The dashboard there has a password, an agent installer and a terminal. See `docs/docker.md`.
 - **Release:** CI on Linux, macOS and Windows, including building `actp.app` on a Mac runner. Tagging `v*` builds every platform into a draft GitHub release.
 - **Checked with real agents:** a full prompt with Droid through a quick tunnel, from one Mac to another (thinking, answer, stop reason). Handshakes and sessions with the Claude, OpenCode and Grok adapters (`docs/agents.md`).
 

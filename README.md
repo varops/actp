@@ -30,6 +30,8 @@ ACTP lets any [ACP](https://agentclientprotocol.com) client – an app, a bot, a
 - **Safe defaults.** Agents only start in folders you allow. Files, terminals and local MCP servers stay on the agent's machine.
 - **A menu bar app** for macOS (and tray builds for Linux and Windows) with a dashboard, so you do not need to edit config files.
 - **Built-in Cloudflare tunnel** for machines without a public address.
+- **A Docker image** for servers: deploy it, pick your agents, and connect.
+- **Agent installer** in the dashboard (needs Node.js and npm), so adding Claude Code or Codex is one click.
 
 ![The actp dashboard: agents, folders, client tokens and open connections](docs/images/dashboard.png)
 
@@ -47,13 +49,23 @@ Download a build from the [releases page](https://github.com/varops/actp/release
 
 macOS builds are not signed yet. The first time, right-click `actp.app` and choose **Open**.
 
-Or build from source with Go 1.25+:
+Or build from source with Go 1.26+:
 
 ```bash
 go install github.com/varops/actp/cmd/actp@latest
 ```
 
 On a Mac, `packaging/macos/build-app.sh` builds `dist/actp.app`.
+
+## Run it in Docker
+
+The image `ghcr.io/varops/actp` has actp, Node.js and `cloudflared`, but no agents. Name the agents you want and pass their API keys:
+
+```bash
+docker run -d --name actp -e ACTP_AGENTS=claude-code,codex -e ANTHROPIC_API_KEY=… -e OPENAI_API_KEY=… -v actp-data:/data -v "$PWD/code:/workspaces" -p 127.0.0.1:7861:7861 ghcr.io/varops/actp:latest
+```
+
+The log shows the tunnel URL and the dashboard password. The dashboard (port 7861) can install more agents and has a terminal for agent logins. See [`docs/docker.md`](docs/docker.md) for every setting.
 
 ## Quick start with the app
 
@@ -187,7 +199,8 @@ It should print `{"ok":true}`.
 - **A client token is close to a shell.** Whoever holds it can make the agents do anything your user can do on that machine. Folders limit where agents start, not what they can do. Only give tokens to clients you trust, and revoke them when you are done.
 - Every request needs a token, including from the same machine: a tunnel makes outside traffic look local.
 - Tokens are stored as hashes on the server and in the OS keychain on clients. They never go on a command line.
-- The dashboard only listens on `127.0.0.1` and only opens through a one-time link.
+- On a desktop, the dashboard only listens on `127.0.0.1` and only opens through a one-time link. In Docker it asks for a password instead.
+- The dashboard terminal is a shell on the agent machine. It is off on desktops unless you set `dashboard: {terminal: true}` in the config.
 
 ## Commands
 
@@ -197,10 +210,12 @@ actp tray                                    server, dashboard and menu bar icon
 actp <agent>@<server> [options]              the bridge an ACP client spawns
 actp <agent>@<server> -p "text"              one prompt from a terminal
 actp token create|list|revoke                client tokens on a server
+actp token generate                          a new token for ACTP_TOKEN (not saved)
 actp remote add|list|remove                  saved servers on a client
 actp agents <server>                         what a server offers
 actp tunnel install                          download cloudflared
 actp doctor                                  check the config and the agents
+actp container                               run in the Docker image
 actp version
 ```
 
@@ -208,6 +223,7 @@ actp version
 
 - [`docs/design.md`](docs/design.md) – public API, configuration, behaviour, and what is done.
 - [`docs/agents.md`](docs/agents.md) – supported agents, how to start them, and their quirks.
+- [`docs/docker.md`](docs/docker.md) – the Docker image and its settings.
 - [`api/openapi.yaml`](api/openapi.yaml) – the HTTP API.
 - [`docs/native-clients.md`](docs/native-clients.md) – how to make an ACP client talk to actp directly, without the bridge.
 - [`docs/wire.md`](docs/wire.md) – the `actp.v1` wire format between bridges (or native clients) and servers.

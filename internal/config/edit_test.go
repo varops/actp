@@ -54,3 +54,32 @@ func TestSetServerListKeepsTheRestOfTheFile(t *testing.T) {
 		t.Fatal("file changed after a refused edit")
 	}
 }
+
+func TestSetPresetEnabledAddsMissingList(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "actp.yaml")
+	src := "version: 1\nserver:\n  # keep me\n  workspaces:\n  - name: w\n    path: " + filepath.ToSlash(dir) + "\n"
+	if err := os.WriteFile(path, []byte(src), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range []struct {
+		preset  string
+		on      bool
+		changed bool
+	}{{"pi", true, true}, {"pi", true, false}, {"codex", true, true}, {"pi", false, true}, {"pi", false, false}} {
+		changed, err := SetPresetEnabled(path, step.preset, step.on)
+		if err != nil || changed != step.changed {
+			t.Fatalf("%s on=%v: changed=%v err=%v", step.preset, step.on, changed, err)
+		}
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Server.Agents) != 1 || cfg.Server.Agents[0].ID != "codex" {
+		t.Fatalf("agents = %+v", cfg.Server.Agents)
+	}
+	if b, _ := os.ReadFile(path); !strings.Contains(string(b), "# keep me") {
+		t.Fatalf("comment lost:\n%s", b)
+	}
+}

@@ -13,7 +13,15 @@ import (
 
 func cmdToken(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: actp token create|list|revoke")
+		return errors.New("usage: actp token create|list|revoke|generate")
+	}
+	if args[0] == "generate" {
+		token, _, err := config.NewToken()
+		if err != nil {
+			return err
+		}
+		fmt.Println(token)
+		return nil
 	}
 	fs := flag.NewFlagSet("token", flag.ContinueOnError)
 	cfgPath := fs.String("config", "", "config file")

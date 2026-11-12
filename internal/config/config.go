@@ -22,8 +22,27 @@ type Config struct {
 	Server  *Server  `yaml:"server"`
 	Remotes []Remote `yaml:"remotes"`
 	// RemotesFile holds remotes saved by `actp remote`, apart from this hand-edited file.
-	RemotesFile string `yaml:"remotes_file"`
+	RemotesFile string    `yaml:"remotes_file"`
+	Dashboard   Dashboard `yaml:"dashboard"`
 	path        string
+}
+
+// Dashboard holds settings of the local dashboard.
+type Dashboard struct {
+	// Terminal adds a shell in the browser. Off by default: whoever opens the
+	// dashboard gets a shell as this user.
+	Terminal bool `yaml:"terminal"`
+}
+
+// AgentsPrefix is where the dashboard installs agents (an npm prefix).
+func AgentsPrefix() string { return filepath.Join(Dir(), "agents") }
+
+// AgentBinDir is the folder with the commands of agents the dashboard installed.
+func AgentBinDir() string {
+	if runtime.GOOS == "windows" {
+		return AgentsPrefix() // npm puts global commands in the prefix itself on Windows
+	}
+	return filepath.Join(AgentsPrefix(), "bin")
 }
 
 type Server struct {

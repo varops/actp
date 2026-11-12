@@ -1,0 +1,7 @@
+.git
+.github
+dist
+docs
+website
+*.md
+!packaging/docker/*.sh

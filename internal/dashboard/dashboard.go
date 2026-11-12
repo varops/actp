@@ -5,12 +5,12 @@ package dashboard
 
 import (
 	"crypto/rand"
-	"crypto/subtle"
-	_ "embed"
+	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -19,17 +19,26 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/varops/actp/internal/agentproc"
 	"github.com/varops/actp/internal/autostart"
 	"github.com/varops/actp/internal/cliinstall"
 	"github.com/varops/actp/internal/config"
+	"github.com/varops/actp/internal/installer"
 	"github.com/varops/actp/internal/server"
+	"github.com/varops/actp/internal/terminal"
 	"github.com/varops/actp/internal/tunnel"
 )
 
 //go:embed index.html
 var indexHTML []byte
+
+//go:embed login.html
+var loginHTML []byte
+
+//go:embed static
+var staticFS embed.FS
 
 const cookieName = "actp_dashboard"
 
@@ -50,6 +59,19 @@ type Options struct {
 	StartTunnel func() error
 	// TunnelError returns cloudflared's last error line, if any.
 	TunnelError func() string
+
+	// Listen is the address to serve on; default a random loopback port.
+	Listen string
+	// Password switches from one-time links to a login form, for a dashboard
+	// reached over the network (Docker). Empty means one-time links.
+	Password string
+	// Terminal adds a shell in the browser.
+	Terminal bool
+	// Installer installs agents from the dashboard; nil hides it.
+	Installer *installer.Installer
+	// Env is the environment of terminal shells; nil means os.Environ().
+	Env    []string
+	Logger *slog.Logger
 }
 
 // Dashboard serves the local page.
@@ -61,22 +83,47 @@ type Dashboard struct {
 	session string // cookie value after the first visit
 	mu      sync.Mutex
 	used    bool
+	login   *logins // password mode only
 }
 
-// Listen starts the dashboard on a random loopback port.
+// Listen starts the dashboard.
 func Listen(opts Options) (*Dashboard, error) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if opts.Listen == "" {
+		opts.Listen = "127.0.0.1:0"
+	}
+	ln, err := net.Listen("tcp", opts.Listen)
 	if err != nil {
 		return nil, err
 	}
-	d := &Dashboard{opts: opts, ln: ln, addr: ln.Addr().String(), once: randomHex(), session: randomHex()}
-	go func() { _ = http.Serve(ln, d.Handler()) }()
+	d := newDashboard(opts)
+	d.ln, d.addr = ln, ln.Addr().String()
+	srv := &http.Server{Handler: d.Handler(), ReadHeaderTimeout: 10 * time.Second}
+	go func() { _ = srv.Serve(ln) }()
 	return d, nil
 }
 
-// URL is the one-time link that opens the dashboard. It works once; open it
-// again through the tray, which calls NewLink.
-func (d *Dashboard) URL() string { return "http://" + d.addr + "/?t=" + d.once }
+func newDashboard(opts Options) *Dashboard {
+	if opts.Logger == nil {
+		opts.Logger = slog.New(slog.DiscardHandler)
+	}
+	d := &Dashboard{opts: opts, once: randomHex(), session: randomHex()}
+	if opts.Password != "" {
+		d.login = newLogins(opts.Password)
+	}
+	if opts.Installer != nil && opts.Installer.OnDone == nil {
+		opts.Installer.OnDone = d.AfterInstall
+	}
+	return d
+}
+
+// URL is the link that opens the dashboard. Without a password it is a
+// one-time link; open it again through the tray, which calls NewLink.
+func (d *Dashboard) URL() string {
+	if d.login != nil {
+		return "http://" + d.addr + "/"
+	}
+	return "http://" + d.addr + "/?t=" + d.once
+}
 
 // NewLink issues a fresh one-time link, for example when the tray is clicked again.
 func (d *Dashboard) NewLink() string {
@@ -99,6 +146,10 @@ func randomHex() string {
 func (d *Dashboard) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", d.index)
+	mux.Handle("GET /static/", http.FileServerFS(staticFS))
+	mux.HandleFunc("GET /login", d.loginPage)
+	mux.HandleFunc("POST /login", d.doLogin)
+	mux.HandleFunc("POST /api/logout", d.logout)
 	mux.HandleFunc("GET /api/status", d.status)
 	mux.HandleFunc("POST /api/links/{id}/end", d.endLink)
 	mux.HandleFunc("POST /api/agents/{id}/probe", d.probe)
@@ -115,53 +166,11 @@ func (d *Dashboard) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/remotes/{name}", d.updateRemote)
 	mux.HandleFunc("POST /api/cli", d.installCLI)
 	mux.HandleFunc("POST /api/setup", d.setup)
+	mux.HandleFunc("GET /api/terminal", d.terminal)
+	mux.HandleFunc("GET /api/installer", d.installerInfo)
+	mux.HandleFunc("GET /api/installer/job", d.installerJob)
+	mux.HandleFunc("POST /api/installer/{preset}/{action}", d.installerStart)
 	return d.guard(mux)
-}
-
-// guard rejects anything that is not this browser on this address: a wrong
-// Host header (DNS rebinding), a missing session cookie, or a cross-site write.
-func (d *Dashboard) guard(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("X-Frame-Options", "DENY")
-		w.Header().Set("Referrer-Policy", "no-referrer")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-ancestors 'none'")
-		if r.Host != d.addr {
-			http.Error(w, "wrong host", http.StatusForbidden)
-			return
-		}
-		if r.URL.Path == "/" && r.URL.Query().Has("t") {
-			d.mu.Lock()
-			ok := !d.used && subtle.ConstantTimeCompare([]byte(r.URL.Query().Get("t")), []byte(d.once)) == 1
-			if ok {
-				d.used = true
-			}
-			d.mu.Unlock()
-			if !ok {
-				http.Error(w, "this link was already used: open the dashboard again from the tray", http.StatusForbidden)
-				return
-			}
-			http.SetCookie(w, &http.Cookie{Name: cookieName, Value: d.session, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode})
-			http.Redirect(w, r, "/", http.StatusSeeOther)
-			return
-		}
-		c, err := r.Cookie(cookieName)
-		if err != nil || subtle.ConstantTimeCompare([]byte(c.Value), []byte(d.session)) != 1 {
-			http.Error(w, "open the dashboard from the tray or the link actp printed", http.StatusForbidden)
-			return
-		}
-		if r.Method != http.MethodGet {
-			if origin := r.Header.Get("Origin"); origin != "" && origin != "http://"+d.addr {
-				http.Error(w, "cross-site request", http.StatusForbidden)
-				return
-			}
-			if r.Header.Get("X-Actp-Dashboard") != "1" {
-				http.Error(w, "missing X-Actp-Dashboard header", http.StatusForbidden)
-				return
-			}
-		}
-		next.ServeHTTP(w, r)
-	})
 }
 
 func (d *Dashboard) index(w http.ResponseWriter, r *http.Request) {
@@ -178,7 +187,14 @@ type statusResponse struct {
 	// ActpPath is this actp binary, for agent commands a client can paste.
 	ActpPath string `json:"actpPath"`
 	// CLI says whether an actp command is on the PATH, and whether it is this one.
-	CLI cliinstall.Status `json:"cli"`
+	CLI      cliinstall.Status `json:"cli"`
+	Features features          `json:"features"`
+}
+
+type features struct {
+	Terminal  bool `json:"terminal"`
+	Installer bool `json:"installer"`
+	Password  bool `json:"password"`
 }
 
 type serverStatus struct {
@@ -228,7 +244,8 @@ func (d *Dashboard) status(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp := statusResponse{Version: d.opts.Version, ConfigPath: cfg.Path(), Remotes: []remoteView{}, Autostart: autostart.Enabled(), ActpPath: actpPath(),
-		CLI: cliinstall.Check(actpPath(), agentproc.Getenv(agentproc.CachedLoginShellEnv(), "PATH"))}
+		CLI:      cliinstall.Check(actpPath(), agentproc.Getenv(agentproc.CachedLoginShellEnv(), "PATH")),
+		Features: features{Terminal: d.opts.Terminal && terminal.Supported, Installer: d.opts.Installer != nil, Password: d.login != nil}}
 	for _, r := range cfg.Remotes {
 		resp.Remotes = append(resp.Remotes, remoteView{Name: r.Name, URL: r.URL})
 	}

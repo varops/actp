@@ -17,8 +17,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/varops/actp/internal/agentproc"
 	"github.com/varops/actp/internal/config"
 	"github.com/varops/actp/internal/dashboard"
+	"github.com/varops/actp/internal/installer"
 	"github.com/varops/actp/internal/logfile"
 	"github.com/varops/actp/internal/server"
 	"github.com/varops/actp/internal/tunnel"
@@ -41,6 +43,15 @@ type hostOptions struct {
 	logFile       bool // also log to ~/.actp/logs/actp.log
 	// onReady is called once the host and dashboard are up (dash may be nil).
 	onReady func(h *host)
+
+	// The rest is for `actp container`.
+	dashListen string // default a random loopback port
+	password   string // dashboard login instead of one-time links
+	terminal   *bool  // nil: dashboard.terminal from the config
+	termEnv    []string
+	baseEnv    []string // environment agents start from; nil: the login shell's
+	// adjust changes the config after every load, for settings that come from the environment.
+	adjust func(*config.Config)
 }
 
 // host is what `actp serve` and `actp tray` run: the server, its tunnel and the
@@ -60,6 +71,23 @@ type host struct {
 	tunnelDone <-chan struct{}
 	tunnel     *tunnel.Tunnel
 	tunnelFn   func() (<-chan struct{}, error)
+	adjust     func(*config.Config)
+	baseEnv    []string
+}
+
+// load reads the config and applies the host's overrides.
+func (h *host) load() (*config.Config, error) {
+	cfg, err := config.Load(h.configPath)
+	if err != nil {
+		return nil, err
+	}
+	if h.adjust != nil {
+		h.adjust(cfg)
+		if err := cfg.Validate(); err != nil {
+			return nil, err
+		}
+	}
+	return cfg, nil
 }
 
 // Quit asks the host to stop, like a signal does.
@@ -82,7 +110,7 @@ func (h *host) configFile() string {
 // startServer reads the config and starts the server if it has a server section
 // and none is running. It returns (false, nil) when there is nothing to start.
 func (h *host) startServer() (bool, error) {
-	cfg, err := config.Load(h.configPath)
+	cfg, err := h.load()
 	if err != nil {
 		return false, err
 	}
@@ -111,7 +139,7 @@ func (h *host) startServer() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	srv, err := server.New(sc, server.Options{Version: version, Logger: h.log, ProbeOnStart: true})
+	srv, err := server.New(sc, server.Options{Version: version, Logger: h.log, ProbeOnStart: true, BaseEnv: h.baseEnv})
 	if err != nil {
 		ln.Close()
 		return false, err
@@ -144,7 +172,7 @@ func (h *host) startServer() (bool, error) {
 			}
 			checkCtx, stopCheck := context.WithCancel(h.ctx)
 			tun, err := tunnel.Start(h.ctx, tunnel.Options{
-				Mode: mode, Target: "http://" + sc.Listen, Token: token, Logger: h.log, Output: out,
+				Mode: mode, Target: "http://" + localTarget(sc.Listen), Token: token, Logger: h.log, Output: out,
 				OnURL: func(u string) {
 					srv.SetPublicURL(u)
 					h.log.Info("clients can connect with: actp <agent>@" + u)
@@ -303,7 +331,7 @@ func (h *host) reload() error {
 	if srv == nil {
 		return nil
 	}
-	c, err := config.Load(h.configPath)
+	c, err := h.load()
 	if err != nil {
 		return err
 	}
@@ -338,7 +366,7 @@ func (h *host) shutdown() error {
 }
 
 func runHost(parent context.Context, opts hostOptions) error {
-	cfg, err := config.Load(opts.configPath)
+	cfg, err := (&host{configPath: opts.configPath, adjust: opts.adjust}).load()
 	if err != nil {
 		return err
 	}
@@ -359,13 +387,27 @@ func runHost(parent context.Context, opts hostOptions) error {
 			logOut = io.MultiWriter(os.Stderr, f)
 		}
 	}
-	h := &host{log: slog.New(slog.NewTextHandler(logOut, nil)), configPath: opts.configPath, ctx: ctx, stop: stop, errs: make(chan error, 1)}
+	h := &host{log: slog.New(slog.NewTextHandler(logOut, nil)), configPath: opts.configPath, ctx: ctx, stop: stop, errs: make(chan error, 1), adjust: opts.adjust, baseEnv: opts.baseEnv}
 	if _, err := h.startServer(); err != nil {
 		return err
 	}
 
 	if opts.dashboard {
+		termOn := cfg.Dashboard.Terminal
+		if opts.terminal != nil {
+			termOn = *opts.terminal
+		}
+		termEnv := opts.termEnv
+		if termOn && termEnv == nil {
+			termEnv = agentproc.AppendPath(agentproc.CachedLoginShellEnv(), config.AgentBinDir())
+		}
 		h.dash, err = dashboard.Listen(dashboard.Options{
+			Listen:      opts.dashListen,
+			Password:    opts.password,
+			Terminal:    termOn,
+			Env:         termEnv,
+			Installer:   &installer.Installer{Env: installerEnv(opts.termEnv)},
+			Logger:      h.log,
 			Server:      h.Server,
 			ConfigPath:  opts.configPath,
 			ConfigFile:  h.configFile(),
@@ -385,7 +427,11 @@ func runHost(parent context.Context, opts hostOptions) error {
 			return err
 		}
 		defer h.dash.Close()
-		h.log.Info("dashboard (one-time link, local only): " + h.dash.URL())
+		if opts.password != "" {
+			h.log.Info("dashboard (log in with the admin password): " + h.dash.URL())
+		} else {
+			h.log.Info("dashboard (one-time link, local only): " + h.dash.URL())
+		}
 	}
 	if opts.onReady != nil {
 		go opts.onReady(h)
@@ -426,6 +472,27 @@ func checkListen(sc *config.Server) error {
 		return nil
 	}
 	return fmt.Errorf("listen %q is not a loopback address: set tls_cert and tls_key, or insecure_listen: true behind a TLS proxy", sc.Listen)
+}
+
+// localTarget is how to reach a listen address from this machine: a wildcard
+// address (0.0.0.0, ::) becomes loopback.
+func localTarget(listen string) string {
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return listen
+	}
+	if ip := net.ParseIP(host); host == "" || (ip != nil && ip.IsUnspecified()) {
+		return net.JoinHostPort("127.0.0.1", port)
+	}
+	return listen
+}
+
+// installerEnv is the environment npm runs in: env when given, else the login shell's.
+func installerEnv(env []string) func() []string {
+	if env == nil {
+		return nil
+	}
+	return func() []string { return env }
 }
 
 func isLoopback(host string) bool {

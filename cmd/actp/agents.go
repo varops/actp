@@ -95,7 +95,7 @@ func cmdDoctor(args []string) error {
 		fmt.Println("server: not configured")
 		return nil
 	}
-	env := agentproc.LoginShellEnv(context.Background())
+	env := agentproc.AppendPath(agentproc.LoginShellEnv(context.Background()), config.AgentBinDir())
 	fmt.Println("agent PATH:", agentproc.Getenv(env, "PATH"))
 	fmt.Printf("tokens: %d\n", len(cfg.Server.Tokens))
 	for _, w := range cfg.Server.Workspaces {

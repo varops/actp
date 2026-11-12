@@ -13,6 +13,7 @@ require (
 
 require (
 	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
+	github.com/creack/pty v1.1.24 // indirect
 	github.com/danieljoos/wincred v1.2.3 // indirect
 	github.com/dprotaso/go-yit v0.0.0-20220510233725-9ba8df137936 // indirect
 	github.com/getkin/kin-openapi v0.142.0 // indirect

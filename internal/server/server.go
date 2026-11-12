@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/varops/actp/api"
+	"github.com/varops/actp/internal/agentproc"
 	"github.com/varops/actp/internal/config"
 	"github.com/varops/actp/internal/wire"
 )
@@ -89,6 +90,7 @@ func New(cfg *config.Server, opts Options) (*Server, error) {
 			s.opts.BaseEnv = os.Environ()
 		}
 	}
+	s.opts.BaseEnv = agentproc.AppendPath(s.opts.BaseEnv, config.AgentBinDir())
 	for _, a := range cfg.Agents {
 		s.status[a.ID] = &agentStatus{Status: string(api.Unknown)}
 	}
