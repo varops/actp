@@ -558,8 +558,8 @@ impl Link {
         let req_id = c.req_id.clone().unwrap_or_default();
         let can_close = {
             let mut st = self.st();
-            st.client_reqs.remove(&req_id);
-            st.abandoned.insert(req_id.clone());
+            let st = &mut *st;
+            abandon_pending(&mut st.client_reqs, &mut st.abandoned, &req_id);
             st.sessions.remove(&c.sid);
             st.can_close
         };
@@ -1526,6 +1526,22 @@ struct SessionCheck {
     done: AtomicBool,
 }
 
+/// Forgets a client request actp has answered itself. Only a request whose
+/// agent answer is still to come is recorded, so that answer is dropped when it
+/// arrives (which also clears the record). If the answer was already taken,
+/// recording the id would drop the answer to a later request that reuses it.
+fn abandon_pending(
+    client_reqs: &mut HashMap<String, ClientReq>,
+    abandoned: &mut HashSet<String>,
+    key: &str,
+) -> bool {
+    if client_reqs.remove(key).is_none() {
+        return false;
+    }
+    abandoned.insert(key.to_string());
+    true
+}
+
 /// The sessionId a client message names, if any.
 fn params_session_id(m: &Message) -> String {
     let mut errs = Vec::new();
@@ -1687,6 +1703,20 @@ fn settle_reply(id: &str, method: &str) -> Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_pending_requests_are_abandoned() {
+        let mut reqs = HashMap::new();
+        let mut abandoned = HashSet::new();
+        reqs.insert("7".to_string(), ClientReq::default());
+        assert!(abandon_pending(&mut reqs, &mut abandoned, "7"));
+        assert!(abandoned.contains("7") && reqs.is_empty());
+        // The agent's answer was taken just before the timeout: nothing is recorded,
+        // so a later request reusing the id still gets its answer.
+        let mut abandoned = HashSet::new();
+        assert!(!abandon_pending(&mut reqs, &mut abandoned, "7"));
+        assert!(abandoned.is_empty());
+    }
 
     #[test]
     fn auth_errors() {

@@ -153,6 +153,20 @@ func (l *Link) holdIfChecking(m *jsonrpc.Message) bool {
 	return true
 }
 
+// abandonPending forgets a client request actp has answered itself. Only a
+// request whose agent answer is still to come is recorded, so that answer is
+// dropped when it arrives (which also clears the record). If the answer was
+// already taken, recording the id would drop the answer to a later request
+// that reuses it.
+func abandonPending(clientReqs map[string]clientReq, abandoned map[string]bool, key string) bool {
+	if _, ok := clientReqs[key]; !ok {
+		return false
+	}
+	delete(clientReqs, key)
+	abandoned[key] = true
+	return true
+}
+
 // timeOutCheck ends a load or resume the agent did not answer in time: the
 // client gets an error for it and for everything queued, the agent's late
 // answer is dropped, and the session is closed.
@@ -163,8 +177,7 @@ func (l *Link) timeOutCheck(c *sessionCheck, reqKey string) {
 		return
 	}
 	c.done = true
-	delete(l.clientReqs, reqKey)
-	l.abandoned[reqKey] = true
+	abandonPending(l.clientReqs, l.abandoned, reqKey)
 	canClose := l.canClose
 	delete(l.sessions, c.sessionID)
 	l.mu.Unlock()

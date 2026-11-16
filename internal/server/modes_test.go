@@ -105,3 +105,17 @@ func TestStartingModes(t *testing.T) {
 		t.Errorf("rewrite:\n%s\nwant\n%s", out, want)
 	}
 }
+
+func TestOnlyPendingRequestsAreAbandoned(t *testing.T) {
+	reqs := map[string]clientReq{"7": {method: "session/load"}}
+	abandoned := map[string]bool{}
+	if !abandonPending(reqs, abandoned, "7") || !abandoned["7"] || len(reqs) != 0 {
+		t.Fatalf("pending request: %v %v", reqs, abandoned)
+	}
+	// The agent's answer was taken just before the timeout: nothing is recorded,
+	// so a later request reusing the id still gets its answer.
+	abandoned = map[string]bool{}
+	if abandonPending(reqs, abandoned, "7") || len(abandoned) != 0 {
+		t.Fatalf("taken answer recorded: %v", abandoned)
+	}
+}
