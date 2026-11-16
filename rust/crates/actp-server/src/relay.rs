@@ -314,6 +314,11 @@ async fn run_control(
                 }
                 hello = true;
                 tracing::info!(machine = %machine, stopped, "the relay knows this machine");
+                if let Some(org) = &server.config().org {
+                    if org.machine != machine {
+                        tracing::error!(relay_says = %machine, configured = %org.machine, "the relay knows this machine by another address than org machine: papers for it will be refused");
+                    }
+                }
                 server.set_org_stopped(stopped).await;
                 let _ = status.send(Status::Connected { machine });
             }

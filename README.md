@@ -178,7 +178,7 @@ If `cloudflared` is missing, the dashboard offers to install it, or run `actp tu
 
 ## Relay mode (Rust only)
 
-For fleets of laptops, the Rust build can run without listening at all: each machine connects out to one relay over WSS on port 443, logging in with the organization's device certificate, and callers reach it at `https://<relay>/m/<machine>`. The relay (`actp-relay`) routes, knows who is online, holds an org-wide stop and keeps its half of the audit; the machine still checks every caller itself. The Go build has no relay mode. See [`docs/relay.md`](docs/relay.md).
+For fleets of laptops, the Rust build can run without listening at all: each machine connects out to one relay over WSS on port 443, logging in with the organization's device certificate, and callers reach it at `https://<relay>/m/<machine>`. The relay (`actp-relay`) routes, knows who is online, holds an org-wide stop and keeps its half of the audit; the machine still checks every caller itself. In org mode, callers present signed papers from the organization's identity service instead of actp tokens, checked on the machine through a pluggable verifier. The Go build has neither. See [`docs/relay.md`](docs/relay.md).
 
 ## Troubleshooting
 
@@ -228,7 +228,7 @@ actp version
 - [`docs/design.md`](docs/design.md) – public API, configuration, behaviour, and what is done.
 - [`docs/agents.md`](docs/agents.md) – supported agents, how to start them, and their quirks.
 - [`docs/docker.md`](docs/docker.md) – the Docker image and its settings.
-- [`docs/relay.md`](docs/relay.md) – relay mode and the relay (Rust only).
+- [`docs/relay.md`](docs/relay.md) – relay mode, org mode and the relay (Rust only).
 - [`api/openapi.yaml`](api/openapi.yaml) – the HTTP API.
 - [`docs/native-clients.md`](docs/native-clients.md) – how to make an ACP client talk to actp directly, without the bridge.
 - [`docs/wire.md`](docs/wire.md) – the `actp.v1` wire format between bridges (or native clients) and servers.

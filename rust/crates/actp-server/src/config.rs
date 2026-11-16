@@ -50,6 +50,8 @@ pub struct Server {
     pub tunnel: Tunnel,
     /// Relay mode (Rust only): dial out to a relay instead of listening.
     pub relay: Option<Relay>,
+    /// Org mode (Rust only): callers present signed papers, not tokens.
+    pub org: Option<Org>,
     pub workspaces: Vec<Workspace>,
     pub agents: Vec<Agent>,
     pub tokens: Vec<Token>,
@@ -82,6 +84,23 @@ pub struct Relay {
     pub key: String,
     /// Roots that sign the relay's certificate (PEM). Empty: the OS trust store.
     pub ca: String,
+}
+
+/// Org mode (docs/relay.md): callers present signed papers from the
+/// organization's identity service instead of actp tokens. A papers
+/// verifier, supplied by the program that embeds the server, checks them
+/// against their issuer; the server then checks that they name this machine
+/// and grant `require_grant`. Not part of the Go server.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Org {
+    /// This machine's address: the name in its device certificate. Papers
+    /// must name it.
+    pub machine: String,
+    /// The grant papers must carry, as exactly `true`.
+    pub require_grant: String,
+    /// What a caller with good papers may use here: the token fields
+    /// (agents, workspaces, permissions, limits) without a name or hash.
+    pub access: Token,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -334,6 +353,9 @@ impl Config {
         s.log_dir = expand_home(&s.log_dir);
         s.state_dir = expand_home(&s.state_dir);
         s.tokens_file = expand_home(&s.tokens_file);
+        if let Some(o) = s.org.as_mut() {
+            apply_token_defaults(&mut o.access);
+        }
         if let Some(r) = s.relay.as_mut() {
             r.cert = expand_home(&r.cert);
             r.key = expand_home(&r.key);
@@ -458,9 +480,21 @@ impl Config {
                 }
             }
             let mut names = std::collections::HashSet::new();
-            for t in &s.tokens {
+            let org_access = s.org.as_ref().map(|o| Token {
+                name: "org access".into(),
+                hash: "sha256:".into(),
+                ..o.access.clone()
+            });
+            for t in s.tokens.iter().chain(org_access.iter()) {
                 if t.name.is_empty() {
                     errs.push("every token needs a name".into());
+                }
+                // The names of people who come in with papers.
+                if t.name.starts_with("papers:") {
+                    errs.push(format!(
+                        "token {}: names starting with papers: are reserved",
+                        quote(&t.name)
+                    ));
                 }
                 if names.contains(&t.name) {
                     errs.push(format!("token {} is defined twice", quote(&t.name)));
@@ -530,6 +564,22 @@ impl Config {
             }
             if s.tls_cert.is_empty() != s.tls_key.is_empty() {
                 errs.push("tls_cert and tls_key must be set together".into());
+            }
+            if let Some(o) = &s.org {
+                if !actp_proto::relay::valid_machine_name(&o.machine) {
+                    errs.push("org mode needs this machine's address (org machine), as in its device certificate".into());
+                }
+                if o.require_grant.is_empty() {
+                    errs.push(
+                        "org mode needs the grant papers must carry (org require_grant)".into(),
+                    );
+                }
+                if !s.tokens.is_empty() {
+                    errs.push("org mode takes signed papers, not tokens: remove the tokens (and the tokens file)".into());
+                }
+                if s.tunnel.mode != "off" {
+                    errs.push("org mode does not use a tunnel: set tunnel mode off".into());
+                }
             }
             if let Some(r) = &s.relay {
                 match r.url.strip_prefix("wss://") {
@@ -943,6 +993,7 @@ impl Decoder {
                         }
                     }
                 }
+                "org" => s.org = self.org(v),
                 "relay" => {
                     if let Some(rm) = self.mapping(v, "relay") {
                         let mut r = Relay::default();
@@ -1019,6 +1070,53 @@ impl Decoder {
         a
     }
 
+    fn org(&mut self, v: &Value) -> Option<Org> {
+        // An empty `org:` must not quietly turn org mode off.
+        if matches!(untag(v), Value::Null) {
+            self.errs
+                .push("org section is empty: give machine, require_grant and access".into());
+            return None;
+        }
+        let m = self.mapping(v, "org")?;
+        let mut o = Org::default();
+        for (k, v) in m {
+            match k.as_str() {
+                "machine" => o.machine = self.string(v, &k).unwrap_or_default(),
+                "require_grant" => o.require_grant = self.string(v, &k).unwrap_or_default(),
+                "access" => {
+                    if let Some(am) = self.mapping(v, "access") {
+                        for (k, v) in am {
+                            if k == "name" || k == "hash" {
+                                self.unknown(&k);
+                            } else {
+                                self.token_field(&mut o.access, &k, v);
+                            }
+                        }
+                    }
+                }
+                _ => self.unknown(&k),
+            }
+        }
+        Some(o)
+    }
+
+    fn token_field(&mut self, t: &mut Token, k: &str, v: &Value) {
+        let k = k.to_string();
+        match k.as_str() {
+            "name" => t.name = self.string(v, &k).unwrap_or_default(),
+            "hash" => t.hash = self.string(v, &k).unwrap_or_default(),
+            "agents" => t.agents = self.strings(v, &k),
+            "workspaces" => t.workspaces = self.strings(v, &k),
+            "default_workspace" => t.default_workspace = self.string(v, &k).unwrap_or_default(),
+            "cwd_fallback" => t.cwd_fallback = self.boolean(v, &k).unwrap_or(false),
+            "mcp_servers" => t.mcp_servers = self.string(v, &k).unwrap_or_default(),
+            "permissions" => t.permissions = self.string(v, &k).unwrap_or_default(),
+            "max_links" => t.max_links = self.int(v, &k).unwrap_or(0),
+            "map" => t.map = self.string_map(v, &k),
+            _ => self.unknown(&k),
+        }
+    }
+
     fn tokens(&mut self, v: &Value) -> Vec<Token> {
         let mut out = Vec::new();
         let Some(seq) = self.sequence(v, "tokens") else {
@@ -1028,21 +1126,7 @@ impl Decoder {
             let mut t = Token::default();
             if let Some(m) = self.mapping(it, "token") {
                 for (k, v) in m {
-                    match k.as_str() {
-                        "name" => t.name = self.string(v, &k).unwrap_or_default(),
-                        "hash" => t.hash = self.string(v, &k).unwrap_or_default(),
-                        "agents" => t.agents = self.strings(v, &k),
-                        "workspaces" => t.workspaces = self.strings(v, &k),
-                        "default_workspace" => {
-                            t.default_workspace = self.string(v, &k).unwrap_or_default()
-                        }
-                        "cwd_fallback" => t.cwd_fallback = self.boolean(v, &k).unwrap_or(false),
-                        "mcp_servers" => t.mcp_servers = self.string(v, &k).unwrap_or_default(),
-                        "permissions" => t.permissions = self.string(v, &k).unwrap_or_default(),
-                        "max_links" => t.max_links = self.int(v, &k).unwrap_or(0),
-                        "map" => t.map = self.string_map(v, &k),
-                        _ => self.unknown(&k),
-                    }
+                    self.token_field(&mut t, &k, v);
                 }
             }
             out.push(t);
@@ -1338,6 +1422,48 @@ remotes:
             assert!(e.contains(want), "{e}");
         }
         assert!(Config::parse(&format!("{base}    insecure: true\n")).is_err());
+    }
+
+    #[test]
+    fn org_mode() {
+        let base = "server:\n  workspaces:\n    - name: it\n      path: /it\n  agents:\n    - id: a\n      command: x\n  org:\n    machine: C02XK1\n    require_grant: machines.operate\n    access:\n      agents: [a]\n      workspaces: [it]\n      default_workspace: it\n";
+        let c = Config::parse(base).unwrap();
+        c.validate().unwrap();
+        let o = c.server.unwrap().org.unwrap();
+        assert_eq!(o.require_grant, "machines.operate");
+        assert_eq!(o.access.max_links, 8);
+        assert_eq!(o.access.agents, ["a"]);
+        for (bad, want) in [
+            (base.replace("machine: C02XK1", "machine: a/b"), "address"),
+            (
+                base.replace("    require_grant: machines.operate\n", ""),
+                "require_grant",
+            ),
+            (
+                base.replace("agents: [a]", "agents: [nope]"),
+                "unknown agent",
+            ),
+            (format!("{base}  tunnel:\n    mode: quick\n"), "tunnel"),
+            (
+                format!("{base}  tokens:\n    - name: t\n      hash: sha256:00\n"),
+                "not tokens",
+            ),
+        ] {
+            let e = Config::parse(&bad).unwrap().validate().unwrap_err().0;
+            assert!(e.contains(want), "{want}: {e}");
+        }
+        assert!(Config::parse(&format!("{base}    name: x\n")).is_err());
+        assert!(
+            Config::parse(
+                &base.replace("      default_workspace: it\n", "      hash: sha256:00\n")
+            )
+            .is_err()
+        );
+        assert!(Config::parse(&format!("{base}    tenant: x\n")).is_err());
+        assert!(Config::parse("server:\n  org:\n").is_err());
+        let reserved = "server:\n  tokens:\n    - name: papers:dave\n      hash: sha256:00\n";
+        let e = Config::parse(reserved).unwrap().validate().unwrap_err().0;
+        assert!(e.contains("reserved"), "{e}");
     }
 
     #[test]

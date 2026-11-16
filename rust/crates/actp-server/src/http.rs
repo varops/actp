@@ -231,14 +231,30 @@ pub async fn handle(server: &Server, mut req: Request<Body>) -> Resp {
     let token = if decoded == "/health" {
         None
     } else {
-        let presented = req
+        let presented: Option<String> = req
             .headers()
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "));
-        match presented.and_then(|p| server.authenticate(p.trim())) {
-            Some(t) => Some(t),
-            None => {
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(|p| p.trim().to_string());
+        let token = match presented {
+            Some(p) => server.authenticate(&p).await,
+            None => Err(crate::auth::Refused::new(crate::auth::INVALID_TOKEN)),
+        };
+        match token {
+            Ok(t) => Some(t),
+            Err(refused) if refused.temporary => {
+                // Could not be checked just now: try again, keep the session.
+                let mut r = error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "auth_unavailable",
+                    "credentials cannot be checked right now",
+                );
+                r.headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+                return r;
+            }
+            Err(_) => {
                 let mut r = error(
                     StatusCode::UNAUTHORIZED,
                     "unauthorized",

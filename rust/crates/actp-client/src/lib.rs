@@ -47,7 +47,20 @@ pub struct Options {
     pub max_backoff: Duration,
     /// TLS for `https://` servers. `None` uses the OS trust store.
     pub tls: Option<Arc<rustls::ClientConfig>>,
+    /// Fetches the credential before every connection, for credentials that
+    /// expire, such as signed papers in org mode. When set, `token` is not
+    /// used. An error, or no answer within 15 s, counts as a failed
+    /// connection attempt. Its error text is shown to the client and logged,
+    /// so it must not carry credentials.
+    pub token_source: Option<TokenSource>,
 }
+
+/// See [`Options::token_source`].
+pub type TokenSource = Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>
+        + Send
+        + Sync,
+>;
 
 impl Default for Options {
     fn default() -> Self {
@@ -62,6 +75,7 @@ impl Default for Options {
             give_up_after: Duration::from_secs(600),
             max_backoff: Duration::from_secs(30),
             tls: None,
+            token_source: None,
         }
     }
 }
@@ -450,9 +464,16 @@ impl Bridge {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
+        let token = match &self.opts.token_source {
+            Some(source) => tokio::time::timeout(Duration::from_secs(15), source())
+                .await
+                .map_err(|_| Error::Other("getting credentials: timed out".into()))?
+                .map_err(|e| Error::Other(format!("getting credentials: {e}")))?,
+            None => self.opts.token.clone(),
+        };
         {
             let h = req.headers_mut();
-            h.insert("Authorization", hv(&format!("Bearer {}", self.opts.token))?);
+            h.insert("Authorization", hv(&format!("Bearer {token}"))?);
             h.insert("Sec-WebSocket-Protocol", hv(&VERSIONS.join(", "))?);
             if !self.opts.client_name.is_empty() {
                 h.insert(HEADER_CLIENT_NAME, hv(&self.opts.client_name)?);

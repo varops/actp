@@ -611,7 +611,7 @@ async fn auth_required_is_reported() {
         .error
         .is_some()
     );
-    let tok = e.srv.authenticate(TOKEN).unwrap();
+    let tok = e.srv.authenticate(TOKEN).await.unwrap();
     assert!(
         e.srv
             .agents_body(&tok)
@@ -659,7 +659,7 @@ async fn reload_revokes_tokens() {
     let mut next = (*e.srv.config()).clone();
     next.tokens.clear();
     e.srv.reload(next);
-    assert!(e.srv.authenticate(TOKEN).is_none());
+    assert!(e.srv.authenticate(TOKEN).await.is_err());
     // The open link keeps working until it drops; then it cannot come back.
     let id = c.prompt(&sid, "echo still here").await;
     c.response(&id).await;

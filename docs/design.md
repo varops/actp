@@ -489,6 +489,7 @@ What v0.1.0 does:
 Since v0.1.1, in the Rust build only (`rust/`):
 
 - **Relay mode and the relay** (`docs/relay.md`): machines connect out to one relay with their device certificates; callers reach them through it. The relay routes, tracks who is online, holds the org-wide stop and writes its half of the audit. The Go server has no relay mode.
+- **Org mode** (`docs/relay.md`): callers present signed papers instead of actp tokens. A verifier supplied by the embedding program checks them against their issuer; the machine then checks that they name it and carry the required grant.
 
 Not yet:
 
