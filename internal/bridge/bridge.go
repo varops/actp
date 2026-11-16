@@ -273,7 +273,7 @@ func (b *bridge) readClient(stdin io.Reader) {
 	}
 }
 
-var cwdMethods = map[string]bool{"session/new": true, "session/load": true, "session/resume": true, "session/list": true}
+var cwdMethods = map[string]bool{"session/new": true, "session/load": true, "session/resume": true, "session/fork": true, "session/options": true, "session/list": true}
 
 // rewrite drops client capabilities that cannot work remotely and applies --cwd/--map.
 func (b *bridge) rewrite(m *jsonrpc.Message) *jsonrpc.Message {
@@ -301,6 +301,16 @@ func (b *bridge) rewrite(m *jsonrpc.Message) *jsonrpc.Message {
 			p["cwd"], _ = json.Marshal(newCwd)
 			changed = true
 		}
+		// --map applies to additional folders too; --cwd only replaces cwd.
+		var dirs []string
+		if json.Unmarshal(p["additionalDirectories"], &dirs) == nil && len(dirs) > 0 && len(b.opts.Maps) > 0 {
+			mapped := make([]string, len(dirs))
+			for i, d := range dirs {
+				mapped[i] = b.mapDir(d)
+				changed = changed || mapped[i] != d
+			}
+			p["additionalDirectories"], _ = json.Marshal(mapped)
+		}
 	}
 	if !changed {
 		return m
@@ -316,6 +326,11 @@ func (b *bridge) mapCwd(cwd string) string {
 	if b.opts.Cwd != "" {
 		return b.opts.Cwd
 	}
+	return b.mapDir(cwd)
+}
+
+// mapDir applies the longest matching --map to a client folder.
+func (b *bridge) mapDir(cwd string) string {
 	norm := strings.ReplaceAll(cwd, `\`, "/")
 	best := -1
 	for i, mp := range b.opts.Maps {

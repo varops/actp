@@ -391,6 +391,8 @@ impl Bridge {
             "session/new",
             "session/load",
             "session/resume",
+            "session/fork",
+            "session/options",
             "session/list",
         ]
         .contains(&m.method.as_str())
@@ -405,6 +407,28 @@ impl Bridge {
                     p.get_or_insert_default()
                         .insert("cwd".into(), gojson::string(&new_cwd));
                     changed = true;
+                }
+                // --map applies to additional folders too; --cwd only replaces cwd.
+                let dirs = p
+                    .as_ref()
+                    .and_then(|pm| pm.get("additionalDirectories"))
+                    .and_then(|raw| serde_json::from_str::<Vec<Option<String>>>(raw).ok());
+                if let Some(dirs) = dirs.filter(|d| !d.is_empty() && !self.opts.maps.is_empty()) {
+                    let mapped: Vec<String> = dirs
+                        .into_iter()
+                        .map(|d| {
+                            let d = d.unwrap_or_default();
+                            let m2 = map_cwd("", &self.opts.maps, &d);
+                            changed |= m2 != d;
+                            m2
+                        })
+                        .collect();
+                    let enc = gojson::GoValue::Arr(
+                        mapped.into_iter().map(gojson::GoValue::Str).collect(),
+                    )
+                    .encode();
+                    p.get_or_insert_default()
+                        .insert("additionalDirectories".into(), enc);
                 }
             }
         }

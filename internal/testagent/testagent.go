@@ -9,6 +9,8 @@
 //	caps            reply with the client capabilities from initialize
 //	cwd             reply with the session cwd
 //	mcp             reply with the session MCP servers
+//	dirs            reply with the session additionalDirectories
+//	meta            reply with the session request's _meta
 //	crash           exit with code 3
 //	burst-crash <n> send n chunks, then exit with code 4
 //	late-burst-crash <n>  like burst-crash, after 300 ms
@@ -36,6 +38,8 @@ type session struct {
 	ID         string          `json:"id"`
 	Cwd        string          `json:"cwd"`
 	MCPServers json.RawMessage `json:"mcpServers"`
+	Dirs       json.RawMessage `json:"additionalDirectories,omitempty"`
+	Meta       json.RawMessage `json:"_meta,omitempty"`
 	History    []string        `json:"history"`
 }
 
@@ -146,7 +150,7 @@ func (a *agent) handle(m *jsonrpc.Message) {
 				"_meta": map[string]any{"terminal-auth": true},
 			}},
 		}))
-	case "session/new", "session/load", "session/resume":
+	case "session/new", "session/load", "session/resume", "session/fork":
 		if a.scenario == "auth-required" {
 			a.send(jsonrpc.NewError(m.ID, jsonrpc.CodeServerError, "Authentication required", nil))
 			return
@@ -155,10 +159,17 @@ func (a *agent) handle(m *jsonrpc.Message) {
 			SessionID  string          `json:"sessionId"`
 			Cwd        string          `json:"cwd"`
 			MCPServers json.RawMessage `json:"mcpServers"`
+			Dirs       json.RawMessage `json:"additionalDirectories"`
+			Meta       json.RawMessage `json:"_meta"`
 		}
 		_ = json.Unmarshal(m.Params, &p)
-		s := &session{ID: p.SessionID, Cwd: p.Cwd, MCPServers: p.MCPServers}
-		if m.Method == "session/new" {
+		s := &session{ID: p.SessionID, Cwd: p.Cwd, MCPServers: p.MCPServers, Dirs: p.Dirs, Meta: p.Meta}
+		if m.Method == "session/fork" {
+			if stored, err := a.load(p.SessionID); err == nil {
+				s.History = stored.History
+			}
+			s.ID = fmt.Sprintf("s-%d", time.Now().UnixNano())
+		} else if m.Method == "session/new" {
 			s.ID = fmt.Sprintf("s-%d", time.Now().UnixNano())
 		} else {
 			stored, err := a.load(p.SessionID)
@@ -177,7 +188,7 @@ func (a *agent) handle(m *jsonrpc.Message) {
 		a.sessions[s.ID] = s
 		a.mu.Unlock()
 		a.save(s)
-		if m.Method == "session/new" {
+		if m.Method == "session/new" || m.Method == "session/fork" {
 			a.send(jsonrpc.NewResult(m.ID, map[string]any{"sessionId": s.ID}))
 		} else {
 			a.send(jsonrpc.NewResult(m.ID, map[string]any{}))
@@ -274,6 +285,10 @@ func (a *agent) prompt(m *jsonrpc.Message) {
 		reply(s.Cwd)
 	case "mcp":
 		reply(string(s.MCPServers))
+	case "dirs":
+		reply("dirs: " + string(s.Dirs))
+	case "meta":
+		reply("meta: " + string(s.Meta))
 	case "crash":
 		fmt.Fprintln(os.Stderr, "testagent: crashing on purpose")
 		os.Exit(3)

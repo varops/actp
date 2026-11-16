@@ -99,13 +99,6 @@ fn sv(v: &str) -> GoValue {
     GoValue::Str(v.to_string())
 }
 
-static SESSION_PARAMS: [&str; 4] = [
-    "session/new",
-    "session/load",
-    "session/resume",
-    "session/list",
-];
-
 impl Link {
     pub(crate) fn new(
         srv: Server,
@@ -304,7 +297,22 @@ impl Link {
                     self.write_agent(&m).await;
                 } // else: a late answer to a request already settled
             }
-            Kind::Notification => self.write_agent(&m).await,
+            Kind::Notification => {
+                let p = gojson::decode_raw_map(m.params.as_deref()).unwrap_or(None);
+                if let Some(field) = rewrite::unchecked_session_field(&m.method, &p) {
+                    tracing::info!(link = short(&self.id), agent = %self.agent.id, method = %m.method, field, "dropped a notification actp cannot check");
+                    self.srv.audit().event(
+                        "session_method_refused",
+                        [
+                            ("link", sv(short(&self.id))),
+                            ("method", sv(&m.method)),
+                            ("field", sv(field)),
+                        ],
+                    );
+                    return;
+                }
+                self.write_agent(&m).await
+            }
             Kind::Request => match self.rewrite_client_request(m).await {
                 Ok(out) => self.write_agent(&out).await,
                 Err(reply) => self.to_client(&reply),
@@ -334,11 +342,11 @@ impl Link {
                 }
                 changed = true;
             }
-        } else if SESSION_PARAMS.contains(&m.method.as_str()) {
+        } else if rewrite::session_cwd_required(&m.method) || m.method == "session/list" {
             let cwd = gojson::string_or_empty(
                 p.as_ref().and_then(|pm| pm.get("cwd")).map(String::as_str),
             );
-            if !cwd.is_empty() || m.method != "session/list" {
+            if !cwd.is_empty() || rewrite::session_cwd_required(&m.method) {
                 let cfg = self.srv.config();
                 match rewrite::resolve_cwd(&cfg, &self.token, &cwd) {
                     Err(msg) => {
@@ -362,6 +370,45 @@ impl Link {
                         changed = true;
                     }
                 }
+            }
+            if let Some(dirs) = p
+                .as_ref()
+                .and_then(|pm| pm.get("additionalDirectories"))
+                .cloned()
+            {
+                match rewrite::resolve_additional_directories(
+                    &self.srv.config(),
+                    &self.token,
+                    &dirs,
+                ) {
+                    Ok(resolved) => {
+                        if let Some(pm) = p.as_mut() {
+                            pm.insert("additionalDirectories".into(), resolved);
+                        }
+                    }
+                    Err(msg) => {
+                        self.srv.audit().event(
+                            "cwd_rejected",
+                            [
+                                ("link", sv(short(&self.id))),
+                                ("additionalDirectories", sv(&dirs)),
+                            ],
+                        );
+                        return Err(Box::new(jsonrpc::new_error(
+                            &id,
+                            jsonrpc::CODE_INVALID_PARAMS,
+                            &msg,
+                        )));
+                    }
+                }
+            }
+            if let Some(meta) = p.as_ref().and_then(|pm| pm.get("_meta")).cloned()
+                && let Some(pm) = p.as_mut()
+            {
+                match rewrite::keep_meta_keys(&meta, &self.agent.keep_session_meta) {
+                    Some(kept) => pm.insert("_meta".into(), kept),
+                    None => pm.remove("_meta"),
+                };
             }
             if let Some(servers) = p.as_ref().and_then(|pm| pm.get("mcpServers")).cloned() {
                 let (kept, dropped) =
@@ -404,6 +451,20 @@ impl Link {
                 sess.turn_running = true;
                 sess.last_output = Instant::now();
             }
+        } else if let Some(field) = rewrite::unchecked_session_field(&m.method, &p) {
+            self.srv.audit().event(
+                "session_method_refused",
+                [
+                    ("link", sv(short(&self.id))),
+                    ("method", sv(&m.method)),
+                    ("field", sv(field)),
+                ],
+            );
+            return Err(Box::new(jsonrpc::new_error(
+                &id,
+                jsonrpc::CODE_INVALID_REQUEST,
+                &rewrite::unchecked_session_message(&m.method, field),
+            )));
         }
 
         self.st().client_reqs.insert(m.id_key(), req);
@@ -587,7 +648,7 @@ impl Link {
                     return out;
                 }
             }
-            "session/new" | "session/load" | "session/resume" => {
+            "session/new" | "session/load" | "session/resume" | "session/fork" => {
                 if let Some(e) = &m.error {
                     if is_auth_error(e) {
                         self.srv.mark_auth_required(&self.agent.id, &e.message);
@@ -595,7 +656,7 @@ impl Link {
                     return m;
                 }
                 let mut id = req.session_id.clone();
-                if req.method == "session/new" {
+                if req.method == "session/new" || req.method == "session/fork" {
                     let r = gojson::object(m.result.as_deref().unwrap_or(""))
                         .ok()
                         .flatten();

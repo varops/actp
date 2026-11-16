@@ -192,6 +192,122 @@ pub fn within(path: &str, root: &str) -> bool {
     })
 }
 
+/// Session methods that create, load or re-target a session, or resolve options
+/// for a folder: they need an allowed cwd (design 3.3). `session/list` may omit it.
+pub fn session_cwd_required(method: &str) -> bool {
+    matches!(
+        method,
+        "session/new" | "session/load" | "session/resume" | "session/fork" | "session/options"
+    )
+}
+
+/// Session methods that take no folders, MCP servers or session options, so
+/// they pass through as they are.
+fn session_plain(method: &str) -> bool {
+    matches!(
+        method,
+        "session/prompt"
+            | "session/cancel"
+            | "session/close"
+            | "session/set_mode"
+            | "session/set_model"
+            | "session/set_config_option"
+            | "session/status"
+            | "session/set_title"
+            | "session/delete"
+            | "session/archive"
+            | "session/unarchive"
+    )
+}
+
+/// The params actp checks on session requests.
+const POLICY_FIELDS: [&str; 4] = ["cwd", "additionalDirectories", "mcpServers", "_meta"];
+
+/// The first policy field carried by a session method actp does not know: such
+/// a message could create or re-target a session past the checks, so it is
+/// refused instead of forwarded (default deny).
+pub fn unchecked_session_field(method: &str, p: &RawMap) -> Option<&'static str> {
+    if !method.starts_with("session/")
+        || session_plain(method)
+        || session_cwd_required(method)
+        || method == "session/list"
+    {
+        return None;
+    }
+    let p = p.as_ref()?;
+    POLICY_FIELDS.into_iter().find(|f| p.contains_key(*f))
+}
+
+pub fn unchecked_session_message(method: &str, field: &str) -> String {
+    format!(
+        "invalid request: actp does not know {method} and cannot check its {}",
+        config::quote(field)
+    )
+}
+
+/// Applies the cwd rules to every entry of `additionalDirectories`, without the
+/// token's `cwd_fallback`: an unknown folder must not silently become the
+/// default workspace. `null` stays `null`. The result is encoded JSON.
+pub fn resolve_additional_directories(
+    s: &Server,
+    tok: &Token,
+    raw: &str,
+) -> Result<String, String> {
+    if gojson::kind(raw) == gojson::Kind::Null {
+        return Ok(raw.to_string());
+    }
+    let list_err = || "additionalDirectories must be a list of folders".to_string();
+    if gojson::kind(raw) != gojson::Kind::Array {
+        return Err(list_err());
+    }
+    let items: Vec<Box<serde_json::value::RawValue>> =
+        serde_json::from_str(raw).map_err(|_| list_err())?;
+    let mut dirs = Vec::with_capacity(items.len());
+    for it in &items {
+        dirs.push(
+            gojson::decode_string(it.get())
+                .map_err(|_| list_err())?
+                .unwrap_or_default(),
+        );
+    }
+    let strict = Token {
+        cwd_fallback: false,
+        ..tok.clone()
+    };
+    let mut out = Vec::with_capacity(dirs.len());
+    for d in dirs {
+        match resolve_cwd(s, &strict, &d) {
+            Ok(r) => out.push(gojson::GoValue::Str(r)),
+            Err(e) => {
+                return Err(format!(
+                    "additional directory not allowed: {}",
+                    e.strip_prefix("cwd not allowed: ").unwrap_or(&e)
+                ));
+            }
+        }
+    }
+    Ok(gojson::GoValue::Arr(out).encode())
+}
+
+/// Keeps only the allow-listed top-level keys of a session request's `_meta`
+/// (agent setting `keep_session_meta`, empty by default). Agents read `_meta` as
+/// options (Claude's adapter takes SDK options and MCP servers from it), so by
+/// default it is dropped. `None` means: drop `_meta`.
+pub fn keep_meta_keys(raw: &str, keep: &[String]) -> Option<String> {
+    if keep.is_empty() {
+        return None;
+    }
+    let meta = gojson::decode_raw_map(Some(raw)).ok()??;
+    let kept: std::collections::BTreeMap<String, String> = keep
+        .iter()
+        .filter_map(|k| meta.get(k).map(|v| (k.clone(), v.clone())))
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    Some(gojson::encode_raw_map(&Some(kept)))
+}
+
 /// Removes `fs` and `terminal` from `initialize` params. `None` when the
 /// params are not an object (or missing), like Go's error.
 pub fn strip_client_capabilities(params: Option<&str>) -> Option<String> {
@@ -365,7 +481,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn setup() -> (PathBuf, Server, Token) {
-        let root = std::env::temp_dir().join(format!("actp-rw-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("actp-rw-{}-{}", std::process::id(), {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        }));
         let root = PathBuf::from(real_path(&root.to_string_lossy()));
         let site = root.join("site");
         std::fs::create_dir_all(site.join("sub")).unwrap();
@@ -437,6 +556,90 @@ mod tests {
         };
         assert_eq!(resolve_cwd(&s, &fallback, "/somewhere/else").unwrap(), site);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolves_additional_directories() {
+        let (root, s, tok) = setup();
+        let tok = Token {
+            cwd_fallback: true,
+            ..tok
+        };
+        let sub = join(&root.join("site").to_string_lossy(), "sub");
+        assert_eq!(
+            resolve_additional_directories(&s, &tok, r#"["actp://site/sub"]"#).unwrap(),
+            actp_proto::gojson::GoValue::Arr(vec![actp_proto::gojson::GoValue::Str(sub)]).encode()
+        );
+        // cwd_fallback must not turn an unknown folder into the default workspace.
+        for raw in [
+            r#"["actp://site","/"]"#,
+            r#"["actp://other"]"#,
+            r#"[""]"#,
+            r#""actp://site""#,
+            "[1]",
+        ] {
+            assert!(
+                resolve_additional_directories(&s, &tok, raw).is_err(),
+                "{raw}"
+            );
+        }
+        assert_eq!(
+            resolve_additional_directories(&s, &tok, "null").unwrap(),
+            "null"
+        );
+        assert_eq!(
+            resolve_additional_directories(&s, &tok, r#"["/"]"#).unwrap_err(),
+            "additional directory not allowed: /"
+        );
+    }
+
+    #[test]
+    fn keeps_only_allowed_meta_keys() {
+        let meta = r#"{"claudeCode":{"options":{"mcpServers":{}}},"trace":"x"}"#;
+        assert_eq!(keep_meta_keys(meta, &[]), None);
+        assert_eq!(
+            keep_meta_keys(meta, &["trace".to_string()]).as_deref(),
+            Some(r#"{"trace":"x"}"#)
+        );
+        assert_eq!(keep_meta_keys(meta, &["absent".to_string()]), None);
+    }
+
+    #[test]
+    fn refuses_unknown_session_methods_with_policy_fields() {
+        let p: RawMap = Some(
+            [
+                ("sessionId".to_string(), "\"s\"".to_string()),
+                ("cwd".to_string(), "\"/\"".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(
+            unchecked_session_field("session/frobnicate", &p),
+            Some("cwd")
+        );
+        for m in [
+            "session/prompt",
+            "session/fork",
+            "session/list",
+            "initialize",
+        ] {
+            assert_eq!(unchecked_session_field(m, &p), None, "{m}");
+        }
+        for f in ["additionalDirectories", "mcpServers", "_meta"] {
+            let p: RawMap = Some([(f.to_string(), "null".to_string())].into_iter().collect());
+            assert_eq!(unchecked_session_field("session/frobnicate", &p), Some(f));
+        }
+        let plain: RawMap = Some(
+            [("sessionId".to_string(), "\"s\"".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(unchecked_session_field("session/frobnicate", &plain), None);
+        assert_eq!(
+            unchecked_session_message("session/x", "cwd"),
+            "invalid request: actp does not know session/x and cannot check its \"cwd\""
+        );
     }
 
     #[test]

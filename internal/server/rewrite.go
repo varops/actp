@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -96,6 +97,88 @@ func within(path, root string) bool {
 		return false
 	}
 	return rel == "." || (!filepath.IsAbs(rel) && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
+}
+
+// resolveAdditionalDirectories applies the cwd rules to every entry of
+// additionalDirectories (design 3.3), without the token's cwd_fallback: an
+// unknown folder must not silently become the default workspace. null stays null.
+func resolveAdditionalDirectories(s *config.Server, tok *config.Token, raw json.RawMessage) (json.RawMessage, error) {
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return raw, nil
+	}
+	var dirs []string
+	if err := json.Unmarshal(raw, &dirs); err != nil {
+		return nil, errors.New("additionalDirectories must be a list of folders")
+	}
+	strict := *tok
+	strict.CwdFallback = false
+	out := make([]string, 0, len(dirs))
+	for _, d := range dirs {
+		r, err := resolveCwd(s, &strict, d)
+		if err != nil {
+			return nil, fmt.Errorf("additional directory not allowed: %s", strings.TrimPrefix(err.Error(), "cwd not allowed: "))
+		}
+		out = append(out, r)
+	}
+	return json.Marshal(out)
+}
+
+// keepMetaKeys keeps only the allow-listed top-level keys of a session request's
+// _meta (agent setting keep_session_meta, empty by default). Agents read _meta as
+// options (Claude's adapter takes SDK options and MCP servers from it), so by
+// default it is dropped. A nil result means: drop _meta.
+func keepMetaKeys(raw json.RawMessage, keep []string) json.RawMessage {
+	if len(keep) == 0 {
+		return nil
+	}
+	var meta map[string]json.RawMessage
+	if json.Unmarshal(raw, &meta) != nil || meta == nil {
+		return nil
+	}
+	kept := map[string]json.RawMessage{}
+	for _, k := range keep {
+		if v, ok := meta[k]; ok {
+			kept[k] = v
+		}
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	out, err := json.Marshal(kept)
+	if err != nil {
+		return nil
+	}
+	return out
+}
+
+// Session methods that take no folders, MCP servers or session options, so they
+// pass through as they are.
+var sessionPlain = map[string]bool{
+	"session/prompt": true, "session/cancel": true, "session/close": true, "session/set_mode": true,
+	"session/set_model": true, "session/set_config_option": true, "session/status": true,
+	"session/set_title": true, "session/delete": true, "session/archive": true, "session/unarchive": true,
+}
+
+// policyFields are the params actp checks on session requests.
+var policyFields = []string{"cwd", "additionalDirectories", "mcpServers", "_meta"}
+
+// uncheckedSessionField reports the first policy field carried by a session
+// method actp does not know: such a message could create or re-target a session
+// past the checks, so it is refused instead of forwarded (default deny).
+func uncheckedSessionField(method string, p map[string]json.RawMessage) string {
+	if !strings.HasPrefix(method, "session/") || sessionPlain[method] || sessionCwdRequired[method] || sessionCwdOptional[method] {
+		return ""
+	}
+	for _, f := range policyFields {
+		if _, ok := p[f]; ok {
+			return f
+		}
+	}
+	return ""
+}
+
+func uncheckedSessionMessage(method, field string) string {
+	return fmt.Sprintf("invalid request: actp does not know %s and cannot check its %q", method, field)
 }
 
 // stripClientCapabilities removes fs and terminal from initialize params (design 3.3).

@@ -113,6 +113,9 @@ type Agent struct {
 	MaxLinks      int               `yaml:"max_links"`
 	OnClientExit  string            `yaml:"on_client_exit"`
 	MaxUnattended Duration          `yaml:"max_unattended"`
+	// KeepSessionMeta lists top-level _meta keys kept in session requests; the
+	// rest of _meta is dropped (design 3.3).
+	KeepSessionMeta []string `yaml:"keep_session_meta,omitempty"`
 }
 
 type Token struct {

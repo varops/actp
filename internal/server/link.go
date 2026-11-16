@@ -249,6 +249,13 @@ func (l *Link) fromClient(raw json.RawMessage) error {
 		}
 		l.writeAgent(m)
 	case jsonrpc.KindNotification:
+		var p map[string]json.RawMessage
+		_ = json.Unmarshal(m.Params, &p)
+		if field := uncheckedSessionField(m.Method, p); field != "" {
+			l.logf("dropped a notification actp cannot check", "method", m.Method, "field", field)
+			l.srv.audit.event("session_method_refused", map[string]any{"link": l.id[:8], "method": m.Method, "field": field})
+			return nil
+		}
 		l.writeAgent(m)
 	case jsonrpc.KindRequest:
 		out, reply := l.rewriteClientRequest(m)
@@ -261,7 +268,12 @@ func (l *Link) fromClient(raw json.RawMessage) error {
 	return nil
 }
 
-var sessionParams = map[string]bool{"session/new": true, "session/load": true, "session/resume": true, "session/list": true}
+// Session methods by how they treat folders (design 3.3). The ones that create,
+// load or re-target a session need an allowed cwd; session/list may omit it.
+var (
+	sessionCwdRequired = map[string]bool{"session/new": true, "session/load": true, "session/resume": true, "session/fork": true, "session/options": true}
+	sessionCwdOptional = map[string]bool{"session/list": true}
+)
 
 // rewriteClientRequest applies design 3.3 to a client request. A non-nil reply
 // means the server answers the client itself and nothing goes to the agent.
@@ -280,10 +292,10 @@ func (l *Link) rewriteClientRequest(m *jsonrpc.Message) (*jsonrpc.Message, *json
 			_ = json.Unmarshal(stripped, &p)
 			changed = true
 		}
-	case sessionParams[m.Method]:
+	case sessionCwdRequired[m.Method] || sessionCwdOptional[m.Method]:
 		var cwd string
 		_ = json.Unmarshal(p["cwd"], &cwd)
-		if cwd != "" || m.Method != "session/list" {
+		if cwd != "" || sessionCwdRequired[m.Method] {
 			resolved, err := resolveCwd(l.srv.conf(), &l.token, cwd)
 			if err != nil {
 				l.srv.audit.event("cwd_rejected", map[string]any{"link": l.id[:8], "cwd": cwd})
@@ -292,6 +304,21 @@ func (l *Link) rewriteClientRequest(m *jsonrpc.Message) (*jsonrpc.Message, *json
 			req.origCwd, req.cwd = cwd, resolved
 			p["cwd"], _ = json.Marshal(resolved)
 			changed = true
+		}
+		if dirs, ok := p["additionalDirectories"]; ok {
+			resolved, err := resolveAdditionalDirectories(l.srv.conf(), &l.token, dirs)
+			if err != nil {
+				l.srv.audit.event("cwd_rejected", map[string]any{"link": l.id[:8], "additionalDirectories": string(dirs)})
+				return nil, jsonrpc.NewError(m.ID, jsonrpc.CodeInvalidParams, err.Error(), nil)
+			}
+			p["additionalDirectories"] = resolved
+		}
+		if meta, ok := p["_meta"]; ok {
+			if kept := keepMetaKeys(meta, l.agent.KeepSessionMeta); kept != nil {
+				p["_meta"] = kept
+			} else {
+				delete(p, "_meta")
+			}
 		}
 		if servers, ok := p["mcpServers"]; ok {
 			kept, dropped := filterMCPServers(l.token.MCPServers, servers)
@@ -323,6 +350,11 @@ func (l *Link) rewriteClientRequest(m *jsonrpc.Message) (*jsonrpc.Message, *json
 			s.lastOutput = time.Now()
 		}
 		l.mu.Unlock()
+	default:
+		if field := uncheckedSessionField(m.Method, p); field != "" {
+			l.srv.audit.event("session_method_refused", map[string]any{"link": l.id[:8], "method": m.Method, "field": field})
+			return nil, jsonrpc.NewError(m.ID, jsonrpc.CodeInvalidRequest, uncheckedSessionMessage(m.Method, field), nil)
+		}
 	}
 
 	l.mu.Lock()
@@ -477,7 +509,7 @@ func (l *Link) afterResponse(req clientReq, m *jsonrpc.Message) *jsonrpc.Message
 				return out
 			}
 		}
-	case "session/new", "session/load", "session/resume":
+	case "session/new", "session/load", "session/resume", "session/fork":
 		if m.Error != nil {
 			if isAuthError(m.Error) {
 				l.srv.markAuthRequired(l.agent.ID, m.Error.Message)
@@ -485,7 +517,7 @@ func (l *Link) afterResponse(req clientReq, m *jsonrpc.Message) *jsonrpc.Message
 			break
 		}
 		id := req.sessionID
-		if req.method == "session/new" {
+		if req.method == "session/new" || req.method == "session/fork" {
 			var r struct {
 				SessionID string `json:"sessionId"`
 			}
