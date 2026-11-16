@@ -38,7 +38,7 @@ use crate::server::Server;
 /// How to reach the relay.
 #[derive(Clone)]
 pub struct RelayOptions {
-    /// `wss://host[:port][/prefix]`.
+    /// `wss://host[:port]`.
     pub url: String,
     /// TLS with the device certificate as the client certificate.
     pub tls: Arc<rustls::ClientConfig>,
@@ -309,6 +309,9 @@ async fn run_control(
         };
         match control {
             Control::Hello { machine, stopped } => {
+                if !actp_proto::relay::valid_machine_name(&machine) {
+                    return "the relay sent a malformed machine address".into();
+                }
                 hello = true;
                 tracing::info!(machine = %machine, stopped, "the relay knows this machine");
                 server.set_org_stopped(stopped).await;
@@ -395,10 +398,6 @@ mod tests {
         assert_eq!(
             join_url("wss://relay.example.com/", PATH_CONNECT),
             "wss://relay.example.com/relay/v1/connect"
-        );
-        assert_eq!(
-            join_url("wss://relay.example.com/acme", PATH_CONNECT),
-            "wss://relay.example.com/acme/relay/v1/connect"
         );
     }
 }

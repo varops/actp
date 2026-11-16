@@ -52,11 +52,19 @@ pub fn server_config(cfg: &Config) -> io::Result<Arc<rustls::ServerConfig>> {
     for p in &cfg.device_crls {
         all_crls.extend(crls(p)?);
     }
-    let verifier = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone())
-        .with_crls(all_crls)
-        .allow_unauthenticated()
-        .build()
-        .map_err(io::Error::other)?;
+    let mut builder =
+        WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone())
+            .allow_unauthenticated();
+    if !all_crls.is_empty() {
+        // Revocation is checked for the device certificate only (the lists
+        // MDM tools publish are the issuing CA's), and a list past its
+        // next-update time no longer counts, so a stale list fails closed.
+        builder = builder
+            .with_crls(all_crls)
+            .only_check_end_entity_revocation()
+            .enforce_revocation_expiration();
+    }
+    let verifier = builder.build().map_err(io::Error::other)?;
     let key = PrivateKeyDer::from_pem_file(&cfg.tls_key).map_err(|e| err(&cfg.tls_key, e))?;
     let mut sc = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()

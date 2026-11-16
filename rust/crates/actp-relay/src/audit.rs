@@ -4,14 +4,35 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value};
 
 pub struct Audit {
-    f: Mutex<Option<File>>,
+    f: Mutex<Option<Log>>,
+}
+
+struct Log {
+    file: File,
+    dir: PathBuf,
+    size: u64,
+    max: u64,
+}
+
+/// Old audit files kept after rotation: `audit.jsonl.1` (newest) to `.10`.
+const KEEP: u32 = 10;
+
+fn open_log(dir: &Path) -> std::io::Result<File> {
+    let mut o = OpenOptions::new();
+    o.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    o.open(dir.join("audit.jsonl"))
 }
 
 impl Audit {
@@ -21,18 +42,18 @@ impl Audit {
         }
     }
 
-    pub fn open(dir: &Path) -> std::io::Result<Self> {
+    /// Appends to `<dir>/audit.jsonl`, rotating it at `max` bytes.
+    pub fn open(dir: &Path, max: u64) -> std::io::Result<Self> {
         crate::state::create_private_dir(dir)?;
-        let mut o = OpenOptions::new();
-        o.create(true).append(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            o.mode(0o600);
-        }
-        let f = o.open(dir.join("audit.jsonl"))?;
+        let file = open_log(dir)?;
+        let size = file.metadata().map(|m| m.len()).unwrap_or(0);
         Ok(Audit {
-            f: Mutex::new(Some(f)),
+            f: Mutex::new(Some(Log {
+                file,
+                dir: dir.to_path_buf(),
+                size,
+                max,
+            })),
         })
     }
 
@@ -49,10 +70,28 @@ impl Audit {
         let mut line = Value::Object(m).to_string();
         line.push('\n');
         let mut g = self.f.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(f) = g.as_mut() {
-            if let Err(e) = f.write_all(line.as_bytes()) {
-                tracing::error!(error = %e, "could not write the audit log");
+        let Some(log) = g.as_mut() else {
+            return;
+        };
+        if log.size + line.len() as u64 > log.max && log.size > 0 {
+            for i in (1..KEEP).rev() {
+                let _ = std::fs::rename(
+                    log.dir.join(format!("audit.jsonl.{i}")),
+                    log.dir.join(format!("audit.jsonl.{}", i + 1)),
+                );
             }
+            let _ = std::fs::rename(log.dir.join("audit.jsonl"), log.dir.join("audit.jsonl.1"));
+            match open_log(&log.dir) {
+                Ok(f) => {
+                    log.file = f;
+                    log.size = 0;
+                }
+                Err(e) => tracing::error!(error = %e, "could not rotate the audit log"),
+            }
+        }
+        match log.file.write_all(line.as_bytes()) {
+            Ok(()) => log.size += line.len() as u64,
+            Err(e) => tracing::error!(error = %e, "could not write the audit log"),
         }
     }
 }

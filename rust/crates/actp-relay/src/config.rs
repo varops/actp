@@ -38,6 +38,33 @@ pub struct Config {
     /// Callers served at once per machine, waiting ones included.
     #[serde(default = "default_max_streams")]
     pub max_streams_per_machine: usize,
+    /// Requests per caller IP address to machines and the management API.
+    #[serde(default)]
+    pub caller_rate: Rate,
+    /// `audit.jsonl` is rotated at this size (100 MB); ten old files are kept.
+    #[serde(default = "default_audit_max_mb")]
+    pub audit_max_mb: u64,
+}
+
+/// A rate: so many per second on average, up to `burst` at once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rate {
+    pub per_second: u32,
+    pub burst: u32,
+}
+
+impl Default for Rate {
+    fn default() -> Self {
+        Rate {
+            per_second: 20,
+            burst: 60,
+        }
+    }
+}
+
+fn default_audit_max_mb() -> u64 {
+    100
 }
 
 fn default_listen() -> String {
@@ -71,6 +98,10 @@ pub struct AdminToken {
 }
 
 impl Config {
+    pub fn audit_max_bytes(&self) -> u64 {
+        self.audit_max_mb.saturating_mul(1 << 20)
+    }
+
     pub fn load(path: &Path) -> Result<Config, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("reading {}: {e}", path.display()))?;
@@ -99,6 +130,12 @@ impl Config {
                     t.name
                 ));
             }
+        }
+        if self.caller_rate.per_second == 0 || self.caller_rate.burst == 0 {
+            errs.push("caller_rate per_second and burst must be at least 1".into());
+        }
+        if self.audit_max_mb == 0 {
+            errs.push("audit_max_mb must be at least 1".into());
         }
         if self.max_streams_per_machine == 0 {
             errs.push("max_streams_per_machine must be at least 1".into());

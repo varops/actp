@@ -2,465 +2,18 @@
 //! `actp_server` in relay mode with device certificates, and callers going
 //! through the relay with the actp bridge library or plain HTTPS.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+mod common;
+
+use std::path::PathBuf;
 use std::time::Duration;
 
-use actp_relay::{Relay, Timing};
-use actp_server::relay::{RelayAcceptor, RelayOptions, Status};
-use rcgen::{
-    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
-    KeyUsagePurpose,
-};
-use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::task::AbortHandle;
-use tokio_util::sync::CancellationToken;
-
-const TOKEN: &str = "actp_relaytesttoken";
-const ADMIN: &str = "actpr_admintoken";
-
-// ---- the Go test agent ----
-
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../..")
-        .canonicalize()
-        .unwrap()
-}
-
-fn test_agent() -> &'static Path {
-    static BIN: OnceLock<PathBuf> = OnceLock::new();
-    BIN.get_or_init(|| {
-        if let Some(p) = std::env::var_os("ACTP_TESTAGENT_BIN").filter(|p| !p.is_empty()) {
-            return PathBuf::from(p);
-        }
-        let exe = if cfg!(windows) { ".exe" } else { "" };
-        let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join("relay-go-bin");
-        std::fs::create_dir_all(&out).unwrap();
-        let target = out.join(format!("actp-testagent{exe}"));
-        let status = std::process::Command::new("go")
-            .args(["build", "-o"])
-            .arg(&target)
-            .arg("./cmd/actp-testagent")
-            .current_dir(repo_root())
-            .env("CGO_ENABLED", "0")
-            .status()
-            .expect("building the Go test agent (set ACTP_TESTAGENT_BIN to use a prebuilt one)");
-        assert!(status.success());
-        target
-    })
-}
-
-fn yaml_path(p: &Path) -> String {
-    format!("'{}'", p.to_string_lossy().replace('\'', "''"))
-}
-
-fn hash(t: &str) -> String {
-    actp_relay::config::hash_token(t)
-}
-
-fn scratch(name: &str) -> PathBuf {
-    static N: AtomicU32 = AtomicU32::new(0);
-    let d = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "relay-{name}-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::SeqCst)
-    ));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
-}
-
-// ---- certificates ----
-
-struct Pki {
-    dir: PathBuf,
-    device_ca: Issuer<'static, KeyPair>,
-}
-
-fn ca(cn: &str) -> (CertificateParams, KeyPair, String) {
-    let key = KeyPair::generate().unwrap();
-    let mut p = CertificateParams::new(Vec::<String>::new()).unwrap();
-    p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    p.distinguished_name.push(DnType::CommonName, cn);
-    p.key_usages = vec![
-        KeyUsagePurpose::KeyCertSign,
-        KeyUsagePurpose::CrlSign,
-        KeyUsagePurpose::DigitalSignature,
-    ];
-    let cert = p.self_signed(&key).unwrap();
-    (p, key, cert.pem())
-}
-
-impl Pki {
-    fn new(dir: &Path) -> Pki {
-        let (rp, rk, rpem) = ca("relay test CA");
-        std::fs::write(dir.join("relay-ca.pem"), rpem).unwrap();
-        let relay_ca = Issuer::new(rp, rk);
-        let key = KeyPair::generate().unwrap();
-        let mut p = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-        p.distinguished_name.push(DnType::CommonName, "relay");
-        p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-        let cert = p.signed_by(&key, &relay_ca).unwrap();
-        std::fs::write(dir.join("relay.pem"), cert.pem()).unwrap();
-        std::fs::write(dir.join("relay.key"), key.serialize_pem()).unwrap();
-
-        let (dp, dk, dpem) = ca("device test CA");
-        std::fs::write(dir.join("device-ca.pem"), dpem).unwrap();
-        Pki {
-            dir: dir.to_path_buf(),
-            device_ca: Issuer::new(dp, dk),
-        }
-    }
-
-    /// A device certificate for `cn`, signed by `issuer` (the org's device CA by default).
-    fn device(&self, cn: &str, issuer: Option<&Issuer<'static, KeyPair>>) -> (PathBuf, PathBuf) {
-        let key = KeyPair::generate().unwrap();
-        let mut p = CertificateParams::new(Vec::<String>::new()).unwrap();
-        p.distinguished_name.push(DnType::CommonName, cn);
-        p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
-        let cert = p
-            .signed_by(&key, issuer.unwrap_or(&self.device_ca))
-            .unwrap();
-        let (c, k) = (
-            self.dir.join(format!("{cn}.pem")),
-            self.dir.join(format!("{cn}.key")),
-        );
-        std::fs::write(&c, cert.pem()).unwrap();
-        std::fs::write(&k, key.serialize_pem()).unwrap();
-        (c, k)
-    }
-
-    fn caller_tls(&self) -> Arc<rustls::ClientConfig> {
-        use rustls::pki_types::CertificateDer;
-        use rustls::pki_types::pem::PemObject;
-        let mut roots = rustls::RootCertStore::empty();
-        for c in CertificateDer::pem_file_iter(self.dir.join("relay-ca.pem")).unwrap() {
-            roots.add(c.unwrap()).unwrap();
-        }
-        Arc::new(
-            rustls::ClientConfig::builder_with_provider(Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-        )
-    }
-}
-
-// ---- the relay ----
-
-fn fast_timing() -> Timing {
-    Timing {
-        ping_every: Duration::from_millis(100),
-        dead_after: Duration::from_millis(800),
-        stream_timeout: Duration::from_secs(5),
-        response_timeout: Duration::from_secs(10),
-    }
-}
-
-struct RelayEnv {
-    relay: Relay,
-    port: u16,
-    dir: PathBuf,
-    stop: CancellationToken,
-}
-
-impl Drop for RelayEnv {
-    fn drop(&mut self) {
-        self.stop.cancel();
-    }
-}
-
-async fn start_relay(pki: &Pki, dir: &Path) -> RelayEnv {
-    let yaml = format!(
-        "listen: 127.0.0.1:0\ntls_cert: {}\ntls_key: {}\ndevice_ca: {}\nstate_dir: {}\nlog_dir: {}\nblocked_machines: [lost-laptop]\nadmin_tokens:\n  - name: dave\n    hash: {}\n",
-        yaml_path(&pki.dir.join("relay.pem")),
-        yaml_path(&pki.dir.join("relay.key")),
-        yaml_path(&pki.dir.join("device-ca.pem")),
-        yaml_path(&dir.join("state")),
-        yaml_path(&dir.join("logs")),
-        hash(ADMIN),
-    );
-    let cfg = actp_relay::config::Config::parse(&yaml).unwrap();
-    let tls = actp_relay::tls::server_config(&cfg).unwrap();
-    let relay = Relay::with_timing(cfg, fast_timing()).unwrap();
-    let ln = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = ln.local_addr().unwrap().port();
-    let stop = CancellationToken::new();
-    {
-        let (relay, stop) = (relay.clone(), stop.clone());
-        tokio::spawn(async move { relay.serve(ln, tls, stop).await });
-    }
-    RelayEnv {
-        relay,
-        port,
-        dir: dir.to_path_buf(),
-        stop,
-    }
-}
-
-impl RelayEnv {
-    fn audit(&self) -> Vec<Value> {
-        std::fs::read_to_string(self.dir.join("logs").join("audit.jsonl"))
-            .unwrap_or_default()
-            .lines()
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect()
-    }
-
-    fn audit_has(&self, event: &str, f: impl Fn(&Value) -> bool) -> bool {
-        self.audit().iter().any(|e| e["event"] == event && f(e))
-    }
-}
-
-// ---- machines ----
-
-struct Laptop {
-    srv: actp_server::Server,
-    status: tokio::sync::watch::Receiver<Status>,
-    stop: CancellationToken,
-}
-
-impl Drop for Laptop {
-    fn drop(&mut self) {
-        self.stop.cancel();
-    }
-}
-
-async fn start_laptop(pki: &Pki, name: &str, relay_port: u16, cert: (PathBuf, PathBuf)) -> Laptop {
-    let root = scratch(name);
-    std::fs::create_dir_all(root.join("site")).unwrap();
-    let yaml = format!(
-        "server:\n  name: {name}\n  idle_close: 1s\n  log_dir: {}\n  state_dir: {}\n  tokens_file: {}\n  relay:\n    url: wss://localhost:{relay_port}\n    cert: {}\n    key: {}\n    ca: {}\n  workspaces:\n    - name: site\n      path: {}\n  agents:\n    - id: test\n      command: {}\n      env:\n        ACTP_TESTAGENT_STORE: {}\n  tokens:\n    - name: it\n      hash: \"{}\"\n      agents: [\"*\"]\n      workspaces: [\"*\"]\n      default_workspace: site\n",
-        yaml_path(&root.join("logs")),
-        yaml_path(&root.join("state")),
-        yaml_path(&root.join("tokens.yaml")),
-        yaml_path(&cert.0),
-        yaml_path(&cert.1),
-        yaml_path(&pki.dir.join("relay-ca.pem")),
-        yaml_path(&root.join("site")),
-        yaml_path(test_agent()),
-        yaml_path(&root.join("store")),
-        hash(TOKEN),
-    );
-    let cfg = actp_server::config::Config::parse(&yaml).unwrap();
-    cfg.validate().unwrap();
-    let sc = cfg.server.clone().unwrap();
-    let relay_cfg = sc.relay.clone().unwrap();
-    let srv = actp_server::Server::new(
-        sc,
-        actp_server::Options {
-            version: "test".into(),
-            base_env: Some(actp_server::agentproc::os_environ()),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    let mut opts = RelayOptions::new(
-        relay_cfg.url.clone(),
-        actp_server::relay::client_tls(&relay_cfg).unwrap(),
-    );
-    opts.ping_every = Duration::from_millis(100);
-    opts.dead_after = Duration::from_millis(800);
-    opts.max_backoff = Duration::from_millis(200);
-    opts.dial_timeout = Duration::from_secs(3);
-    let stop = CancellationToken::new();
-    let acceptor = RelayAcceptor::start(srv.clone(), opts, stop.clone());
-    let status = acceptor.status();
-    tokio::spawn(actp_server::http::serve(
-        srv.clone(),
-        acceptor,
-        stop.clone(),
-    ));
-    Laptop { srv, status, stop }
-}
-
-impl Laptop {
-    async fn wait_status(&mut self, want: impl Fn(&Status) -> bool) -> Status {
-        tokio::time::timeout(Duration::from_secs(10), self.status.wait_for(|s| want(s)))
-            .await
-            .expect("laptop status in time")
-            .expect("status channel open")
-            .clone()
-    }
-
-    async fn wait_connected(&mut self) {
-        self.wait_status(|s| matches!(s, Status::Connected { .. }))
-            .await;
-    }
-}
-
-// ---- callers ----
-
-/// One HTTPS request to the relay; returns the status and the JSON body.
-async fn request(
-    pki: &Pki,
-    port: u16,
-    method: &str,
-    path: &str,
-    bearer: &str,
-    body: Option<Value>,
-) -> (u16, Value) {
-    request_with(pki.caller_tls(), port, method, path, bearer, body).await
-}
-
-async fn request_with(
-    tls: Arc<rustls::ClientConfig>,
-    port: u16,
-    method: &str,
-    path: &str,
-    bearer: &str,
-    body: Option<Value>,
-) -> (u16, Value) {
-    let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    let tls = tokio_rustls::TlsConnector::from(tls)
-        .connect("localhost".try_into().unwrap(), tcp)
-        .await
-        .unwrap();
-    let (mut sender, conn) =
-        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tls))
-            .await
-            .unwrap();
-    tokio::spawn(conn);
-    let mut req = http::Request::builder()
-        .method(method)
-        .uri(path)
-        .header("host", "localhost");
-    if !bearer.is_empty() {
-        req = req.header("authorization", format!("Bearer {bearer}"));
-    }
-    use http_body_util::BodyExt;
-    let req = req
-        .body(http_body_util::Full::new(bytes::Bytes::from(
-            body.map(|b| b.to_string()).unwrap_or_default(),
-        )))
-        .unwrap();
-    let resp = sender.send_request(req).await.unwrap();
-    let status = resp.status().as_u16();
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    (
-        status,
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-    )
-}
-
-/// An ACP client on the actp bridge library, through the relay to `machine`.
-struct Caller {
-    stdin: tokio::io::DuplexStream,
-    lines: Arc<Mutex<Vec<Value>>>,
-    done: tokio::task::JoinHandle<Result<(), actp_client::Error>>,
-}
-
-impl Caller {
-    fn start(pki: &Pki, port: u16, machine: &str) -> Caller {
-        let o = actp_client::Options {
-            agent: "test".into(),
-            base_url: format!("https://localhost:{port}/m/{machine}"),
-            token: TOKEN.into(),
-            client_name: "relay-test".into(),
-            max_backoff: Duration::from_millis(100),
-            give_up_after: Duration::from_secs(2),
-            tls: Some(pki.caller_tls()),
-            ..Default::default()
-        };
-        let (stdin_w, stdin_r) = tokio::io::duplex(1 << 20);
-        let (stdout_w, stdout_r) = tokio::io::duplex(1 << 20);
-        let done = tokio::spawn(actp_client::run(o, stdin_r, stdout_w));
-        let lines: Arc<Mutex<Vec<Value>>> = Arc::default();
-        let l2 = lines.clone();
-        tokio::spawn(async move {
-            let mut rd = BufReader::new(stdout_r).lines();
-            while let Ok(Some(line)) = rd.next_line().await {
-                if let Ok(v) = serde_json::from_str(&line) {
-                    l2.lock().unwrap().push(v);
-                }
-            }
-        });
-        Caller {
-            stdin: stdin_w,
-            lines,
-            done,
-        }
-    }
-
-    async fn call(&mut self, id: i64, method: &str, params: Value) -> Value {
-        let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        self.stdin
-            .write_all(format!("{msg}\n").as_bytes())
-            .await
-            .unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(v) = self
-                .lines
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|v| v["id"] == json!(id))
-            {
-                return v.clone();
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "no answer to {method}: {:?}",
-                self.lines.lock().unwrap()
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-}
-
-async fn eventually(what: &str, f: impl Fn() -> bool) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while !f() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for {what}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-// ---- a TCP proxy that can cut every connection ----
-
-struct Proxy {
-    port: u16,
-    conns: Arc<Mutex<Vec<AbortHandle>>>,
-}
-
-impl Proxy {
-    async fn start(target: u16) -> Proxy {
-        let ln = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = ln.local_addr().unwrap().port();
-        let conns: Arc<Mutex<Vec<AbortHandle>>> = Arc::default();
-        let c2 = conns.clone();
-        tokio::spawn(async move {
-            while let Ok((mut down, _)) = ln.accept().await {
-                let Ok(mut up) = TcpStream::connect(("127.0.0.1", target)).await else {
-                    continue;
-                };
-                let h = tokio::spawn(async move {
-                    let _ = tokio::io::copy_bidirectional(&mut down, &mut up).await;
-                });
-                c2.lock().unwrap().push(h.abort_handle());
-            }
-        });
-        Proxy { port, conns }
-    }
-
-    fn drop_all(&self) {
-        for h in self.conns.lock().unwrap().drain(..) {
-            h.abort();
-        }
-    }
-}
+use actp_relay::Relay;
+use actp_server::relay::Status;
+use common::*;
+use rcgen::Issuer;
+use serde_json::json;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
 
 // ---- tests ----
 
@@ -730,7 +283,7 @@ async fn the_org_wide_stop_drops_sessions_and_refuses_new_ones() {
     eventually("laptop-c stopped", || c.srv.org_stopped()).await;
 
     // The stop survives a relay restart.
-    let cfg = env.relay.config().clone();
+    let cfg = (*env.relay.config()).clone();
     let again = Relay::with_timing(cfg, fast_timing()).unwrap();
     assert!(again.stop_state().stopped);
     drop(again);
@@ -949,5 +502,117 @@ async fn only_the_machine_asked_can_take_a_stream() {
             .await
             .err(),
         Some(404)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reload_cuts_off_a_newly_blocked_machine() {
+    let dir = scratch("reload");
+    let pki = Pki::new(&dir);
+    let env = start_relay(&pki, &dir).await;
+    let mut a = start_laptop(&pki, "laptop-a", env.port, pki.device("laptop-a", None)).await;
+    a.wait_connected().await;
+    let mut caller = Caller::start(&pki, env.port, "laptop-a");
+    assert!(
+        caller
+            .call(1, "initialize", json!({"protocolVersion": 1}))
+            .await
+            .get("result")
+            .is_some()
+    );
+
+    let yaml = relay_yaml(&pki, &dir, "").replace("[lost-laptop]", "[lost-laptop, laptop-a]");
+    let cfg = actp_relay::config::Config::parse(&yaml).unwrap();
+    let tls = actp_relay::tls::server_config(&cfg).unwrap();
+    env.relay.reload(cfg, tls);
+    eventually("laptop-a offline", || {
+        env.relay.machines().iter().all(|m| !m.online)
+    })
+    .await;
+    a.wait_status(|s| matches!(s, Status::Disconnected { error } if error.contains("403")))
+        .await;
+    assert!(env.audit_has("session_closed", |e| e["reason"] == "blocked"));
+    assert!(env.audit_has("machine_offline", |e| e["reason"] == "blocked"));
+    let (status, _) = request(
+        &pki,
+        env.port,
+        "GET",
+        "/m/laptop-a/api/v1/info",
+        TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(status, 503);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn callers_are_rate_limited_and_floods_do_not_flood_the_audit() {
+    let dir = scratch("rate");
+    let pki = Pki::new(&dir);
+    let env = start_relay_with(&pki, &dir, "caller_rate: {per_second: 1, burst: 30}\n").await;
+    let mut statuses = Vec::new();
+    for _ in 0..40 {
+        statuses.push(
+            request(&pki, env.port, "GET", "/m/laptop-x/health", "", None)
+                .await
+                .0,
+        );
+    }
+    assert_eq!(statuses.iter().filter(|s| **s == 503).count(), 30);
+    assert_eq!(statuses.iter().filter(|s| **s == 429).count(), 10);
+    // 30 refusals, 20 written, the rest counted.
+    let refused = || {
+        env.audit()
+            .iter()
+            .filter(|e| e["event"] == "caller_refused")
+            .count()
+    };
+    assert_eq!(refused(), 20);
+    eventually("the count of refusals left out", || {
+        env.audit_has("refusals_not_logged", |e| {
+            e["kind"] == "caller_refused" && e["count"] == 10
+        })
+    })
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_that_cannot_be_recorded_says_so_and_is_recorded_later() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("unsaved");
+    let pki = Pki::new(&dir);
+    let env = start_relay(&pki, &dir).await;
+    let state = dir.join("state");
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o500)).unwrap();
+    if std::fs::write(state.join("probe"), b"x").is_ok() {
+        return; // running as root: permissions do not stop writes
+    }
+    let (status, body) = request(
+        &pki,
+        env.port,
+        "POST",
+        "/relay/v1/stop",
+        ADMIN,
+        Some(json!({"reason": "incident"})),
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (500, Some("stop_not_saved"))
+    );
+    assert_eq!(body["stop"]["stopped"], true);
+    assert!(env.relay.stop_state().stopped, "the stop holds anyway");
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    eventually("the stop recorded", || {
+        env.audit_has("org_stop_saved", |_| true)
+    })
+    .await;
+    let cfg = (*env.relay.config()).clone();
+    assert!(
+        Relay::with_timing(cfg, fast_timing())
+            .unwrap()
+            .stop_state()
+            .stopped
     );
 }

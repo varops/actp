@@ -9,9 +9,16 @@
 //! | `GET /relay/v1/machines` | admin token | who is online, last seen |
 //! | `GET /relay/v1/stop` | admin token | the org-wide stop |
 //! | `POST /relay/v1/stop`, `POST /relay/v1/release` | admin token | press, release (`{"reason": …}`) |
+//!
+//! Caller and management routes are rate limited per IP address.
 
 use std::convert::Infallible;
+use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use actp_proto::api;
@@ -32,7 +39,7 @@ use hyper::body::Incoming;
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde_json::json;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
@@ -63,7 +70,7 @@ pub(crate) async fn serve_connection<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let peer = std::sync::Arc::new(peer);
+    let peer = Arc::new(peer);
     let svc = hyper::service::service_fn(move |req| {
         let (relay, peer, shutdown) = (relay.clone(), peer.clone(), shutdown.clone());
         async move { Ok::<_, Infallible>(handle(&relay, &peer, req, shutdown).await) }
@@ -110,16 +117,32 @@ async fn handle(
     if let Some(id) = path.strip_prefix(PATH_STREAM) {
         return machine_stream(relay, peer, req, id.to_string());
     }
-    if let Some(rest) = path.strip_prefix(PATH_MACHINE) {
-        let rest = rest.to_string();
-        return caller(relay, peer, req, &rest).await;
+    let admin_route = matches!(
+        path.as_str(),
+        "/relay/v1/machines" | "/relay/v1/stop" | "/relay/v1/release"
+    );
+    if !admin_route && !path.starts_with(PATH_MACHINE) {
+        return error(StatusCode::NOT_FOUND, "not_found", "no such route");
     }
-    match path.as_str() {
-        "/relay/v1/machines" | "/relay/v1/stop" | "/relay/v1/release" => {
-            admin(relay, peer, req, &path).await
-        }
-        _ => error(StatusCode::NOT_FOUND, "not_found", "no such route"),
+    if !relay.callers().allow(peer.remote.ip()) {
+        relay.refusal(
+            "caller_rate_limited",
+            [("remote", json!(peer.remote.ip().to_string()))],
+        );
+        let mut r = error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "too many requests from this address",
+        );
+        r.headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+        return r;
     }
+    if admin_route {
+        return admin(relay, peer, req, &path).await;
+    }
+    let rest = path[PATH_MACHINE.len()..].to_string();
+    caller(relay, peer, req, &rest).await
 }
 
 // ---- machines ----
@@ -133,7 +156,7 @@ fn machine_of(relay: &Relay, peer: &Peer, route: &str) -> Result<String, Box<Res
             "this route needs the machine's device certificate",
         ))),
         Some(Err(why)) => {
-            relay.audit().event(
+            relay.refusal(
                 "machine_refused",
                 [
                     ("remote", json!(peer.remote.to_string())),
@@ -147,8 +170,8 @@ fn machine_of(relay: &Relay, peer: &Peer, route: &str) -> Result<String, Box<Res
                 why,
             )))
         }
-        Some(Ok(m)) if relay.config().blocked_machines.iter().any(|b| b == m) => {
-            relay.audit().event(
+        Some(Ok(m)) if relay.blocked(m) => {
+            relay.refusal(
                 "machine_refused",
                 [
                     ("machine", json!(m)),
@@ -264,16 +287,25 @@ async fn run_control(
     ws: WebSocketStream<TokioIo<Upgraded>>,
     shutdown: CancellationToken,
 ) {
-    let (id, mut rx, cancel, stopped) = relay.machine_connected(&machine, remote);
+    let (id, mut rx, cut, stopped) = relay.machine_connected(&machine, remote);
     tracing::info!(machine = %machine, %remote, "machine online");
     let (mut sink, mut stream) = ws.split();
     let timing = relay.timing().clone();
+    // Every write has a deadline, so a machine that stops reading cannot
+    // hold this task (and its cut-off) forever.
+    let send_timeout = timing.send_timeout;
+    let mut send = async |m: Message| -> bool {
+        matches!(
+            tokio::time::timeout(send_timeout, sink.send(m)).await,
+            Ok(Ok(()))
+        )
+    };
     let hello = Control::Hello {
         machine: machine.clone(),
         stopped,
     };
-    let mut why = "closed";
-    if sink.send(Message::text(hello.encode())).await.is_err() {
+    let mut why: String = "closed".into();
+    if !send(Message::text(hello.encode())).await {
         relay.machine_disconnected(&machine, id, "send failed");
         return;
     }
@@ -283,35 +315,40 @@ async fn run_control(
     ping.tick().await;
     loop {
         tokio::select! {
-            _ = shutdown.cancelled() => { why = "relay stopping"; break; }
-            _ = cancel.cancelled() => {
-                why = "replaced";
-                let _ = sink.send(Message::Close(Some(CloseFrame {
-                    code: CloseCode::from(actp_proto::frame::CLOSE_REPLACED),
-                    reason: "replaced".into(),
+            _ = shutdown.cancelled() => { why = "relay stopping".into(); break; }
+            _ = cut.cancelled() => {
+                why = cut.why().into();
+                let code = if why == "replaced" {
+                    actp_proto::frame::CLOSE_REPLACED
+                } else {
+                    actp_proto::frame::CLOSE_GOING_AWAY
+                };
+                let _ = send(Message::Close(Some(CloseFrame {
+                    code: CloseCode::from(code),
+                    reason: cut.why().into(),
                 }))).await;
                 break;
             }
             m = rx.recv() => {
                 let Some(m) = m else { break };
-                if sink.send(Message::text(m.encode())).await.is_err() {
-                    why = "send failed";
+                if !send(Message::text(m.encode())).await {
+                    why = "send failed".into();
                     break;
                 }
             }
             _ = ping.tick() => {
                 if last_heard.elapsed() >= timing.dead_after {
-                    why = "silent";
+                    why = "silent".into();
                     break;
                 }
-                if sink.send(Message::Ping(Bytes::new())).await.is_err() {
-                    why = "send failed";
+                if !send(Message::Ping(Bytes::new())).await {
+                    why = "send failed".into();
                     break;
                 }
             }
             m = stream.next() => match m {
                 Some(Ok(Message::Close(_))) | None => break,
-                Some(Err(_)) => { why = "connection error"; break; }
+                Some(Err(_)) => { why = "connection error".into(); break; }
                 Some(Ok(_)) => {
                     last_heard = Instant::now();
                     if last_marked.elapsed() >= Duration::from_secs(5) {
@@ -322,8 +359,8 @@ async fn run_control(
             },
         }
     }
-    tracing::info!(machine = %machine, reason = why, "machine offline");
-    relay.machine_disconnected(&machine, id, why);
+    tracing::info!(machine = %machine, reason = %why, "machine offline");
+    relay.machine_disconnected(&machine, id, &why);
 }
 
 fn machine_stream(relay: &Relay, peer: &Peer, mut req: Request<Incoming>, id: String) -> Resp {
@@ -415,18 +452,26 @@ fn is_upgrade(h: &HeaderMap) -> bool {
         .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
 }
 
-/// The agent id from an ACTP link path, for the audit.
-fn agent_of(target: &str) -> Option<String> {
+/// The forwarded path as the machine routes it: each segment
+/// percent-decoded, no query, at most 128 characters. For the audit.
+fn route_of(target: &str) -> String {
     let path = target.split('?').next().unwrap_or("");
-    let s: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-    match s.as_slice() {
-        ["actp", "v1", "agents", id, "link"] => Some(
-            percent_encoding::percent_decode_str(id)
+    let decoded: Vec<String> = path
+        .split('/')
+        .map(|s| {
+            percent_encoding::percent_decode_str(s)
                 .decode_utf8_lossy()
-                .chars()
-                .take(64)
-                .collect(),
-        ),
+                .into_owned()
+        })
+        .collect();
+    decoded.join("/").chars().take(128).collect()
+}
+
+/// The agent id of an ACTP link route, for the audit.
+fn agent_of(route: &str) -> Option<String> {
+    let s: Vec<&str> = route.trim_start_matches('/').split('/').collect();
+    match s.as_slice() {
+        ["actp", "v1", "agents", id, "link"] => Some(id.chars().take(64).collect()),
         _ => None,
     }
 }
@@ -439,6 +484,44 @@ fn header_str(h: &HeaderMap, name: &str) -> Option<String> {
     h.get(name)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.chars().take(128).collect())
+}
+
+/// Counts the bytes read through it.
+struct Counting<T> {
+    io: T,
+    read: Arc<AtomicU64>,
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for Counting<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let r = Pin::new(&mut self.io).poll_read(cx, buf);
+        let n = (buf.filled().len() - before) as u64;
+        self.read.fetch_add(n, Ordering::Relaxed);
+        r
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for Counting<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
 }
 
 async fn caller(relay: &Relay, peer: &Peer, mut req: Request<Incoming>, rest: &str) -> Resp {
@@ -473,7 +556,7 @@ async fn caller(relay: &Relay, peer: &Peer, mut req: Request<Incoming>, rest: &s
                 "the machine did not answer in time",
             ),
         };
-        relay.audit().event(
+        relay.refusal(
             "caller_refused",
             [
                 ("machine", json!(machine)),
@@ -518,21 +601,28 @@ async fn caller(relay: &Relay, peer: &Peer, mut req: Request<Incoming>, rest: &s
             _ => return refuse(Refusal::Timeout),
         };
     let status = resp.status();
-    let agent = agent_of(&target);
+    let route = route_of(&target);
+    let agent = agent_of(&route);
     let resumed = parts.headers.contains_key(HEADER_LINK_ID);
     let link = header_str(resp.headers(), HEADER_LINK_ID).map(|l| short(&l));
     let client_name = header_str(&parts.headers, HEADER_CLIENT_NAME);
 
-    if status != StatusCode::SWITCHING_PROTOCOLS {
-        if agent.is_some() {
-            relay.audit().event(
-                "caller_answered",
-                [
-                    ("machine", json!(machine)),
-                    ("remote", json!(remote)),
-                    ("agent", json!(agent)),
-                    ("status", json!(status.as_u16())),
-                ],
+    if status != StatusCode::SWITCHING_PROTOCOLS || caller_upgrade.is_none() {
+        relay.audit().event(
+            "caller_answered",
+            [
+                ("machine", json!(machine)),
+                ("remote", json!(remote)),
+                ("route", json!(route)),
+                ("status", json!(status.as_u16())),
+            ],
+        );
+        if status == StatusCode::SWITCHING_PROTOCOLS {
+            // The caller asked for no upgrade: a machine has no business switching.
+            return error(
+                StatusCode::BAD_GATEWAY,
+                "bad_gateway",
+                "the machine switched protocols unasked",
             );
         }
         // The slot is held until the answer has been sent.
@@ -546,7 +636,7 @@ async fn caller(relay: &Relay, peer: &Peer, mut req: Request<Incoming>, rest: &s
 
     // A link: register the session (refused if the stop came meanwhile) and
     // pipe the two upgraded connections into each other.
-    let Some((session, cancel)) = relay.session_started(&machine) else {
+    let Some((session, cut)) = relay.session_started(&machine) else {
         return refuse(Refusal::Stopped);
     };
     relay.audit().event(
@@ -566,28 +656,29 @@ async fn caller(relay: &Relay, peer: &Peer, mut req: Request<Incoming>, rest: &s
     let mut out = Response::from_parts(rparts, full(Bytes::new()));
     strip_hop(out.headers_mut());
     let relay2 = relay.clone();
+    let caller_upgrade = caller_upgrade.expect("checked above");
     tokio::spawn(async move {
         let started = Instant::now();
-        let (a, b) = match (caller_upgrade, machine_upgrade) {
-            (Some(c), m) => (c.await, m.await),
-            (None, _) => {
-                relay2.session_ended(session);
-                return;
-            }
-        };
-        let mut reason = "closed";
-        let mut bytes = (0u64, 0u64);
-        if let (Ok(a), Ok(b)) = (a, b) {
-            let (mut a, mut b) = (TokioIo::new(a), TokioIo::new(b));
-            tokio::select! {
-                _ = cancel.cancelled() => reason = "org_stop",
-                r = tokio::io::copy_bidirectional(&mut a, &mut b) => {
-                    if let Ok(n) = r { bytes = n; } else { reason = "error"; }
+        let (to_machine, to_caller) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+        let reason = match (caller_upgrade.await, machine_upgrade.await) {
+            (Ok(a), Ok(b)) => {
+                let mut a = Counting {
+                    io: TokioIo::new(a),
+                    read: to_machine.clone(),
+                };
+                let mut b = Counting {
+                    io: TokioIo::new(b),
+                    read: to_caller.clone(),
+                };
+                tokio::select! {
+                    _ = cut.cancelled() => cut.why(),
+                    r = tokio::io::copy_bidirectional(&mut a, &mut b) => {
+                        if r.is_ok() { "closed" } else { "error" }
+                    }
                 }
             }
-        } else {
-            reason = "upgrade_failed";
-        }
+            _ => "upgrade_failed",
+        };
         drop(slot);
         relay2.session_ended(session);
         relay2.audit().event(
@@ -596,8 +687,11 @@ async fn caller(relay: &Relay, peer: &Peer, mut req: Request<Incoming>, rest: &s
                 ("session", json!(session)),
                 ("machine", json!(machine)),
                 ("seconds", json!(started.elapsed().as_secs())),
-                ("bytes_to_machine", json!(bytes.0)),
-                ("bytes_to_caller", json!(bytes.1)),
+                (
+                    "bytes_to_machine",
+                    json!(to_machine.load(Ordering::Relaxed)),
+                ),
+                ("bytes_to_caller", json!(to_caller.load(Ordering::Relaxed))),
                 ("reason", json!(reason)),
             ],
         );
@@ -622,7 +716,7 @@ async fn admin(relay: &Relay, peer: &Peer, req: Request<Incoming>, path: &str) -
         .map(str::trim)
         .unwrap_or("");
     let Some(by) = relay.admin(presented) else {
-        relay.audit().event(
+        relay.refusal(
             "admin_refused",
             [
                 ("remote", json!(peer.remote.to_string())),
@@ -673,7 +767,20 @@ async fn admin(relay: &Relay, peer: &Peer, req: Request<Incoming>, path: &str) -
             }
             if path == "/relay/v1/stop" {
                 let s = relay.stop(&by, &reason);
-                json_resp(StatusCode::OK, json!({ "stop": s }).to_string())
+                if s.saved {
+                    json_resp(StatusCode::OK, json!({ "stop": s.stop }).to_string())
+                } else {
+                    // The stop holds now, but a restart would lose it.
+                    json_resp(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({
+                            "error": "stop_not_saved",
+                            "message": "the stop is on, but stop.json could not be written: a restart before the relay manages to write it would lose the stop",
+                            "stop": s.stop,
+                        })
+                        .to_string(),
+                    )
+                }
             } else {
                 match relay.release(&by, &reason) {
                     Ok(s) => json_resp(StatusCode::OK, json!({ "stop": s }).to_string()),
@@ -719,10 +826,19 @@ mod tests {
         assert_eq!(split_target("a%2Fb/x", &u), None);
         assert_eq!(split_target("%2e%2e/x", &u), None);
         assert_eq!(split_target("", &u), None);
+    }
+
+    #[test]
+    fn audits_routes_as_the_machine_sees_them() {
         assert_eq!(
-            agent_of("/actp/v1/agents/claude/link?q"),
+            agent_of(&route_of("/actp/v1/agents/claude/link?q")),
             Some("claude".into())
         );
-        assert_eq!(agent_of("/api/v1/agents"), None);
+        assert_eq!(
+            agent_of(&route_of("/actp/v1/%61gents/cl%61ude/link")),
+            Some("claude".into())
+        );
+        assert_eq!(agent_of(&route_of("/api/v1/agents")), None);
+        assert_eq!(route_of("/api/v1/info?token=x"), "/api/v1/info");
     }
 }

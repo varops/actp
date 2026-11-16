@@ -84,7 +84,33 @@ async fn serve(path: PathBuf) -> Result<(), (i32, String)> {
         tokio::spawn(async move { relay.serve(listener, tls, stop).await })
     };
     tracing::info!(addr = %listen, version = VERSION, "actp relay listening");
-    shutdown_signal().await;
+    #[cfg(unix)]
+    let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .map_err(|e| fail(e.to_string()))?;
+    loop {
+        #[cfg(unix)]
+        let reload = hup.recv();
+        #[cfg(not(unix))]
+        let reload = std::future::pending::<Option<()>>();
+        tokio::select! {
+            _ = shutdown_signal() => break,
+            _ = reload => {
+                // Blocked machines, admin tokens, limits, device roots and CRLs.
+                match Config::load(&path).and_then(|c| {
+                    let tls = actp_relay::tls::server_config(&c).map_err(|e| e.to_string())?;
+                    Ok((c, tls))
+                }) {
+                    Ok((c, tls)) => {
+                        if c.listen != listen {
+                            tracing::warn!("a new listen address needs a restart");
+                        }
+                        relay.reload(c, tls);
+                    }
+                    Err(e) => tracing::error!(error = %e, "reload failed, keeping the old configuration"),
+                }
+            }
+        }
+    }
     tracing::info!("stopping");
     stop.cancel();
     let _ = task.await;

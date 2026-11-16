@@ -18,7 +18,15 @@ In relay mode, a machine does not listen for connections. It connects out to one
 - **It holds the org-wide stop.** One switch drops every session on every machine and refuses new ones until it is released. Machines are told, and end their sessions themselves too.
 - **It writes its half of the audit:** which caller connected to which machine, when and for how long, and every stop and release, with who and why. Ids, addresses, times and byte counts only, never what a session carries.
 
-The relay sees the traffic it routes, in plaintext. A compromised relay cannot get past a machine's checks with credentials it does not have, but it can read sessions and act inside a session a real caller opened. Host it like any other server that IT relies on.
+### What a compromised relay can do
+
+The relay sees the traffic it routes in plaintext, credentials included. Someone who controls the relay can therefore:
+
+- read every session, and act inside any session a real caller opened;
+- keep the credentials callers present and use them again, against any machine that accepts them, for as long as they stay valid. With actp tokens that is until the token is revoked, on every machine that has it;
+- send a caller to a different machine than the one it asked for, or answer as the machine itself, because the caller does not check which machine it reached.
+
+What it cannot do is get a machine to accept credentials the machine would refuse. Org mode narrows the reuse: Eunomia papers are bound to one machine and expire within minutes. Until callers check the machine end to end (an open question), host the relay like any other server IT relies on, and prefer org mode over shared actp tokens.
 
 ## The machine
 
@@ -27,15 +35,19 @@ Add a `relay` section to the server config. Nothing else changes: agents, worksp
 ```yaml
 server:
   relay:
-    url: wss://relay.example.com          # the relay, on port 443 unless the URL says otherwise
+    url: wss://relay.example.com          # the relay: wss://host[:port], no path
     cert: /etc/actp/device.pem            # the device certificate, leaf first, then intermediates
     key: /etc/actp/device.key
-    ca: /etc/actp/relay-ca.pem            # optional: roots for the relay's certificate (default: the OS store)
+    ca: /etc/actp/relay-ca.pem            # roots for the relay's certificate (default: the OS store)
   agents: …
   tokens: …
 ```
 
 `actp serve` then connects to the relay and keeps the connection up. After a drop it reconnects, waiting 1 s, then 2 s, and so on up to 30 s, with some jitter so a fleet does not reconnect in step. Sessions survive a drop as usual: the bridge reconnects through the relay and catches up.
+
+Set `ca` to the private CA that signs the relay's certificate. With the OS store, any publicly trusted certificate for the relay's hostname would be accepted as the relay.
+
+The machine checks what the relay tells it: the first message must be the hello, with a well-formed machine address, and the machine dials nothing but the configured relay URL. It opens at most 64 relayed connections at once.
 
 The device key is read from a PEM file. Keys that the OS keeps non-exportable (the macOS keychain, the Windows certificate store) need a signer that uses the key store; the `actp_server::relay` API takes any `rustls::ClientConfig`, so an embedding program can supply one.
 
@@ -53,6 +65,8 @@ blocked_machines: []                      # addresses refused even with a valid 
 state_dir: /var/lib/actp-relay            # stop.json, machines.json
 log_dir: /var/log/actp-relay              # audit.jsonl
 max_streams_per_machine: 32
+caller_rate: {per_second: 20, burst: 60}  # per caller IP, for /m/… and the management API
+audit_max_mb: 100                         # audit.jsonl is rotated at this size; ten old files are kept
 admin_tokens:
   - name: dave                            # recorded with every stop and release
     hash: sha256:…                        # from `actp-relay token create`
@@ -62,7 +76,11 @@ admin_tokens:
 actp-relay serve --config /etc/actp-relay/actp-relay.yaml
 ```
 
-The relay must terminate TLS itself: a TLS proxy in front of it would hide the device certificates.
+The relay must terminate TLS itself: a TLS proxy in front of it would hide the device certificates. It serves from the root path only.
+
+`SIGHUP` reloads the blocked machines, the admin tokens, the limits, the device roots and the revocation lists. A machine that is now blocked is cut off at once, with its sessions. The listen address and the folders need a restart.
+
+Any certificate under `device_ca` counts as a machine, so use roots that sign only device certificates, not ones that also sign user or Wi-Fi certificates. Revocation lists are checked for the device certificate itself, not its issuers, and a list past its next-update time no longer counts: every machine is then refused until a fresh list is in place and the relay reloads.
 
 A machine address has 1 to 253 characters: letters, digits and `.`, `-`, `_`, `@`, `:`, `+`, `~`. A certificate whose name does not fit, or that carries more than one name of the chosen kind, is refused. Addresses are compared exactly.
 
@@ -80,6 +98,11 @@ actp claude@https://relay.example.com/m/C02XK1ABJG5H --token-env ACTP_TOKEN
 | `503 org_stopped` | The org-wide stop is on. |
 | `429 machine_busy` | Too many callers are using the machine (`max_streams_per_machine`). |
 | `504 machine_timeout` | The machine did not open a stream or answer in time. |
+| `429 rate_limited` | Too many requests from this IP address (`caller_rate`). |
+
+The relay itself asks callers for nothing; the machine checks them. So anyone who can reach the relay can learn whether a machine of a given address is online, and can make machines do the work of opening a stream for each request, within `caller_rate`. Keep the relay off the open internet where the org can.
+
+A session ends at the relay when either side closes, when its machine's control connection is lost (the machine is offline), or on the org-wide stop. Idle TCP connections are probed with keepalives, so a laptop that vanishes mid-session is noticed within a few minutes.
 
 Anything else comes from the machine itself.
 
@@ -109,7 +132,7 @@ curl -X POST -H "Authorization: Bearer $ADMIN" -d '{"reason": "suspicious activi
 curl -X POST -H "Authorization: Bearer $ADMIN" -d '{"reason": "account secured"}' https://relay.example.com/relay/v1/release
 ```
 
-`GET /relay/v1/stop` shows the stop. A reason is required for both. The stop is written to `state_dir/stop.json` and survives a restart; if that file cannot be read, the relay starts with the stop on. A release is written before it takes effect, so a release that cannot be recorded does not happen.
+`GET /relay/v1/stop` shows the stop. A reason is required for both. The stop takes effect at once and is written to `state_dir/stop.json`, so it survives a restart; if that file cannot be read, the relay starts with the stop on. If the stop cannot be written, the answer is `500 stop_not_saved` (the stop still holds) and the relay keeps trying every few seconds. A release is written before it takes effect, so a release that cannot be recorded does not happen.
 
 ### Audit
 
@@ -118,15 +141,21 @@ curl -X POST -H "Authorization: Bearer $ADMIN" -d '{"reason": "account secured"}
 | Event | Fields |
 | --- | --- |
 | `machine_online`, `machine_replaced` | `machine`, `remote` |
-| `machine_offline` | `machine`, `seconds`, `reason` |
+| `machine_offline` | `machine`, `seconds`, `reason` (`closed`, `silent`, `replaced`, `blocked`, `relay stopping`, …) |
 | `machine_refused` | `remote`, `route`, `reason`, and `machine` when the certificate named one |
 | `session_open` | `session`, `machine`, `remote`, `agent`, `link` (first 8 characters), `resumed`, `client_name` |
-| `session_closed` | `session`, `machine`, `seconds`, `bytes_to_machine`, `bytes_to_caller`, `reason` |
-| `caller_answered` | `machine`, `remote`, `agent`, `status` (a link request the machine refused) |
+| `session_closed` | `session`, `machine`, `seconds`, `bytes_to_machine`, `bytes_to_caller`, `reason` (`closed`, `org_stop`, `machine_offline`, `blocked`, `relay_stopping`, `error`) |
+| `caller_answered` | `machine`, `remote`, `route` (the path as the machine routes it, without the query), `status`: every forwarded request that did not become a session |
 | `caller_refused` | `machine`, `remote`, `reason` |
+| `caller_rate_limited` | `remote` |
 | `org_stop` | `by`, `reason`, `sessions_dropped` |
+| `org_stop_not_saved`, `org_stop_saved` | `error` / nothing |
 | `org_release` | `by`, `reason` |
 | `admin_refused` | `remote`, `route` |
+| `config_reloaded` | `blocked_machines` |
+| `refusals_not_logged` | `kind`, `count` |
+
+Of each refusal kind (`caller_refused`, `caller_rate_limited`, `machine_refused`, `admin_refused`), at most 20 a minute are written; the rest are counted in `refusals_not_logged`.
 
 `client_name` is what the caller says about itself; the relay does not check it. The machine's own audit log records who the machine authenticated.
 

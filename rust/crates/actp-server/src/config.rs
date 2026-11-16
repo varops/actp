@@ -74,7 +74,7 @@ pub struct Tunnel {
 /// to it. Nothing listens on the machine. Not part of the Go server.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Relay {
-    /// `wss://host[:port][/prefix]`.
+    /// `wss://host[:port]`.
     pub url: String,
     /// The device certificate (PEM, leaf first, then any intermediates).
     pub cert: String,
@@ -532,8 +532,12 @@ impl Config {
                 errs.push("tls_cert and tls_key must be set together".into());
             }
             if let Some(r) = &s.relay {
-                if !r.url.starts_with("wss://") {
-                    errs.push("relay url must start with wss://".into());
+                match r.url.strip_prefix("wss://") {
+                    None => errs.push("relay url must start with wss://".into()),
+                    Some(rest) if rest.trim_end_matches('/').contains(['/', '?', '#']) => {
+                        errs.push("relay url is wss://host[:port], without a path".into())
+                    }
+                    Some(_) => {}
                 }
                 if r.cert.is_empty() || r.key.is_empty() {
                     errs.push(
@@ -1317,6 +1321,10 @@ remotes:
         assert!(r.ca.is_empty());
         for (bad, want) in [
             (base.replace("wss://", "https://"), "must start with wss://"),
+            (
+                base.replace("relay.example.com", "relay.example.com/acme"),
+                "without a path",
+            ),
             (
                 base.replace("    key: /d/device.key\n", ""),
                 "device certificate",
