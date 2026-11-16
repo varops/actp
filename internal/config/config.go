@@ -116,6 +116,9 @@ type Agent struct {
 	// KeepSessionMeta lists top-level _meta keys kept in session requests; the
 	// rest of _meta is dropped (design 3.3).
 	KeepSessionMeta []string `yaml:"keep_session_meta,omitempty"`
+	// AllowedModes lists the session modes a client may switch to; empty means
+	// the modes that keep permission prompts (design 3.3).
+	AllowedModes []string `yaml:"allowed_modes,omitempty"`
 }
 
 type Token struct {
@@ -340,6 +343,11 @@ func (c *Config) Validate() error {
 			}
 			if !oneOf(a.OnClientExit, "finish", "cancel") {
 				errs = append(errs, fmt.Errorf("agent %q: on_client_exit must be finish or cancel", a.ID))
+			}
+			// Claude's adapter reads SDK options and MCP servers from _meta.claudeCode,
+			// which would get around the folder, MCP and mode checks.
+			if oneOf("claudeCode", a.KeepSessionMeta...) {
+				errs = append(errs, fmt.Errorf("agent %q: keep_session_meta must not keep claudeCode: it carries agent options and MCP servers that bypass actp's checks", a.ID))
 			}
 		}
 		names := map[string]bool{}

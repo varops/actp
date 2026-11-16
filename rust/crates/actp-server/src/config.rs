@@ -90,6 +90,9 @@ pub struct Agent {
     pub max_unattended: Duration,
     /// Top-level `_meta` keys kept in session requests; the rest is dropped.
     pub keep_session_meta: Vec<String>,
+    /// Session modes a client may switch to; empty means the modes that keep
+    /// permission prompts (see [`crate::modes`]).
+    pub allowed_modes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -424,6 +427,11 @@ impl Config {
                         "agent {}: on_client_exit must be finish or cancel",
                         quote(&a.id)
                     ));
+                }
+                // Claude's adapter reads SDK options and MCP servers from _meta.claudeCode,
+                // which would get around the folder, MCP and mode checks.
+                if a.keep_session_meta.iter().any(|k| k == "claudeCode") {
+                    errs.push(format!("agent {}: keep_session_meta must not keep claudeCode: it carries agent options and MCP servers that bypass actp's checks", quote(&a.id)));
                 }
             }
             let mut names = std::collections::HashSet::new();
@@ -949,6 +957,7 @@ impl Decoder {
                 "on_client_exit" => a.on_client_exit = self.string(v, &k).unwrap_or_default(),
                 "max_unattended" => a.max_unattended = self.duration(v, &k).unwrap_or_default(),
                 "keep_session_meta" => a.keep_session_meta = self.strings(v, &k),
+                "allowed_modes" => a.allowed_modes = self.strings(v, &k),
                 _ => self.unknown(&k),
             }
         }
@@ -1341,6 +1350,20 @@ remotes:
             Duration::from_secs(600)
         );
         assert_eq!(c.server.as_ref().unwrap().shell_env, Some(false));
+    }
+
+    #[test]
+    fn keep_session_meta_refuses_claude_code() {
+        let c = Config::parse("server:\n  agents:\n    - id: a\n      command: x\n      keep_session_meta: [trace, claudeCode]\n      allowed_modes: [default]\n").unwrap();
+        assert_eq!(
+            c.server.as_ref().unwrap().agents[0].allowed_modes,
+            ["default"]
+        );
+        let e = c.validate().unwrap_err().0;
+        assert!(
+            e.contains("keep_session_meta must not keep claudeCode"),
+            "{e}"
+        );
     }
 
     #[test]

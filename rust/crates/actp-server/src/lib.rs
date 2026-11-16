@@ -20,6 +20,7 @@ mod fsutil;
 pub mod http;
 mod leftovers;
 mod link;
+pub mod modes;
 mod probe;
 pub mod rewrite;
 mod server;

@@ -30,6 +30,7 @@ fn bin(i: Impl) -> &'static Path {
 
 const TOKEN: &str = "actp_conformance_token";
 const OTHER_TOKEN: &str = "actp_conformance_other";
+const STRICT_TOKEN: &str = "actp_conformance_strict";
 const WAIT: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,9 +74,10 @@ impl Dirs {
 /// The server config: a scripted agent, a workspace, and two tokens.
 fn server_config(d: &Dirs, port: u16, tokens_in_file: bool) -> String {
     let tokens = format!(
-        "    - name: tester\n      hash: \"{}\"\n      agents: [\"*\"]\n      workspaces: [\"*\"]\n      default_workspace: site\n      map:\n        /client/repo: site\n    - name: limited\n      hash: \"{}\"\n      agents: [other]\n      workspaces: [site]\n",
+        "    - name: tester\n      hash: \"{}\"\n      agents: [\"*\"]\n      workspaces: [\"*\"]\n      default_workspace: site\n      map:\n        /client/repo: site\n    - name: limited\n      hash: \"{}\"\n      agents: [other]\n      workspaces: [site]\n    - name: strict\n      hash: \"{}\"\n      agents: [test]\n      workspaces: [site]\n      default_workspace: site\n      permissions: auto_deny\n",
         hash(TOKEN),
-        hash(OTHER_TOKEN)
+        hash(OTHER_TOKEN),
+        hash(STRICT_TOKEN)
     );
     let (inline, file) = if tokens_in_file {
         (String::new(), format!("tokens:\n{tokens}"))
@@ -907,6 +909,107 @@ async fn session_routes(bridge: Impl, server: Impl) {
     assert_eq!(c.exit().await.0, 0);
 }
 
+/// A client cannot switch a session into a mode that skips permission prompts:
+/// not with session/set_mode, not through the mode config option, not as an
+/// initial config option, and not by picking a mode in a permission answer.
+async fn session_modes(bridge: Impl, server: Impl) {
+    let s = ServerProc::start(server, "modes", false).await;
+    let mut c = Client::start(bridge, &s, s.port, "test", TOKEN, &[]).await;
+    c.initialize().await;
+    let sid = c.new_session("actp://site").await;
+    let refused = |n: i64, mode: &str| {
+        format!(
+            r#"{{"error":{{"code":-32602,"message":"mode not allowed: {mode}"}},"id":{n},"jsonrpc":"2.0"}}"#
+        )
+    };
+
+    let (raw, _) = c
+        .call(
+            "session/set_mode",
+            json!({"sessionId": sid, "modeId": "bypassPermissions"}),
+        )
+        .await;
+    assert_eq!(raw, refused(c.next_id, "bypassPermissions"));
+    let (raw, _) = c
+        .call(
+            "session/set_mode",
+            json!({"sessionId": sid, "modeId": "plan"}),
+        )
+        .await;
+    assert_eq!(
+        raw,
+        format!(r#"{{"id":{},"jsonrpc":"2.0","result":{{}}}}"#, c.next_id)
+    );
+    let (raw, _) = c
+        .call(
+            "session/set_config_option",
+            json!({"sessionId": sid, "configId": "mode", "value": "bypassPermissions"}),
+        )
+        .await;
+    assert_eq!(raw, refused(c.next_id, "bypassPermissions"));
+    let (raw, _) = c
+        .call(
+            "session/set_config_option",
+            json!({"sessionId": sid, "configId": "mode", "value": "somethingNew"}),
+        )
+        .await;
+    assert_eq!(raw, refused(c.next_id, "somethingNew"));
+    let (raw, _) = c.call("session/new", json!({"cwd": "actp://site", "mcpServers": [], "configOptions": [{"configId": "mode", "value": "bypassPermissions"}]})).await;
+    assert_eq!(raw, refused(c.next_id, "bypassPermissions"));
+
+    // Picking a mode option in a permission answer would switch the mode: cancelled instead.
+    let id = c.prompt(&sid, "exitplan").await;
+    let (_, req) = c
+        .wait("plan-exit permission", |v| {
+            v["method"] == "session/request_permission"
+        })
+        .await;
+    c.send(json!({"jsonrpc": "2.0", "id": req["id"], "result": {"outcome": {"outcome": "selected", "optionId": "bypassPermissions"}}})).await;
+    let text = chunk_text(&c.chunk("exitplan: ").await);
+    assert!(
+        text.contains(r#""outcome":"cancelled""#) && text.ends_with("mode: plan"),
+        "{text}"
+    );
+    c.response(id).await;
+    let id = c.prompt(&sid, "mode").await;
+    c.wait("mode reply", |v| {
+        v["method"] == "session/update" && chunk_text(v) == "mode: plan"
+    })
+    .await;
+    c.response(id).await;
+
+    // A token whose permissions are auto_deny cannot reach modes that skip prompts.
+    let mut strict = Client::start(bridge, &s, s.port, "test", STRICT_TOKEN, &[]).await;
+    strict.initialize().await;
+    let ssid = strict.new_session("actp://site").await;
+    let (raw, _) = strict
+        .call(
+            "session/set_mode",
+            json!({"sessionId": ssid, "modeId": "acceptEdits"}),
+        )
+        .await;
+    assert_eq!(raw, refused(strict.next_id, "acceptEdits"));
+    let (raw, _) = strict
+        .call(
+            "session/set_mode",
+            json!({"sessionId": ssid, "modeId": "plan"}),
+        )
+        .await;
+    assert_eq!(
+        raw,
+        format!(
+            r#"{{"id":{},"jsonrpc":"2.0","result":{{}}}}"#,
+            strict.next_id
+        )
+    );
+
+    assert!(s.audit().contains("\"event\":\"mode_refused\""));
+    for mut client in [c, strict] {
+        client.close_stdin();
+        assert_eq!(client.exit().await.0, 0);
+    }
+}
+
 async fn wait_until(what: &str, f: impl Fn() -> bool) {
     let deadline = tokio::time::Instant::now() + WAIT;
     while !f() {
@@ -949,6 +1052,7 @@ pairings!(drop_and_resume);
 pairings!(agent_crash);
 pairings!(ambiguous_envelope);
 pairings!(session_routes);
+pairings!(session_modes);
 #[cfg(unix)]
 pairings!(token_revoke);
 
