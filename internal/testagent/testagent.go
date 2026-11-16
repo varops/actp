@@ -11,6 +11,8 @@
 //	mcp             reply with the session MCP servers
 //	dirs            reply with the session additionalDirectories
 //	meta            reply with the session request's _meta
+//	mode            reply with the session mode
+//	exitplan        ask permission with mode options (like Claude's plan exit) and switch to the pick
 //	crash           exit with code 3
 //	burst-crash <n> send n chunks, then exit with code 4
 //	late-burst-crash <n>  like burst-crash, after 300 ms
@@ -40,6 +42,7 @@ type session struct {
 	MCPServers json.RawMessage `json:"mcpServers"`
 	Dirs       json.RawMessage `json:"additionalDirectories,omitempty"`
 	Meta       json.RawMessage `json:"_meta,omitempty"`
+	Mode       string          `json:"mode,omitempty"`
 	History    []string        `json:"history"`
 }
 
@@ -161,9 +164,18 @@ func (a *agent) handle(m *jsonrpc.Message) {
 			MCPServers json.RawMessage `json:"mcpServers"`
 			Dirs       json.RawMessage `json:"additionalDirectories"`
 			Meta       json.RawMessage `json:"_meta"`
+			Config     []struct {
+				ConfigID string `json:"configId"`
+				Value    string `json:"value"`
+			} `json:"configOptions"`
 		}
 		_ = json.Unmarshal(m.Params, &p)
-		s := &session{ID: p.SessionID, Cwd: p.Cwd, MCPServers: p.MCPServers, Dirs: p.Dirs, Meta: p.Meta}
+		s := &session{ID: p.SessionID, Cwd: p.Cwd, MCPServers: p.MCPServers, Dirs: p.Dirs, Meta: p.Meta, Mode: "default"}
+		for _, c := range p.Config {
+			if c.ConfigID == "mode" {
+				s.Mode = c.Value
+			}
+		}
 		if m.Method == "session/fork" {
 			if stored, err := a.load(p.SessionID); err == nil {
 				s.History = stored.History
@@ -188,10 +200,35 @@ func (a *agent) handle(m *jsonrpc.Message) {
 		a.sessions[s.ID] = s
 		a.mu.Unlock()
 		a.save(s)
+		result := map[string]any{"modes": modeState(s.Mode), "configOptions": modeOptions(s.Mode)}
 		if m.Method == "session/new" || m.Method == "session/fork" {
-			a.send(jsonrpc.NewResult(m.ID, map[string]any{"sessionId": s.ID}))
-		} else {
+			result["sessionId"] = s.ID
+		}
+		a.send(jsonrpc.NewResult(m.ID, result))
+	case "session/set_mode", "session/set_config_option":
+		var p struct {
+			SessionID string `json:"sessionId"`
+			ModeID    string `json:"modeId"`
+			ConfigID  string `json:"configId"`
+			Value     string `json:"value"`
+		}
+		_ = json.Unmarshal(m.Params, &p)
+		a.mu.Lock()
+		s := a.sessions[p.SessionID]
+		if s != nil && m.Method == "session/set_mode" {
+			s.Mode = p.ModeID
+		} else if s != nil && p.ConfigID == "mode" {
+			s.Mode = p.Value
+		}
+		a.mu.Unlock()
+		if s == nil {
+			a.send(jsonrpc.NewError(m.ID, jsonrpc.CodeInvalidParams, "unknown session", nil))
+			return
+		}
+		if m.Method == "session/set_mode" {
 			a.send(jsonrpc.NewResult(m.ID, map[string]any{}))
+		} else {
+			a.send(jsonrpc.NewResult(m.ID, map[string]any{"configOptions": modeOptions(s.Mode)}))
 		}
 	case "session/list":
 		entries, _ := os.ReadDir(a.store)
@@ -285,6 +322,38 @@ func (a *agent) prompt(m *jsonrpc.Message) {
 		reply(s.Cwd)
 	case "mcp":
 		reply(string(s.MCPServers))
+	case "mode":
+		a.mu.Lock()
+		mode := s.Mode
+		a.mu.Unlock()
+		reply("mode: " + mode)
+	case "exitplan":
+		resp := a.request("session/request_permission", map[string]any{
+			"sessionId": s.ID,
+			"toolCall":  map[string]any{"toolCallId": "plan", "title": "Ready to code?"},
+			"options": []any{
+				map[string]any{"optionId": "bypassPermissions", "name": "Yes, and bypass permissions", "kind": "allow_always"},
+				map[string]any{"optionId": "acceptEdits", "name": "Yes, and auto-accept edits", "kind": "allow_always"},
+				map[string]any{"optionId": "default", "name": "Yes, and manually approve edits", "kind": "allow_once"},
+				map[string]any{"optionId": "plan", "name": "No, keep planning", "kind": "reject_once"},
+			},
+		}, cancel)
+		var r struct {
+			Outcome struct {
+				Outcome  string `json:"outcome"`
+				OptionID string `json:"optionId"`
+			} `json:"outcome"`
+		}
+		if resp != nil && resp.Error == nil {
+			_ = json.Unmarshal(resp.Result, &r)
+		}
+		a.mu.Lock()
+		if r.Outcome.Outcome == "selected" {
+			s.Mode = r.Outcome.OptionID
+		}
+		mode := s.Mode
+		a.mu.Unlock()
+		reply("exitplan: " + describe(resp) + ", mode: " + mode)
 	case "dirs":
 		reply("dirs: " + string(s.Dirs))
 	case "meta":
@@ -380,4 +449,22 @@ func (a *agent) load(id string) (*session, error) {
 	}
 	var s session
 	return &s, json.Unmarshal(data, &s)
+}
+
+var testModes = []string{"default", "acceptEdits", "plan", "bypassPermissions"}
+
+func modeState(current string) map[string]any {
+	modes := make([]any, len(testModes))
+	for i, id := range testModes {
+		modes[i] = map[string]any{"id": id, "name": id}
+	}
+	return map[string]any{"currentModeId": current, "availableModes": modes}
+}
+
+func modeOptions(current string) []any {
+	opts := make([]any, len(testModes))
+	for i, id := range testModes {
+		opts[i] = map[string]any{"value": id, "name": id}
+	}
+	return []any{map[string]any{"id": "mode", "name": "Mode", "category": "mode", "type": "select", "currentValue": current, "options": opts}}
 }

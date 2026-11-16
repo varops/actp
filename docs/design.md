@@ -143,7 +143,8 @@ server:
       max_links: 16
       on_client_exit: finish      # finish | cancel (section 3.1)
       max_unattended: 1h          # longest a turn may run after its client left
-      keep_session_meta: []       # _meta keys kept in session requests (default: drop all of _meta)
+      keep_session_meta: []       # _meta keys kept in session requests (default: drop all of _meta; never claudeCode)
+      allowed_modes: []           # session modes a client may pick (default: the ones that keep prompts, section 3.3)
     - id: codex
       preset: codex
     - id: my-agent
@@ -307,6 +308,8 @@ Paths are cleaned and symlinks resolved before the check. Responses carry the cl
 **Additional folders.** Every entry of `additionalDirectories` in those requests goes through the same rules (without the `cwd_fallback`, so an unknown folder never becomes the default workspace) and is rewritten to the server path. If any entry is not allowed, the whole request gets `invalidParams` with `additional directory not allowed: <path>`.
 
 **Session `_meta`.** Agents read `_meta` in session requests as options (Claude's adapter takes SDK options and extra MCP servers from it), which would get around the checks here. So the server drops `_meta` from the requests above, except for the top-level keys an agent lists in `keep_session_meta`.
+
+**Session modes.** Some agent modes turn permission prompts off (Claude's `bypassPermissions`), which would make the permission policy and the human approval step meaningless. A client may only switch a session to a mode the agent's `allowed_modes` lists; when it lists none, `default`, `plan`, `dontAsk`, `acceptEdits` and `auto`. Unknown mode ids are refused. When the token's effective permissions are `auto_deny`, `acceptEdits`, `auto` and `bypassPermissions` are always refused: they approve what actp would deny. The check covers `session/set_mode`, `session/set_config_option` on a mode option (`mode`, or any option the agent reported with category `mode`), and mode entries in `configOptions` of session setup requests; refusals get `invalidParams` with `mode not allowed: <mode>` and are audited (`mode_refused`). A client's answer to a permission request that picks one of the agent's modes as its option (Claude's plan-mode exit offers "bypass permissions") is replaced with `cancelled` when that mode is not allowed. `keep_session_meta` cannot keep `claudeCode`: Claude's adapter reads agent options and MCP servers from it, which would get around these checks.
 
 **Unknown session methods.** A `session/*` method actp does not know is forwarded only when it carries none of `cwd`, `additionalDirectories`, `mcpServers` and `_meta`; otherwise a request gets `-32600` and a notification is dropped (default deny). Known methods without folders (`session/prompt`, `session/cancel`, `session/close`, `session/set_mode`, `session/set_model`, `session/set_config_option`, `session/status`, `session/set_title`, `session/delete`, `session/archive`, `session/unarchive`) pass through.
 

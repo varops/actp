@@ -75,6 +75,10 @@ struct LinkState {
     tomb: Option<Tombstone>,
     finalized: bool,
     last_busy: Option<Instant>,
+    /// Config options that select the session mode.
+    mode_options: HashSet<String>,
+    /// Mode ids the agent offers.
+    offered_modes: HashSet<String>,
 }
 
 pub(crate) struct Link {
@@ -147,6 +151,8 @@ impl Link {
                     tomb: None,
                     finalized: false,
                     last_busy: None,
+                    mode_options: HashSet::new(),
+                    offered_modes: HashSet::new(),
                 }),
                 ended: watch::channel(false).0,
                 drained: watch::channel(false).0,
@@ -292,10 +298,41 @@ impl Link {
         };
         match m.kind() {
             Kind::Response => {
-                let known = self.st().agent_reqs.remove(&m.id_key()).is_some();
-                if known {
-                    self.write_agent(&m).await;
-                } // else: a late answer to a request already settled
+                let (known, mode) = {
+                    let mut st = self.st();
+                    let req = st.agent_reqs.remove(&m.id_key());
+                    let mode = req
+                        .as_ref()
+                        .filter(|r| r.method == "session/request_permission")
+                        .and_then(|_| {
+                            crate::modes::permission_picks_mode(
+                                m.result.as_deref(),
+                                &st.offered_modes,
+                            )
+                        });
+                    (req.is_some(), mode)
+                };
+                if !known {
+                    return; // a late answer to a request already settled
+                }
+                if let Some(mode) =
+                    mode.filter(|mode| !crate::modes::mode_allowed(&self.agent, &self.token, mode))
+                {
+                    // Picking a mode in a permission answer switches the session to it.
+                    self.srv.audit().event(
+                        "mode_refused",
+                        [
+                            ("link", sv(short(&self.id))),
+                            ("mode", sv(&mode)),
+                            ("via", sv("permission")),
+                        ],
+                    );
+                    let id = m.id.clone().unwrap_or_default();
+                    self.write_agent(&jsonrpc::new_result(&id, cancelled_outcome()))
+                        .await;
+                    return;
+                }
+                self.write_agent(&m).await;
             }
             Kind::Notification => {
                 let p = gojson::decode_raw_map(m.params.as_deref()).unwrap_or(None);
@@ -467,6 +504,41 @@ impl Link {
             )));
         }
 
+        let modes = {
+            let st = self.st();
+            crate::modes::requested_modes(&m.method, &p, |id| {
+                id == "mode" || st.mode_options.contains(id)
+            })
+        };
+        let refused = match modes {
+            Err(msg) => Some((msg.to_string(), String::new())),
+            Ok(modes) => modes
+                .into_iter()
+                .find(|mode| !crate::modes::mode_allowed(&self.agent, &self.token, mode))
+                .map(|mode| (format!("mode not allowed: {mode}"), mode)),
+        };
+        if let Some((msg, mode)) = refused {
+            if mode.is_empty() {
+                self.srv.audit().event(
+                    "mode_refused",
+                    [("link", sv(short(&self.id))), ("method", sv(&m.method))],
+                );
+            } else {
+                self.srv.audit().event(
+                    "mode_refused",
+                    [
+                        ("link", sv(short(&self.id))),
+                        ("method", sv(&m.method)),
+                        ("mode", sv(&mode)),
+                    ],
+                );
+            }
+            return Err(Box::new(jsonrpc::new_error(
+                &id,
+                jsonrpc::CODE_INVALID_PARAMS,
+                &msg,
+            )));
+        }
         self.st().client_reqs.insert(m.id_key(), req);
         if !changed {
             return Ok(m);
@@ -648,7 +720,27 @@ impl Link {
                     return out;
                 }
             }
+            "session/set_config_option" | "session/options" => {
+                if m.error.is_none() {
+                    let mut st = self.st();
+                    let st = &mut *st;
+                    crate::modes::learn_modes(
+                        m.result.as_deref(),
+                        &mut st.mode_options,
+                        &mut st.offered_modes,
+                    );
+                }
+            }
             "session/new" | "session/load" | "session/resume" | "session/fork" => {
+                if m.error.is_none() {
+                    let mut st = self.st();
+                    let st = &mut *st;
+                    crate::modes::learn_modes(
+                        m.result.as_deref(),
+                        &mut st.mode_options,
+                        &mut st.offered_modes,
+                    );
+                }
                 if let Some(e) = &m.error {
                     if is_auth_error(e) {
                         self.srv.mark_auth_required(&self.agent.id, &e.message);

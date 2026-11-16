@@ -69,6 +69,8 @@ type Link struct {
 	stateSince      time.Time
 	protocolVersion int
 	canClose        bool
+	modeOptions     map[string]bool // config options that select the session mode
+	offeredModes    map[string]bool // mode ids the agent offers
 	clientReqs      map[string]clientReq
 	agentReqs       map[string]agentReq
 	sessions        map[string]*linkSession
@@ -116,6 +118,7 @@ func (s *Server) startLink(agent *config.Agent, tok *config.Token, clientName st
 		state: StateDetached, stateSince: time.Now(),
 		clientReqs: map[string]clientReq{}, agentReqs: map[string]agentReq{},
 		sessions: map[string]*linkSession{}, serverReqs: map[string]bool{},
+		modeOptions: map[string]bool{}, offeredModes: map[string]bool{},
 		ended: make(chan struct{}), drained: make(chan struct{}),
 	}
 	wopts := s.opts.Wire
@@ -241,11 +244,20 @@ func (l *Link) fromClient(raw json.RawMessage) error {
 	switch m.Kind() {
 	case jsonrpc.KindResponse:
 		l.mu.Lock()
-		_, ok := l.agentReqs[m.IDKey()]
+		ar, ok := l.agentReqs[m.IDKey()]
 		delete(l.agentReqs, m.IDKey())
+		var mode string
+		if ok && ar.method == "session/request_permission" {
+			mode = permissionPicksMode(m.Result, l.offeredModes)
+		}
 		l.mu.Unlock()
 		if !ok {
 			return nil // a late answer to a request already settled
+		}
+		if mode != "" && !modeAllowed(l.agent, &l.token, mode) {
+			// Picking a mode in a permission answer switches the session to it.
+			l.srv.audit.event("mode_refused", map[string]any{"link": l.id[:8], "mode": mode, "via": "permission"})
+			m = jsonrpc.NewResult(m.ID, map[string]any{"outcome": map[string]any{"outcome": "cancelled"}})
 		}
 		l.writeAgent(m)
 	case jsonrpc.KindNotification:
@@ -354,6 +366,20 @@ func (l *Link) rewriteClientRequest(m *jsonrpc.Message) (*jsonrpc.Message, *json
 		if field := uncheckedSessionField(m.Method, p); field != "" {
 			l.srv.audit.event("session_method_refused", map[string]any{"link": l.id[:8], "method": m.Method, "field": field})
 			return nil, jsonrpc.NewError(m.ID, jsonrpc.CodeInvalidRequest, uncheckedSessionMessage(m.Method, field), nil)
+		}
+	}
+
+	l.mu.Lock()
+	modes, err := requestedModes(m.Method, p, func(id string) bool { return id == "mode" || l.modeOptions[id] })
+	l.mu.Unlock()
+	if err != nil {
+		l.srv.audit.event("mode_refused", map[string]any{"link": l.id[:8], "method": m.Method})
+		return nil, jsonrpc.NewError(m.ID, jsonrpc.CodeInvalidParams, err.Error(), nil)
+	}
+	for _, mode := range modes {
+		if !modeAllowed(l.agent, &l.token, mode) {
+			l.srv.audit.event("mode_refused", map[string]any{"link": l.id[:8], "method": m.Method, "mode": mode})
+			return nil, jsonrpc.NewError(m.ID, jsonrpc.CodeInvalidParams, "mode not allowed: "+mode, nil)
 		}
 	}
 
@@ -509,7 +535,18 @@ func (l *Link) afterResponse(req clientReq, m *jsonrpc.Message) *jsonrpc.Message
 				return out
 			}
 		}
+	case "session/set_config_option", "session/options":
+		if m.Error == nil {
+			l.mu.Lock()
+			learnModes(m.Result, l.modeOptions, l.offeredModes)
+			l.mu.Unlock()
+		}
 	case "session/new", "session/load", "session/resume", "session/fork":
+		if m.Error == nil {
+			l.mu.Lock()
+			learnModes(m.Result, l.modeOptions, l.offeredModes)
+			l.mu.Unlock()
+		}
 		if m.Error != nil {
 			if isAuthError(m.Error) {
 				l.srv.markAuthRequired(l.agent.ID, m.Error.Message)

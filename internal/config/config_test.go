@@ -117,3 +117,13 @@ func TestParseByteSize(t *testing.T) {
 		t.Error("expected error")
 	}
 }
+
+func TestKeepSessionMetaRefusesClaudeCode(t *testing.T) {
+	cfg, err := Parse([]byte("server:\n  agents:\n    - id: a\n      command: x\n      keep_session_meta: [trace, claudeCode]\n      allowed_modes: [default]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "keep_session_meta must not keep claudeCode") {
+		t.Fatalf("got %v", err)
+	}
+}
