@@ -64,6 +64,9 @@ pub(crate) struct State {
     /// agent id + "\0" + session id → the link holding it.
     pub sessions: HashMap<String, Arc<Link>>,
     pub status: HashMap<String, AgentStatus>,
+    /// Links being started (agent id, token name), counted against the limits.
+    pub slots: HashMap<u64, (String, String)>,
+    pub next_slot: u64,
 }
 
 pub(crate) struct Inner {
@@ -211,6 +214,8 @@ impl Server {
                     links: HashMap::new(),
                     sessions: HashMap::new(),
                     status,
+                    slots: HashMap::new(),
+                    next_slot: 0,
                 }),
                 pids_closed: Mutex::new(false),
                 opts,
@@ -474,17 +479,21 @@ impl Server {
                 resumed: true,
             });
         }
-        if let Some(msg) = self.over_limit(&agent.id, &tok.name, agent.max_links, tok.max_links) {
-            return Err(Rejection {
-                retry_after: Some(30),
-                ..Rejection::new(429, "too_many_links", msg)
-            });
-        }
+        let slot = match self.reserve_link(&agent.id, &tok.name, agent.max_links, tok.max_links) {
+            Ok(slot) => slot,
+            Err(msg) => {
+                return Err(Rejection {
+                    retry_after: Some(30),
+                    ..Rejection::new(429, "too_many_links", msg)
+                });
+            }
+        };
         match self
             .start_link(
                 agent,
                 tok.clone(),
                 req.client_name.clone().unwrap_or_default(),
+                slot,
             )
             .await
         {
@@ -497,15 +506,26 @@ impl Server {
         }
     }
 
-    fn over_limit(
+    /// Checks the limits and holds a slot in the same step, so parallel requests
+    /// cannot all pass the check before any of their links exists. The slot is
+    /// given back when the link is in place, or when it is dropped.
+    fn reserve_link(
         &self,
         agent_id: &str,
         token_name: &str,
         agent_max: i64,
         token_max: i64,
-    ) -> Option<String> {
-        let st = self.st();
+    ) -> Result<Slot, String> {
+        let mut st = self.st();
         let (mut per_agent, mut per_token) = (0i64, 0i64);
+        for (agent, token) in st.slots.values() {
+            if agent == agent_id {
+                per_agent += 1;
+            }
+            if token == token_name {
+                per_token += 1;
+            }
+        }
         for l in st.links.values() {
             if l.is_ended() {
                 continue; // ended links waiting for their client hold no agent process
@@ -518,12 +538,19 @@ impl Server {
             }
         }
         if per_agent >= agent_max {
-            Some(format!("agent {agent_id} has reached its link limit"))
-        } else if per_token >= token_max {
-            Some("this token has reached its link limit".into())
-        } else {
-            None
+            return Err(format!("agent {agent_id} has reached its link limit"));
         }
+        if per_token >= token_max {
+            return Err("this token has reached its link limit".into());
+        }
+        st.next_slot += 1;
+        let id = st.next_slot;
+        st.slots
+            .insert(id, (agent_id.to_string(), token_name.to_string()));
+        Ok(Slot {
+            srv: self.clone(),
+            id,
+        })
     }
 
     /// Starts an agent process for a new link.
@@ -532,6 +559,7 @@ impl Server {
         agent: config::Agent,
         tok: Token,
         client_name: String,
+        slot: Slot,
     ) -> Result<Arc<Link>, String> {
         let cfg = self.config();
         let mut dir = crate::rewrite::home_dir();
@@ -567,7 +595,13 @@ impl Server {
         let mut wopts = self.inner.opts.wire.clone();
         wopts.spool_path = Some(self.spool_dir().join(format!("{id}.spool")));
         let link = Link::new(self.clone(), id, agent, tok, client_name, proc, wopts);
-        self.st().links.insert(link.id.clone(), link.clone());
+        {
+            // The link takes the slot's place in one step.
+            let mut st = self.st();
+            st.links.insert(link.id.clone(), link.clone());
+            st.slots.remove(&slot.id);
+        }
+        drop(slot);
         crate::leftovers::record_pids(self);
         link.started();
         Ok(link)
@@ -622,6 +656,18 @@ impl Server {
         deliver: actp_proto::Deliver,
     ) -> Endpoint {
         Endpoint::new(opts, deliver)
+    }
+}
+
+/// A place under the link limits, held while an agent starts.
+struct Slot {
+    srv: Server,
+    id: u64,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.srv.st().slots.remove(&self.id);
     }
 }
 

@@ -114,7 +114,8 @@ func (s *Server) OpenLink(w http.ResponseWriter, r *http.Request, agentID api.Ag
 			lastSeq = *params.ActpLastSeq
 		}
 	} else {
-		if msg := s.overLimit(agentID, tok.Name, agent.MaxLinks, tok.MaxLinks); msg != "" {
+		slot, msg := s.reserveLink(agentID, tok.Name, agent.MaxLinks, tok.MaxLinks)
+		if msg != "" {
 			w.Header().Set("Retry-After", "30")
 			writeError(w, http.StatusTooManyRequests, "too_many_links", msg)
 			return
@@ -124,7 +125,7 @@ func (s *Server) OpenLink(w http.ResponseWriter, r *http.Request, agentID api.Ag
 			clientName = *params.ActpClientName
 		}
 		var err error
-		link, err = s.startLink(agent, tok, clientName)
+		link, err = s.startLink(agent, tok, clientName, slot)
 		if err != nil {
 			writeError(w, http.StatusServiceUnavailable, "agent_unavailable", err.Error())
 			return
@@ -161,10 +162,34 @@ func offersVersion(headers []string) bool {
 	return false
 }
 
-func (s *Server) overLimit(agentID, tokenName string, agentMax, tokenMax int) string {
+// linkSlot holds a place under the link limits while an agent starts.
+type linkSlot struct{ agent, token string }
+
+// reserveLink checks the limits and holds a slot in the same step, so parallel
+// requests cannot all pass the check before any of their links exists.
+// startLink turns the slot into a link or gives it back.
+func (s *Server) reserveLink(agentID, tokenName string, agentMax, tokenMax int) (*linkSlot, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if msg := s.overLimitLocked(agentID, tokenName, agentMax, tokenMax); msg != "" {
+		return nil, msg
+	}
+	slot := &linkSlot{agent: agentID, token: tokenName}
+	s.slots[slot] = true
+	return slot, ""
+}
+
+// overLimitLocked counts open links and reserved slots; the caller holds mu.
+func (s *Server) overLimitLocked(agentID, tokenName string, agentMax, tokenMax int) string {
 	perAgent, perToken := 0, 0
+	for slot := range s.slots {
+		if slot.agent == agentID {
+			perAgent++
+		}
+		if slot.token == tokenName {
+			perToken++
+		}
+	}
 	for _, l := range s.links {
 		if l.ended != nil && isClosed(l.ended) {
 			continue // ended links waiting for their client hold no agent process

@@ -1033,3 +1033,28 @@ async fn server_close_ends_links_with_server_shutdown() {
         "a clean stop leaves no state file"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn link_limit_holds_under_parallel_upgrades() {
+    let e = env(|s| s.agents[0].max_links = 1).await;
+    let port = e.port;
+    let attempts = (0..8).map(|_| async move {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut req = format!("ws://127.0.0.1:{port}/actp/v1/agents/test/link")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("Authorization", format!("Bearer {TOKEN}").parse().unwrap());
+        req.headers_mut()
+            .insert("Sec-WebSocket-Protocol", "actp.v1".parse().unwrap());
+        match tokio_tungstenite::connect_async(req).await {
+            Ok((ws, _)) => Ok(ws),
+            Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => Err(resp.status().as_u16()),
+            Err(other) => panic!("dial: {other}"),
+        }
+    });
+    let results = futures_util::future::join_all(attempts).await;
+    let opened = results.iter().filter(|r| r.is_ok()).count();
+    let refused = results.iter().filter(|r| matches!(r, Err(429))).count();
+    assert_eq!((opened, refused), (1, 7), "max_links 1");
+}

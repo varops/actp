@@ -14,6 +14,7 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/varops/actp/internal/bridge"
+	"github.com/varops/actp/internal/config"
 	"github.com/varops/actp/internal/jsonrpc"
 	"github.com/varops/actp/internal/wire"
 )
@@ -240,4 +241,44 @@ func TestIdleCloseCountsFromWhenTheTurnEnded(t *testing.T) {
 		}
 		return false
 	})
+}
+
+func TestLinkLimitHoldsUnderParallelUpgrades(t *testing.T) {
+	e := newEnv(t, func(s *config.Server) { s.Agents[0].MaxLinks = 1 })
+	u, _ := bridge.LinkURL(e.http.URL, "test")
+	const n = 8
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	opened, refused := 0, 0
+	var conns []*websocket.Conn
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			h := http.Header{}
+			h.Set("Authorization", "Bearer "+testToken)
+			<-start
+			conn, resp, err := websocket.Dial(context.Background(), u, &websocket.DialOptions{HTTPHeader: h, Subprotocols: wire.Versions})
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				opened++
+				conns = append(conns, conn)
+			case resp != nil && resp.StatusCode == http.StatusTooManyRequests:
+				refused++
+			default:
+				t.Errorf("dial: %v", err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	for _, c := range conns {
+		_ = c.CloseNow()
+	}
+	if opened != 1 || refused != n-1 {
+		t.Fatalf("max_links 1: %d links opened, %d refused", opened, refused)
+	}
 }

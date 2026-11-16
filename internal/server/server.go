@@ -49,7 +49,8 @@ type Server struct {
 
 	mu       sync.Mutex
 	links    map[string]*Link
-	sessions map[string]*Link // agentID + "\x00" + sessionId → link holding it
+	sessions map[string]*Link   // agentID + "\x00" + sessionId → link holding it
+	slots    map[*linkSlot]bool // links being started, counted against the limits
 	status   map[string]*agentStatus
 
 	// pidMu orders state-file writes; after Close, pidsClosed stops them.
@@ -84,6 +85,7 @@ func New(cfg *config.Server, opts Options) (*Server, error) {
 		stop:     stop,
 		links:    map[string]*Link{},
 		sessions: map[string]*Link{},
+		slots:    map[*linkSlot]bool{},
 		status:   map[string]*agentStatus{},
 	}
 	s.cfg.Store(cfg)
