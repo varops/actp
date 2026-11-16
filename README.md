@@ -26,7 +26,7 @@ ACTP lets any [ACP](https://agentclientprotocol.com) client – an app, a bot, a
 
 - **Plain ACP on both ends.** Clients and agents do not know actp is there.
 - **Connections that survive drops.** A closed lid or a Wi-Fi change does not stop the agent. The bridge reconnects and catches up without losing or repeating a message.
-- **Tokens per client**, limited to the agents and folders you choose, and revocable at any time.
+- **Tokens per client**, limited to the agents and folders you choose. Revoke one at any time: it can no longer connect or resume a dropped connection, though a connection already open runs until it closes.
 - **Safe defaults.** Agents only start in folders you allow. Files, terminals and local MCP servers stay on the agent's machine.
 - **A menu bar app** for macOS (and tray builds for Linux and Windows) with a dashboard, so you do not need to edit config files.
 - **Built-in Cloudflare tunnel** for machines without a public address.
