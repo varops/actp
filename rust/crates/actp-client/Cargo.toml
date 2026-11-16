@@ -1,0 +1,18 @@
+[package]
+name = "actp-client"
+description = "The actp bridge as a library: stdio ACP passthrough to a remote actp server, with reconnect and catch-up"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+actp-proto.workspace = true
+rand.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true

@@ -167,6 +167,7 @@ ACP messages pass through unchanged, except for these. Build your client with th
 - **MCP servers.** By default the server drops `stdio` entries and `http`/`sse` entries that point at `localhost`: they would run on, or point at, the server machine.
 - **Permissions** may be answered by the server's policy (`auto_allow`, `auto_deny`) without reaching you.
 - **Terminal login hints** (`_meta.terminal-auth` in `authMethods`) are removed: a login has to happen on the server machine.
+- **One spelling per envelope field.** A message with a key that differs from `jsonrpc`, `id`, `method`, `params`, `result` or `error` only in case, or with one of them twice, is refused and never forwarded: a request with a usable `id` gets `-32600`, anything else is dropped. A message with an `id` key and a `method` is a request, even when the id is `null`.
 - **Loading a session that is still running elsewhere** (for example on a link your app left behind when it crashed) returns `-32000` `session still running on the agent host`. The old link is marked unattended; retry after its turn ends.
 - `$/cancel_request` and extension methods (`_x.ai/*`, `elicitation/create`, …) pass through in both directions. If the agent cancels a request it sent you, remove the prompt from your UI.
 

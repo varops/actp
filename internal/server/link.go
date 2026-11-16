@@ -90,7 +90,7 @@ func newID() string {
 }
 
 // startLink starts an agent process for a new link.
-func (s *Server) startLink(agent *config.Agent, tok *config.Token, clientName string) (*Link, error) {
+func (s *Server) startLink(agent *config.Agent, tok *config.Token, clientName string, slot *linkSlot) (*Link, error) {
 	dir := homeDir()
 	if ws := s.conf().Workspace(tok.DefaultWorkspace); ws != nil {
 		dir = ws.Path
@@ -104,6 +104,9 @@ func (s *Server) startLink(agent *config.Agent, tok *config.Token, clientName st
 		BaseEnv: s.opts.BaseEnv, Env: agent.Env, EnvRemove: agent.EnvRemove,
 	})
 	if err != nil {
+		s.mu.Lock()
+		delete(s.slots, slot)
+		s.mu.Unlock()
 		s.setStatus(agent.ID, func(st *agentStatus) { st.Status, st.Error = string(api.Unavailable), err.Error() })
 		return nil, fmt.Errorf("agent %s did not start: %w", agent.ID, err)
 	}
@@ -120,6 +123,7 @@ func (s *Server) startLink(agent *config.Agent, tok *config.Token, clientName st
 	l.ep = wire.NewEndpoint(wopts, l.fromClient)
 	s.mu.Lock()
 	s.links[l.id] = l
+	delete(s.slots, slot) // the link now counts in its place
 	s.mu.Unlock()
 	s.recordPIDs()
 	s.audit.event("link_opened", map[string]any{"link": l.id[:8], "agent": agent.ID, "token": tok.Name, "client": clientName})
@@ -223,6 +227,12 @@ func (l *Link) writeAgent(m *jsonrpc.Message) {
 
 // fromClient handles one ACP message from the bridge, in order.
 func (l *Link) fromClient(raw json.RawMessage) error {
+	if err := jsonrpc.CheckEnvelope(raw); err != nil {
+		if reply := l.refuseAmbiguous(err, "client"); reply != nil {
+			l.toClient(reply)
+		}
+		return nil
+	}
 	m, err := jsonrpc.Parse(raw)
 	if err != nil {
 		l.logf("dropped invalid message from client", "error", err.Error())
@@ -291,6 +301,10 @@ func (l *Link) rewriteClientRequest(m *jsonrpc.Message) (*jsonrpc.Message, *json
 			p["mcpServers"] = kept
 			changed = true
 		}
+		// Policy was applied here: forward the re-encoded message, never the original bytes.
+		if p != nil {
+			changed = true
+		}
 		if (m.Method == "session/load" || m.Method == "session/resume") && req.sessionID != "" {
 			if other := l.srv.sessionHolder(l.agent.ID, req.sessionID); other != nil && other != l {
 				if other.token.Name == l.token.Name {
@@ -324,6 +338,23 @@ func (l *Link) rewriteClientRequest(m *jsonrpc.Message) (*jsonrpc.Message, *json
 	return out, nil
 }
 
+// refuseAmbiguous handles a message whose envelope two decoders could read
+// differently (one key in two spellings, or twice): actp would route it by one
+// reading and the peer act on the other, skipping the rewrites. It is never
+// forwarded. A request with a usable id gets an error; anything else is dropped.
+func (l *Link) refuseAmbiguous(err error, from string) *jsonrpc.Message {
+	var a *jsonrpc.Ambiguous
+	if !errors.As(err, &a) {
+		return nil
+	}
+	l.logf("refused an ambiguous message", "from", from, "reason", a.Reason)
+	l.srv.audit.event("message_refused", map[string]any{"link": l.id[:8], "from": from, "reason": a.Reason})
+	if a.Request && a.ID != nil {
+		return jsonrpc.NewError(a.ID, jsonrpc.CodeInvalidRequest, "invalid request: "+a.Error(), nil)
+	}
+	return nil
+}
+
 // readAgent handles the agent's output until it exits.
 func (l *Link) readAgent() {
 	rd := jsonrpc.NewReader(l.proc.Stdout)
@@ -338,6 +369,12 @@ func (l *Link) readAgent() {
 				l.logf("reading agent failed", "error", err.Error())
 			}
 			break
+		}
+		if err := jsonrpc.CheckEnvelope(raw); err != nil {
+			if reply := l.refuseAmbiguous(err, "agent"); reply != nil {
+				l.writeAgent(reply)
+			}
+			continue
 		}
 		l.fromAgent(m)
 	}

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 )
 
@@ -66,15 +67,85 @@ func Parse(raw []byte) (*Message, error) {
 		return nil, err
 	}
 	m := &Message{Raw: compact(raw), Method: h.Method, Params: h.Params, Result: h.Result, Error: h.Error}
+	// An id key makes a message with a method a request, even with a null id:
+	// that is how agents (for example the ACP TypeScript SDK) read it.
 	if h.ID != nil && !bytes.Equal(h.ID, []byte("null")) {
 		m.ID = compact(h.ID)
-	} else if h.ID != nil && h.Method == "" {
+	} else if h.ID != nil {
 		m.ID = json.RawMessage("null")
 	}
 	if m.Method == "" && m.ID == nil {
 		return nil, errors.New("not a JSON-RPC message: no method and no id")
 	}
 	return m, nil
+}
+
+// envelopeKeys are the JSON-RPC fields actp routes and rewrites by.
+var envelopeKeys = []string{"jsonrpc", "id", "method", "params", "result", "error"}
+
+// Ambiguous is a message whose envelope two JSON decoders can read differently.
+type Ambiguous struct {
+	Reason string
+	// ID is the message's id when it has exactly one non-null "id" key, else nil.
+	ID json.RawMessage
+	// Request reports whether a method key is present in any spelling.
+	Request bool
+}
+
+func (a *Ambiguous) Error() string { return "ambiguous JSON-RPC envelope: " + a.Reason }
+
+// CheckEnvelope refuses a message that Go's decoding (case-insensitive keys,
+// last one wins) and a peer's exact-key decoding could read differently: a key
+// that differs from an envelope field only in case, or an envelope field given
+// twice. Messages that are not JSON objects are left to Parse.
+func CheckEnvelope(raw []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return nil
+	}
+	seen := map[string]int{}
+	var ids []json.RawMessage
+	a := &Ambiguous{}
+	for dec.More() {
+		kt, err := dec.Token()
+		if err != nil {
+			return nil
+		}
+		key, _ := kt.(string)
+		var val json.RawMessage
+		if err := dec.Decode(&val); err != nil {
+			return nil
+		}
+		for _, name := range envelopeKeys {
+			if !strings.EqualFold(key, name) {
+				continue
+			}
+			if name == "method" {
+				a.Request = true
+			}
+			switch {
+			case key != name:
+				if a.Reason == "" {
+					a.Reason = fmt.Sprintf("key %q differs from %q only in case", key, name)
+				}
+			default:
+				seen[name]++
+				if name == "id" {
+					ids = append(ids, val)
+				}
+				if seen[name] == 2 && a.Reason == "" {
+					a.Reason = fmt.Sprintf("key %q appears more than once", name)
+				}
+			}
+		}
+	}
+	if a.Reason == "" {
+		return nil
+	}
+	if len(ids) == 1 && !bytes.Equal(bytes.TrimSpace(ids[0]), []byte("null")) {
+		a.ID = compact(ids[0])
+	}
+	return a
 }
 
 func compact(raw []byte) json.RawMessage {
