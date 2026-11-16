@@ -66,6 +66,8 @@ state_dir: /var/lib/actp-relay            # stop.json, machines.json
 log_dir: /var/log/actp-relay              # audit.jsonl
 max_streams_per_machine: 32
 caller_rate: {per_second: 20, burst: 60}  # per caller IP, for /m/… and the management API
+max_connections: 20000                    # connections held at once
+max_connections_per_ip: 1000              # per IP address: an office behind one NAT address counts as one
 audit_max_mb: 100                         # audit.jsonl is rotated at this size; ten old files are kept
 admin_tokens:
   - name: dave                            # recorded with every stop and release
@@ -78,9 +80,13 @@ actp-relay serve --config /etc/actp-relay/actp-relay.yaml
 
 The relay must terminate TLS itself: a TLS proxy in front of it would hide the device certificates. It serves from the root path only.
 
-`SIGHUP` reloads the blocked machines, the admin tokens, the limits, the device roots and the revocation lists. A machine that is now blocked is cut off at once, with its sessions. The listen address and the folders need a restart.
+`SIGHUP` reloads the blocked machines, the admin tokens, the rate limits, the device roots and the revocation lists. The listen address, the folders, `audit_max_mb` and the connection limits need a restart.
 
-Any certificate under `device_ca` counts as a machine, so use roots that sign only device certificates, not ones that also sign user or Wi-Fi certificates. Revocation lists are checked for the device certificate itself, not its issuers, and a list past its next-update time no longer counts: every machine is then refused until a fresh list is in place and the relay reloads.
+Device certificates are checked again, not only when a machine connects. The relay checks a machine's certificate against the roots and revocation lists in force on every request it makes, on every reload, and every ten seconds. A machine that is now blocked, or whose certificate has expired or been revoked, is cut off at once with its sessions, and cannot come back. TLS sessions are never resumed, so a reconnect always presents the certificate again.
+
+With `machine_name: uri`, only URIs without a path work as addresses (`urn:device:1234`, not `spiffe://acme/dev/1`), because an address cannot contain `/`.
+
+Any certificate under `device_ca` counts as a machine, so use roots that sign only device certificates, not ones that also sign user or Wi-Fi certificates. Revocation lists are checked for the device certificate itself, not its issuers, and a list past its next-update time no longer counts: every machine is then refused and cut off until a fresh list is in place and the relay reloads.
 
 A machine address has 1 to 253 characters: letters, digits and `.`, `-`, `_`, `@`, `:`, `+`, `~`. A certificate whose name does not fit, or that carries more than one name of the chosen kind, is refused. Addresses are compared exactly.
 
@@ -100,9 +106,9 @@ actp claude@https://relay.example.com/m/C02XK1ABJG5H --token-env ACTP_TOKEN
 | `504 machine_timeout` | The machine did not open a stream or answer in time. |
 | `429 rate_limited` | Too many requests from this IP address (`caller_rate`). |
 
-The relay itself asks callers for nothing; the machine checks them. So anyone who can reach the relay can learn whether a machine of a given address is online, and can make machines do the work of opening a stream for each request, within `caller_rate`. Keep the relay off the open internet where the org can.
+The relay itself asks callers for nothing; the machine checks them. So anyone who can reach the relay can learn whether a machine of a given address is online, and can make machines do the work of opening a stream for each request, within `caller_rate`. `caller_rate` and `max_connections_per_ip` count per IP address, so callers behind one NAT address share them. Keep the relay off the open internet where the org can.
 
-A session ends at the relay when either side closes, when its machine's control connection is lost (the machine is offline), or on the org-wide stop. Idle TCP connections are probed with keepalives, so a laptop that vanishes mid-session is noticed within a few minutes.
+A session ends at the relay when either side closes, when its machine's control connection is lost (the machine is offline), when the machine is blocked or its certificate stops being valid, or on the org-wide stop. Idle TCP connections are probed with keepalives, so a laptop that vanishes mid-session is noticed within a few minutes.
 
 Anything else comes from the machine itself.
 
@@ -132,7 +138,9 @@ curl -X POST -H "Authorization: Bearer $ADMIN" -d '{"reason": "suspicious activi
 curl -X POST -H "Authorization: Bearer $ADMIN" -d '{"reason": "account secured"}' https://relay.example.com/relay/v1/release
 ```
 
-`GET /relay/v1/stop` shows the stop. A reason is required for both. The stop takes effect at once and is written to `state_dir/stop.json`, so it survives a restart; if that file cannot be read, the relay starts with the stop on. If the stop cannot be written, the answer is `500 stop_not_saved` (the stop still holds) and the relay keeps trying every few seconds. A release is written before it takes effect, so a release that cannot be recorded does not happen.
+`GET /relay/v1/stop` shows the stop. A reason is required for both. The stop takes effect at once and is written to `state_dir/stop.json`, so it survives a restart; if that file cannot be read, the relay starts with the stop on. If the stop cannot be written, the answer is `500 stop_not_saved` (the stop still holds) and the relay keeps trying every few seconds. A release is written before it takes effect, so a release that cannot be recorded does not happen (`500 not_released`).
+
+Keep `state_dir` with the relay: a relay that starts without its `stop.json` knows of no stop, and its hello releases the stop on every machine that connects.
 
 ### Audit
 
@@ -141,21 +149,23 @@ curl -X POST -H "Authorization: Bearer $ADMIN" -d '{"reason": "account secured"}
 | Event | Fields |
 | --- | --- |
 | `machine_online`, `machine_replaced` | `machine`, `remote` |
-| `machine_offline` | `machine`, `seconds`, `reason` (`closed`, `silent`, `replaced`, `blocked`, `relay stopping`, …) |
+| `machine_offline` | `machine`, `seconds`, `reason` (`closed`, `silent`, `blocked`, `certificate_invalid`, `relay stopping`, …) |
 | `machine_refused` | `remote`, `route`, `reason`, and `machine` when the certificate named one |
 | `session_open` | `session`, `machine`, `remote`, `agent`, `link` (first 8 characters), `resumed`, `client_name` |
-| `session_closed` | `session`, `machine`, `seconds`, `bytes_to_machine`, `bytes_to_caller`, `reason` (`closed`, `org_stop`, `machine_offline`, `blocked`, `relay_stopping`, `error`) |
-| `caller_answered` | `machine`, `remote`, `route` (the path as the machine routes it, without the query), `status`: every forwarded request that did not become a session |
+| `session_closed` | `session`, `machine`, `seconds`, `bytes_to_machine`, `bytes_to_caller`, `reason` (`closed`, `org_stop`, `machine_offline`, `blocked`, `certificate_invalid`, `relay_stopping`, `error`, `upgrade_failed`) |
+| `caller_answered` | `machine`, `remote`, `route` (the path as the machine routes it, without the query), `status`: every forwarded request that did not become a session (throttled like a refusal when the machine refused it) |
 | `caller_refused` | `machine`, `remote`, `reason` |
 | `caller_rate_limited` | `remote` |
 | `org_stop` | `by`, `reason`, `sessions_dropped` |
 | `org_stop_not_saved`, `org_stop_saved` | `error` / nothing |
 | `org_release` | `by`, `reason` |
 | `admin_refused` | `remote`, `route` |
-| `config_reloaded` | `blocked_machines` |
+| `config_reloaded` | `blocked_machines`, `machines_cut` |
 | `refusals_not_logged` | `kind`, `count` |
 
-Of each refusal kind (`caller_refused`, `caller_rate_limited`, `machine_refused`, `admin_refused`), at most 20 a minute are written; the rest are counted in `refusals_not_logged`.
+Of each refusal kind (`caller_refused`, `caller_rate_limited`, `machine_refused`, `admin_refused`, and `caller_answered` with a status of 400 or more), at most 20 a minute are written; the rest are counted in `refusals_not_logged`.
+
+The stop's own events (`org_stop`, `org_release`, `org_stop_not_saved`, `org_stop_saved`) are also written to `log_dir/org_stops.jsonl`, which is never rotated, so no flood of other events can push them out.
 
 `client_name` is what the caller says about itself; the relay does not check it. The machine's own audit log records who the machine authenticated.
 
@@ -164,7 +174,7 @@ Of each refusal kind (`caller_refused`, `caller_rate_limited`, `machine_refused`
 Between a machine and the relay (`actp_proto::relay`):
 
 1. The machine opens `wss://<relay>/relay/v1/connect` with its device certificate and the WebSocket subprotocol `actp-relay.v1`. The relay answers with `{"type":"hello","machine":"<address>","stopped":<bool>}` and pings every 15 s; the machine pings every 20 s. Either side drops a connection that stays silent too long.
-2. When a caller arrives, the relay sends `{"type":"open","stream":"<64 hex>"}`. The machine opens `wss://<relay>/relay/v1/stream/<id>` with its certificate and subprotocol `actp-relay-stream.v1`. Only the machine that was asked can take the stream. Binary messages on it carry the caller's HTTP connection byte for byte, and the machine serves it like any other connection.
-3. `{"type":"stop"}` and `{"type":"release"}` carry the org-wide stop. While it is on, the machine ends every link and refuses new ones and resumes with `503 org_stopped`, whatever the relay does next.
+2. When a caller arrives, the relay sends `{"type":"open","stream":"<64 hex>"}`. The machine opens `wss://<relay>/relay/v1/stream/<id>` with its certificate and subprotocol `actp-relay-stream.v1`. Only the machine that was asked can take the stream. Binary messages on it carry the caller's HTTP connection byte for byte, and the machine serves it like any other connection. Closing the stream closes both directions: a half-closed connection is not kept half open.
+3. `{"type":"stop"}` and `{"type":"release"}` carry the org-wide stop, and so does the hello's `stopped`. While it is on, the machine ends every link and refuses new links and resumes with `503 org_stopped`, even if the relay goes on routing callers to it.
 
 Unknown message types are ignored, so a newer relay can add messages.
