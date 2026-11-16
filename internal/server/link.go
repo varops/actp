@@ -69,8 +69,9 @@ type Link struct {
 	stateSince      time.Time
 	protocolVersion int
 	canClose        bool
-	modeOptions     map[string]bool // config options that select the session mode
-	offeredModes    map[string]bool // mode ids the agent offers
+	held            map[string][]*jsonrpc.Message // client messages for sessions whose starting mode is being checked
+	modeOptions     map[string]bool               // config options that select the session mode
+	offeredModes    map[string]bool               // mode ids the agent offers
 	clientReqs      map[string]clientReq
 	agentReqs       map[string]agentReq
 	sessions        map[string]*linkSession
@@ -119,6 +120,7 @@ func (s *Server) startLink(agent *config.Agent, tok *config.Token, clientName st
 		clientReqs: map[string]clientReq{}, agentReqs: map[string]agentReq{},
 		sessions: map[string]*linkSession{}, serverReqs: map[string]func(*jsonrpc.Message){},
 		modeOptions: map[string]bool{}, offeredModes: map[string]bool{},
+		held:  map[string][]*jsonrpc.Message{},
 		ended: make(chan struct{}), drained: make(chan struct{}),
 	}
 	wopts := s.opts.Wire
@@ -241,6 +243,25 @@ func (l *Link) fromClient(raw json.RawMessage) error {
 		l.logf("dropped invalid message from client", "error", err.Error())
 		return nil
 	}
+	// A message for a session whose starting mode is still being checked waits
+	// until the check is done, so it never reaches the agent in the refused mode.
+	if m.Kind() != jsonrpc.KindResponse {
+		if sid := paramsSessionID(m); sid != "" {
+			l.mu.Lock()
+			if queue, ok := l.held[sid]; ok {
+				l.held[sid] = append(queue, m)
+				l.mu.Unlock()
+				return nil
+			}
+			l.mu.Unlock()
+		}
+	}
+	l.handleClient(m)
+	return nil
+}
+
+// handleClient handles one parsed client message (fromClient after the checks).
+func (l *Link) handleClient(m *jsonrpc.Message) {
 	switch m.Kind() {
 	case jsonrpc.KindResponse:
 		l.mu.Lock()
@@ -252,7 +273,7 @@ func (l *Link) fromClient(raw json.RawMessage) error {
 		}
 		l.mu.Unlock()
 		if !ok {
-			return nil // a late answer to a request already settled
+			return // a late answer to a request already settled
 		}
 		if mode != "" && !modeAllowed(l.agent, &l.token, mode) {
 			// Picking a mode in a permission answer switches the session to it.
@@ -266,18 +287,75 @@ func (l *Link) fromClient(raw json.RawMessage) error {
 		if field := uncheckedSessionField(m.Method, p); field != "" {
 			l.logf("dropped a notification actp cannot check", "method", m.Method, "field", field)
 			l.srv.audit.event("session_method_refused", map[string]any{"link": l.id[:8], "method": m.Method, "field": field})
-			return nil
+			return
 		}
 		l.writeAgent(m)
 	case jsonrpc.KindRequest:
+		// actp's own requests to the agent use ids starting with actp-; a client
+		// id like that could be mistaken for one of them.
+		var id string
+		if json.Unmarshal(m.ID, &id) == nil && strings.HasPrefix(id, "actp-") {
+			l.srv.audit.event("id_refused", map[string]any{"link": l.id[:8], "method": m.Method})
+			l.toClient(jsonrpc.NewError(m.ID, jsonrpc.CodeInvalidRequest, `invalid request: ids starting with "actp-" are reserved for actp`, nil))
+			return
+		}
 		out, reply := l.rewriteClientRequest(m)
 		if reply != nil {
 			l.toClient(reply)
-			return nil
+			return
+		}
+		// Until the agent's answer is through the starting-mode check, the
+		// client's next requests for this session wait (the load may switch the
+		// session to a mode from the workspace settings).
+		if m.Method == "session/load" || m.Method == "session/resume" {
+			if sid := paramsSessionID(m); sid != "" {
+				l.queueSession(sid)
+			}
 		}
 		l.writeAgent(out)
 	}
-	return nil
+}
+
+// paramsSessionID is the sessionId a client message names, if any.
+func paramsSessionID(m *jsonrpc.Message) string {
+	var p struct {
+		SessionID string `json:"sessionId"`
+	}
+	_ = json.Unmarshal(m.Params, &p)
+	return p.SessionID
+}
+
+// queueSession starts queueing client messages for a session.
+func (l *Link) queueSession(sessionID string) {
+	l.mu.Lock()
+	if _, ok := l.held[sessionID]; !ok {
+		l.held[sessionID] = []*jsonrpc.Message{}
+	}
+	l.mu.Unlock()
+}
+
+// releaseHeld lets a session's queued client messages through, in order. With
+// a refusal, queued requests get it as their answer and notifications are dropped.
+func (l *Link) releaseHeld(sessionID string, refusal *jsonrpc.Error) {
+	for {
+		l.mu.Lock()
+		queue := l.held[sessionID]
+		if len(queue) == 0 {
+			delete(l.held, sessionID)
+			l.mu.Unlock()
+			return
+		}
+		l.held[sessionID] = []*jsonrpc.Message{}
+		l.mu.Unlock()
+		for _, m := range queue {
+			switch {
+			case refusal == nil:
+				l.handleClient(m)
+			case m.Kind() == jsonrpc.KindRequest:
+				l.toClient(jsonrpc.NewError(m.ID, refusal.Code, refusal.Message, nil))
+			}
+		}
+	}
 }
 
 // Session methods by how they treat folders (design 3.3). The ones that create,
@@ -476,6 +554,9 @@ func (l *Link) fromAgent(m *jsonrpc.Message) {
 		}
 		if m != nil { // nil: held until actp's own request is answered
 			l.toClient(m)
+			if req.method == "session/load" || req.method == "session/resume" {
+				l.releaseHeld(req.sessionID, nil)
+			}
 		}
 	case jsonrpc.KindRequest:
 		if reply := l.answerAgentRequest(m); reply != nil {
@@ -628,7 +709,9 @@ func (l *Link) checkStartingMode(m *jsonrpc.Message, sessionID string) *jsonrpc.
 		if canClose {
 			l.serverRequest("session/close", map[string]any{"sessionId": sessionID})
 		}
-		l.toClient(jsonrpc.NewError(m.ID, jsonrpc.CodeServerError, fmt.Sprintf("session refused: it starts in mode %s, which is not allowed here, and could not be switched to an allowed mode", bad), nil))
+		refusal := &jsonrpc.Error{Code: jsonrpc.CodeServerError, Message: fmt.Sprintf("session refused: it starts in mode %s, which is not allowed here, and could not be switched to an allowed mode", bad)}
+		l.toClient(jsonrpc.NewError(m.ID, refusal.Code, refusal.Message, nil))
+		l.releaseHeld(sessionID, refusal)
 	}
 	target := resetTarget(offered, allowed)
 	if target == "" {
@@ -636,7 +719,8 @@ func (l *Link) checkStartingMode(m *jsonrpc.Message, sessionID string) *jsonrpc.
 		return nil
 	}
 	l.srv.audit.event("mode_reset", map[string]any{"link": l.id[:8], "session": sessionID, "from": bad, "to": target})
-	l.serverRequestThen("session/set_mode", map[string]any{"sessionId": sessionID, "modeId": target}, func(answer *jsonrpc.Message) {
+	l.queueSession(sessionID)
+	reqID := l.serverRequestThen("session/set_mode", map[string]any{"sessionId": sessionID, "modeId": target}, func(answer *jsonrpc.Message) {
 		if answer.Error != nil {
 			refuse("the agent refused the switch: " + answer.Error.Message)
 			return
@@ -652,6 +736,17 @@ func (l *Link) checkStartingMode(m *jsonrpc.Message, sessionID string) *jsonrpc.
 			return
 		}
 		l.toClient(out)
+		l.releaseHeld(sessionID, nil)
+	})
+	// An agent that never answers the switch must not hold the session forever.
+	time.AfterFunc(l.srv.opts.ModeResetTimeout, func() {
+		l.mu.Lock()
+		_, waiting := l.serverReqs[reqID]
+		delete(l.serverReqs, reqID)
+		l.mu.Unlock()
+		if waiting {
+			refuse("the agent did not answer the switch in time")
+		}
 	})
 	return nil
 }
@@ -789,15 +884,19 @@ func (l *Link) serverRequest(method string, params any) {
 
 // serverRequestThen is serverRequest with a func that gets the agent's answer,
 // on the goroutine that reads the agent.
-func (l *Link) serverRequestThen(method string, params any, answer func(*jsonrpc.Message)) {
+// It returns the request's id key.
+func (l *Link) serverRequestThen(method string, params any, answer func(*jsonrpc.Message)) string {
 	l.mu.Lock()
 	l.nextServerReq++
-	id := json.RawMessage(fmt.Sprintf(`"actp-%d"`, l.nextServerReq))
+	// Client ids starting with actp- are refused; the random part also keeps
+	// these ids from being guessed.
+	id := json.RawMessage(fmt.Sprintf(`"actp-%d-%s"`, l.nextServerReq, newID()[:16]))
 	l.serverReqs[string(id)] = answer
 	l.mu.Unlock()
 	if m, err := jsonrpc.NewRequest(id, method, params); err == nil {
 		l.writeAgent(m)
 	}
+	return string(id)
 }
 
 func (l *Link) cancelRunningTurns() {

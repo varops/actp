@@ -85,6 +85,7 @@ async fn env(adjust: impl FnOnce(&mut actp_server::config::Server)) -> Env {
             base_env: Some(actp_server::agentproc::os_environ()),
             wire: fast_wire(),
             tick: Duration::from_millis(20),
+            mode_reset_timeout: Duration::from_secs(1),
             ..Default::default()
         },
     )
@@ -1057,4 +1058,87 @@ async fn link_limit_holds_under_parallel_upgrades() {
     let opened = results.iter().filter(|r| r.is_ok()).count();
     let refused = results.iter().filter(|r| matches!(r, Err(429))).count();
     assert_eq!((opened, refused), (1, 7), "max_links 1");
+}
+
+/// A workspace sub folder with agent project settings, as Claude Code reads
+/// them from `.claude/settings.json`.
+fn write_settings(e: &Env, dir: &str, body: &str) -> String {
+    let d = std::path::Path::new(&e.site).join(dir).join(".claude");
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("settings.json"), body).unwrap();
+    format!("actp://site/{dir}")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn starting_mode_reset_times_out() {
+    let e = env(|_| {}).await; // mode_reset_timeout: 1s
+    let cwd = write_settings(
+        &e,
+        "silent",
+        r#"{"permissions":{"defaultMode":"bypass"},"actpTest":{"ignoreSetMode":true}}"#,
+    );
+    let mut c = e.bridge();
+    c.initialize().await;
+    let start = std::time::Instant::now();
+    let r = c
+        .call("session/new", json!({"cwd": cwd, "mcpServers": []}))
+        .await;
+    assert!(
+        r.error.as_ref().is_some_and(|e| e
+            .message
+            .starts_with("session refused: it starts in mode bypassPermissions")),
+        "{}",
+        r.raw
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "refusal took {:?}",
+        start.elapsed()
+    );
+    assert!(e.audit_has("mode_reset_failed"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn requests_wait_for_the_starting_mode_check() {
+    let e = env(|_| {}).await;
+    let cwd = write_settings(
+        &e,
+        "slow",
+        r#"{"permissions":{"defaultMode":"bypass"},"actpTest":{"setModeDelayMs":300}}"#,
+    );
+    let mut c = e.bridge();
+    c.initialize().await;
+    let sid = c.new_session(&cwd).await;
+    // Load the session again and prompt it at once: the prompt must wait until
+    // the starting mode has been switched.
+    c.request(
+        "session/load",
+        json!({"sessionId": sid, "cwd": cwd, "mcpServers": []}),
+    )
+    .await;
+    let id = c.prompt(&sid, "mode").await;
+    c.response(&id).await;
+    c.chunk("mode: default").await;
+    assert!(
+        !c.chunks().iter().any(|t| t == "mode: bypassPermissions"),
+        "a request reached the agent in the refused mode"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn actp_ids_are_reserved() {
+    let e = env(|_| {}).await;
+    let mut c = e.bridge();
+    c.initialize().await;
+    c.send_raw(r#"{"jsonrpc":"2.0","id":"actp-7","method":"session/list","params":{}}"#)
+        .await;
+    let r = c.response("\"actp-7\"").await;
+    let err = r.error.unwrap();
+    assert_eq!(
+        (err.code, err.message.as_str()),
+        (
+            -32600,
+            "invalid request: ids starting with \"actp-\" are reserved for actp"
+        )
+    );
 }

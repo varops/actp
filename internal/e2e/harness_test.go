@@ -104,7 +104,7 @@ server:
 		t.Fatal(err)
 	}
 	srv, err := server.New(cfg.Server, server.Options{
-		Version: "test", BaseEnv: os.Environ(), Wire: fastWire, Tick: 20 * time.Millisecond,
+		Version: "test", BaseEnv: os.Environ(), Wire: fastWire, Tick: 20 * time.Millisecond, ModeResetTimeout: time.Second,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {

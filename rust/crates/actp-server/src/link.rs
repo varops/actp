@@ -76,6 +76,8 @@ struct LinkState {
     tomb: Option<Tombstone>,
     finalized: bool,
     last_busy: Option<Instant>,
+    /// Client messages for sessions whose starting mode is being checked.
+    held: HashMap<String, Vec<Message>>,
     /// Config options that select the session mode.
     mode_options: HashSet<String>,
     /// Mode ids the agent offers.
@@ -152,6 +154,7 @@ impl Link {
                     tomb: None,
                     finalized: false,
                     last_busy: None,
+                    held: HashMap::new(),
                     mode_options: HashSet::new(),
                     offered_modes: HashSet::new(),
                 }),
@@ -297,6 +300,24 @@ impl Link {
                 return;
             }
         };
+        // A message for a session whose starting mode is still being checked
+        // waits until the check is done, so it never reaches the agent in the
+        // refused mode.
+        if m.kind() != Kind::Response {
+            let sid = params_session_id(&m);
+            if !sid.is_empty() {
+                let mut st = self.st();
+                if let Some(queue) = st.held.get_mut(&sid) {
+                    queue.push(m);
+                    return;
+                }
+            }
+        }
+        self.handle_client(m).await;
+    }
+
+    /// Handles one parsed client message (`from_client` after the checks).
+    async fn handle_client(self: &Arc<Self>, m: Message) {
         match m.kind() {
             Kind::Response => {
                 let (known, mode) = {
@@ -351,10 +372,77 @@ impl Link {
                 }
                 self.write_agent(&m).await
             }
-            Kind::Request => match self.rewrite_client_request(m).await {
-                Ok(out) => self.write_agent(&out).await,
-                Err(reply) => self.to_client(&reply),
-            },
+            Kind::Request => {
+                // actp's own requests to the agent use ids starting with actp-;
+                // a client id like that could be mistaken for one of them.
+                if m.id
+                    .as_deref()
+                    .and_then(|id| gojson::decode_string(id).ok().flatten())
+                    .is_some_and(|id| id.starts_with("actp-"))
+                {
+                    self.srv.audit().event(
+                        "id_refused",
+                        [("link", sv(short(&self.id))), ("method", sv(&m.method))],
+                    );
+                    let id = m.id.clone().unwrap_or_default();
+                    self.to_client(&jsonrpc::new_error(
+                        &id,
+                        jsonrpc::CODE_INVALID_REQUEST,
+                        "invalid request: ids starting with \"actp-\" are reserved for actp",
+                    ));
+                    return;
+                }
+                let load = (m.method == "session/load" || m.method == "session/resume")
+                    .then(|| params_session_id(&m))
+                    .filter(|s| !s.is_empty());
+                match self.rewrite_client_request(m).await {
+                    Ok(out) => {
+                        // Until the agent's answer is through the starting-mode check,
+                        // the client's next requests for this session wait (the load
+                        // may switch the session to a mode from the workspace settings).
+                        if let Some(sid) = load {
+                            self.queue_session(&sid);
+                        }
+                        self.write_agent(&out).await
+                    }
+                    Err(reply) => self.to_client(&reply),
+                }
+            }
+        }
+    }
+
+    /// Starts queueing client messages for a session.
+    fn queue_session(&self, sid: &str) {
+        self.st().held.entry(sid.to_string()).or_default();
+    }
+
+    /// Lets a session's queued client messages through, in order. With a
+    /// refusal, queued requests get it as their answer and notifications are dropped.
+    async fn release_held(self: &Arc<Self>, sid: &str, refusal: Option<&(i64, String)>) {
+        loop {
+            let queue = {
+                let mut st = self.st();
+                match st.held.get_mut(sid) {
+                    Some(q) if !q.is_empty() => std::mem::take(q),
+                    _ => {
+                        st.held.remove(sid);
+                        return;
+                    }
+                }
+            };
+            for m in queue {
+                match refusal {
+                    None => self.handle_client(m).await,
+                    Some((code, msg)) if m.kind() == Kind::Request => {
+                        self.to_client(&jsonrpc::new_error(
+                            &m.id.clone().unwrap_or_default(),
+                            *code,
+                            msg,
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            }
         }
     }
 
@@ -637,6 +725,10 @@ impl Link {
                     }
                     st.client_reqs.remove(&m.id_key())
                 };
+                let load = req
+                    .as_ref()
+                    .filter(|r| r.method == "session/load" || r.method == "session/resume")
+                    .map(|r| r.session_id.clone());
                 let out = match req {
                     Some(req) => {
                         let (out, opened) = self.after_response(req, m);
@@ -650,6 +742,9 @@ impl Link {
                 // None: held until the agent answers actp's own request.
                 if let Some(out) = out {
                     self.to_client(&out);
+                    if let Some(sid) = load {
+                        self.release_held(&sid, None).await;
+                    }
                 }
             }
             Kind::Request => match self.answer_agent_request(&m) {
@@ -883,7 +978,7 @@ impl Link {
         let id = {
             let mut st = self.st();
             st.next_server_req += 1;
-            let id = format!("\"actp-{}\"", st.next_server_req);
+            let id = server_req_id(st.next_server_req);
             st.server_reqs.insert(id.clone(), None);
             id
         };
@@ -896,18 +991,18 @@ impl Link {
         &self,
         method: &str,
         params: GoValue,
-    ) -> tokio::sync::oneshot::Receiver<Message> {
+    ) -> (String, tokio::sync::oneshot::Receiver<Message>) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let id = {
             let mut st = self.st();
             st.next_server_req += 1;
-            let id = format!("\"actp-{}\"", st.next_server_req);
+            let id = server_req_id(st.next_server_req);
             st.server_reqs.insert(id.clone(), Some(tx));
             id
         };
         self.write_agent(&jsonrpc::new_request(&id, method, params))
             .await;
-        rx
+        (id, rx)
     }
 
     /// Makes sure a session does not start in a refused mode. An agent can pick
@@ -936,15 +1031,30 @@ impl Link {
                 ("to", sv(&target)),
             ],
         );
-        let rx = self
+        self.queue_session(&sid);
+        let (req_id, rx) = self
             .server_request_then(
                 "session/set_mode",
                 map([("sessionId", s(sid.clone())), ("modeId", s(target.clone()))]),
             )
             .await;
         let me = self.clone();
+        let timeout = self.srv.inner.opts.mode_reset_timeout;
         tokio::spawn(async move {
-            let Ok(answer) = rx.await else {
+            tokio::pin!(rx);
+            let answer = tokio::select! {
+                a = &mut rx => a,
+                _ = tokio::time::sleep(timeout) => {
+                    // An agent that never answers must not hold the session forever.
+                    let waiting = me.st().server_reqs.remove(&req_id).is_some();
+                    if waiting {
+                        me.refuse_starting_mode(&m, &sid, &bad, "the agent did not answer the switch in time").await;
+                        return;
+                    }
+                    rx.await
+                }
+            };
+            let Ok(answer) = answer else {
                 return; // the link ended first
             };
             if let Some(e) = &answer.error {
@@ -960,7 +1070,10 @@ impl Link {
             match crate::modes::rewrite_starting_mode(m.result.as_deref(), &target)
                 .and_then(|r| m.with_result(&r).ok())
             {
-                Some(out) => me.to_client(&out),
+                Some(out) => {
+                    me.to_client(&out);
+                    me.release_held(&sid, None).await;
+                }
                 None => {
                     me.refuse_starting_mode(&m, &sid, &bad, "the response could not be rewritten")
                         .await
@@ -970,7 +1083,13 @@ impl Link {
         None
     }
 
-    async fn refuse_starting_mode(&self, m: &Message, sid: &str, bad: &str, reason: &str) {
+    async fn refuse_starting_mode(
+        self: &Arc<Self>,
+        m: &Message,
+        sid: &str,
+        bad: &str,
+        reason: &str,
+    ) {
         self.srv.audit().event(
             "mode_reset_failed",
             [
@@ -991,11 +1110,14 @@ impl Link {
                 .await;
         }
         let id = m.id.clone().unwrap_or_default();
-        self.to_client(&jsonrpc::new_error(
-            &id,
+        let refusal = (
             jsonrpc::CODE_SERVER_ERROR,
-            &format!("session refused: it starts in mode {bad}, which is not allowed here, and could not be switched to an allowed mode"),
-        ));
+            format!(
+                "session refused: it starts in mode {bad}, which is not allowed here, and could not be switched to an allowed mode"
+            ),
+        );
+        self.to_client(&jsonrpc::new_error(&id, refusal.0, &refusal.1));
+        self.release_held(sid, Some(&refusal)).await;
     }
 
     async fn cancel_running_turns(&self) {
@@ -1215,6 +1337,22 @@ impl Link {
     pub(crate) fn pid(&self) -> u32 {
         self.proc.pid()
     }
+}
+
+/// The sessionId a client message names, if any.
+fn params_session_id(m: &Message) -> String {
+    let mut errs = Vec::new();
+    gojson::object(m.params.as_deref().unwrap_or(""))
+        .ok()
+        .flatten()
+        .and_then(|p| p.string("sessionId", &mut errs))
+        .unwrap_or_default()
+}
+
+/// An id for actp's own requests to the agent. Client ids starting with
+/// `actp-` are refused; the random part also keeps these ids from being guessed.
+fn server_req_id(n: u64) -> String {
+    format!("\"actp-{n}-{}\"", &crate::server::new_id()[..16])
 }
 
 /// Whether any session has a turn running (design 3.7).

@@ -33,6 +33,9 @@ type Options struct {
 	ProbeOnStart bool
 	// ReadOnly is for tools like `actp doctor`: no crash cleanup, no audit log.
 	ReadOnly bool
+	// ModeResetTimeout bounds how long an agent may take to answer actp's
+	// switch of a session's starting mode (10 s).
+	ModeResetTimeout time.Duration
 }
 
 // Server holds configuration, links and agent status.
@@ -76,6 +79,9 @@ func New(cfg *config.Server, opts Options) (*Server, error) {
 	}
 	if opts.Version == "" {
 		opts.Version = "dev"
+	}
+	if opts.ModeResetTimeout == 0 {
+		opts.ModeResetTimeout = 10 * time.Second
 	}
 	ctx, stop := context.WithCancel(context.Background())
 	s := &Server{
