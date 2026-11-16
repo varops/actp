@@ -85,6 +85,9 @@ async fn env(adjust: impl FnOnce(&mut actp_server::config::Server)) -> Env {
             base_env: Some(actp_server::agentproc::os_environ()),
             wire: fast_wire(),
             tick: Duration::from_millis(20),
+            mode_reset_timeout: Duration::from_secs(1),
+            held_load_timeout: Duration::from_secs(2),
+            max_held_messages: 200,
             ..Default::default()
         },
     )
@@ -1057,4 +1060,194 @@ async fn link_limit_holds_under_parallel_upgrades() {
     let opened = results.iter().filter(|r| r.is_ok()).count();
     let refused = results.iter().filter(|r| matches!(r, Err(429))).count();
     assert_eq!((opened, refused), (1, 7), "max_links 1");
+}
+
+/// A workspace sub folder with agent project settings, as Claude Code reads
+/// them from `.claude/settings.json`.
+fn write_settings(e: &Env, dir: &str, body: &str) -> String {
+    let d = std::path::Path::new(&e.site).join(dir).join(".claude");
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("settings.json"), body).unwrap();
+    format!("actp://site/{dir}")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn starting_mode_reset_times_out() {
+    let e = env(|_| {}).await; // mode_reset_timeout: 1s
+    let cwd = write_settings(
+        &e,
+        "silent",
+        r#"{"permissions":{"defaultMode":"bypass"},"actpTest":{"ignoreSetMode":true}}"#,
+    );
+    let mut c = e.bridge();
+    c.initialize().await;
+    let start = std::time::Instant::now();
+    let r = c
+        .call("session/new", json!({"cwd": cwd, "mcpServers": []}))
+        .await;
+    assert!(
+        r.error.as_ref().is_some_and(|e| e
+            .message
+            .starts_with("session refused: it starts in mode bypassPermissions")),
+        "{}",
+        r.raw
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "refusal took {:?}",
+        start.elapsed()
+    );
+    assert!(e.audit_has("mode_reset_failed"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn requests_wait_for_the_starting_mode_check() {
+    let e = env(|_| {}).await;
+    let cwd = write_settings(
+        &e,
+        "slow",
+        r#"{"permissions":{"defaultMode":"bypass"},"actpTest":{"setModeDelayMs":300}}"#,
+    );
+    let mut c = e.bridge();
+    c.initialize().await;
+    let sid = c.new_session(&cwd).await;
+    // Load the session again and prompt it at once: the prompt must wait until
+    // the starting mode has been switched.
+    c.request(
+        "session/load",
+        json!({"sessionId": sid, "cwd": cwd, "mcpServers": []}),
+    )
+    .await;
+    let id = c.prompt(&sid, "mode").await;
+    c.response(&id).await;
+    c.chunk("mode: default").await;
+    assert!(
+        !c.chunks().iter().any(|t| t == "mode: bypassPermissions"),
+        "a request reached the agent in the refused mode"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn actp_ids_are_reserved() {
+    let e = env(|_| {}).await;
+    let mut c = e.bridge();
+    c.initialize().await;
+    c.send_raw(r#"{"jsonrpc":"2.0","id":"actp-7","method":"session/list","params":{}}"#)
+        .await;
+    let r = c.response("\"actp-7\"").await;
+    let err = r.error.unwrap();
+    assert_eq!(
+        (err.code, err.message.as_str()),
+        (
+            -32600,
+            "invalid request: ids starting with \"actp-\" are reserved for actp"
+        )
+    );
+}
+
+/// A large queue released while the first queued request makes the agent
+/// write a lot must not deadlock: the queue drains off the task that reads
+/// the agent, which keeps reading.
+#[tokio::test(flavor = "multi_thread")]
+async fn large_held_backlog_does_not_deadlock() {
+    let e = env(|_| {}).await;
+    let cwd = write_settings(
+        &e,
+        "backlog",
+        r#"{"permissions":{"defaultMode":"bypass"},"actpTest":{"setModeDelayMs":300}}"#,
+    );
+    let mut c = e.bridge();
+    c.initialize().await;
+    let sid = c.new_session(&cwd).await;
+    let big = "x".repeat(300 << 10);
+    let id = c.prompt(&sid, &format!("echo {big}")).await; // the session history now holds 300 KB
+    c.response(&id).await;
+    let load = json!({"sessionId": sid, "cwd": cwd, "mcpServers": []});
+    let first = c.request("session/load", load.clone()).await;
+    let second = c.request("session/load", load).await; // replays 300 KB while the queue drains
+    let pad = "p".repeat(2 << 10);
+    let mut ids = Vec::new();
+    for _ in 0..150 {
+        ids.push(
+            c.request("session/set_title", json!({"sessionId": sid, "title": pad}))
+                .await,
+        );
+    }
+    c.response(&first).await;
+    c.response(&second).await;
+    for id in ids {
+        c.response(&id).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn held_queue_is_bounded() {
+    let e = env(|_| {}).await; // max_held_messages: 200
+    let cwd = write_settings(
+        &e,
+        "bounded",
+        r#"{"permissions":{"defaultMode":"bypass"},"actpTest":{"setModeDelayMs":500}}"#,
+    );
+    let mut c = e.bridge();
+    c.initialize().await;
+    let sid = c.new_session(&cwd).await;
+    c.request(
+        "session/load",
+        json!({"sessionId": sid, "cwd": cwd, "mcpServers": []}),
+    )
+    .await;
+    let mut ids = Vec::new();
+    for _ in 0..205 {
+        ids.push(
+            c.request("session/set_title", json!({"sessionId": sid, "title": "t"}))
+                .await,
+        );
+    }
+    let mut busy = 0;
+    for id in ids {
+        if c.response(&id)
+            .await
+            .error
+            .is_some_and(|e| e.message.starts_with("session busy:"))
+        {
+            busy += 1;
+        }
+    }
+    assert_eq!(busy, 5);
+    assert!(e.audit_has("held_overflow"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn held_load_times_out() {
+    let e = env(|_| {}).await; // held_load_timeout: 2s
+    let cwd = write_settings(&e, "slowload", r#"{"actpTest":{"loadDelayMs":4000}}"#);
+    let mut c = e.bridge();
+    c.initialize().await;
+    let sid = c.new_session(&cwd).await;
+    let load = c
+        .request(
+            "session/load",
+            json!({"sessionId": sid, "cwd": cwd, "mcpServers": []}),
+        )
+        .await;
+    let prompt = c.prompt(&sid, "echo waiting").await;
+    for id in [&load, &prompt] {
+        let r = c.response(id).await;
+        assert_eq!(
+            r.error.map(|e| e.message).as_deref(),
+            Some("session refused: the agent did not answer in time"),
+            "{}",
+            r.raw
+        );
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await; // the agent's late answer to the load is dropped
+    let n = c
+        .msgs
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|m| m.kind() == Kind::Response && m.id_key() == load)
+        .count();
+    assert_eq!(n, 1, "answers to the load");
+    assert!(e.audit_has("load_timed_out"));
 }

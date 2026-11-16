@@ -2,7 +2,8 @@
 //! states and timers (design 3.1), the rewrites (3.3) and the settle order
 //! when it ends (3.2). A port of Go's `internal/server/link.go`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -29,6 +30,8 @@ pub const TOMBSTONE_FOR: Duration = Duration::from_secs(600);
 #[derive(Clone, Debug, Default)]
 struct ClientReq {
     method: String,
+    /// A load or resume holds the session's next messages until it is checked.
+    check: Option<Arc<SessionCheck>>,
     session_id: String,
     orig_cwd: String,
     cwd: String,
@@ -76,6 +79,10 @@ struct LinkState {
     tomb: Option<Tombstone>,
     finalized: bool,
     last_busy: Option<Instant>,
+    /// Client messages for sessions whose starting mode is being checked.
+    held: HashMap<String, HeldSession>,
+    /// Client request ids actp already answered (timed-out loads).
+    abandoned: HashSet<String>,
     /// Config options that select the session mode.
     mode_options: HashSet<String>,
     /// Mode ids the agent offers.
@@ -152,6 +159,8 @@ impl Link {
                     tomb: None,
                     finalized: false,
                     last_busy: None,
+                    held: HashMap::new(),
+                    abandoned: HashSet::new(),
                     mode_options: HashSet::new(),
                     offered_modes: HashSet::new(),
                 }),
@@ -297,6 +306,22 @@ impl Link {
                 return;
             }
         };
+        // A message for a session whose starting mode is still being checked
+        // waits until the check is done, so it never reaches the agent in the
+        // refused mode.
+        let m = if m.kind() != Kind::Response {
+            match self.hold_if_checking(m) {
+                Some(m) => m,
+                None => return,
+            }
+        } else {
+            m
+        };
+        self.handle_client(m).await;
+    }
+
+    /// Handles one parsed client message (`from_client` after the checks).
+    async fn handle_client(self: &Arc<Self>, m: Message) {
         match m.kind() {
             Kind::Response => {
                 let (known, mode) = {
@@ -351,10 +376,207 @@ impl Link {
                 }
                 self.write_agent(&m).await
             }
-            Kind::Request => match self.rewrite_client_request(m).await {
-                Ok(out) => self.write_agent(&out).await,
-                Err(reply) => self.to_client(&reply),
-            },
+            Kind::Request => {
+                // actp's own requests to the agent use ids starting with actp-;
+                // a client id like that could be mistaken for one of them.
+                if m.id
+                    .as_deref()
+                    .and_then(|id| gojson::decode_string(id).ok().flatten())
+                    .is_some_and(|id| id.starts_with("actp-"))
+                {
+                    self.srv.audit().event(
+                        "id_refused",
+                        [("link", sv(short(&self.id))), ("method", sv(&m.method))],
+                    );
+                    let id = m.id.clone().unwrap_or_default();
+                    self.to_client(&jsonrpc::new_error(
+                        &id,
+                        jsonrpc::CODE_INVALID_REQUEST,
+                        "invalid request: ids starting with \"actp-\" are reserved for actp",
+                    ));
+                    return;
+                }
+                let load = (m.method == "session/load" || m.method == "session/resume")
+                    .then(|| params_session_id(&m))
+                    .filter(|s| !s.is_empty());
+                let (req_id, req_key) = (m.id.clone(), m.id_key());
+                match self.rewrite_client_request(m).await {
+                    Ok(out) => {
+                        // Until the agent's answer is through the starting-mode check,
+                        // the client's next requests for this session wait (the load
+                        // may switch the session to a mode from the workspace settings).
+                        if let Some(sid) = load {
+                            let c = self.start_check(&sid, req_id);
+                            if let Some(r) = self.st().client_reqs.get_mut(&req_key) {
+                                r.check = Some(c);
+                            }
+                        }
+                        self.write_agent(&out).await
+                    }
+                    Err(reply) => self.to_client(&reply),
+                }
+            }
+        }
+    }
+
+    /// Holds a session's client messages until the check ends. A check for a
+    /// client's load or resume times out after `held_load_timeout`.
+    fn start_check(self: &Arc<Self>, sid: &str, req_id: Option<String>) -> Arc<SessionCheck> {
+        let c = Arc::new(SessionCheck {
+            sid: sid.to_string(),
+            req_id,
+            done: AtomicBool::new(false),
+        });
+        self.st().held.entry(sid.to_string()).or_default().checks += 1;
+        if c.req_id.is_some() {
+            let (me, c2) = (self.clone(), c.clone());
+            let timeout = self.srv.inner.opts.held_load_timeout;
+            tokio::spawn(async move {
+                tokio::time::sleep(timeout).await;
+                me.time_out_check(&c2).await;
+            });
+        }
+        c
+    }
+
+    /// Marks a check as ending; false means it already ended (timed out). The
+    /// caller answers the client, then calls `end_check`.
+    fn claim_check(c: &SessionCheck) -> bool {
+        !c.done.swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Ends a claimed check. Without a refusal the queue drains once no check is
+    /// left; with one, queued requests get it and notifications are dropped.
+    fn end_check(self: &Arc<Self>, c: &SessionCheck, refusal: Option<&(i64, String)>) {
+        let (refused, drain) = {
+            let mut st = self.st();
+            let Some(h) = st.held.get_mut(&c.sid) else {
+                return;
+            };
+            h.checks = h.checks.saturating_sub(1);
+            let mut refused = VecDeque::new();
+            if refusal.is_some() {
+                refused = std::mem::take(&mut h.queue);
+                h.bytes = 0;
+            }
+            let drain = h.checks == 0 && !h.draining && !h.queue.is_empty();
+            if drain {
+                h.draining = true;
+            }
+            if h.checks == 0 && !h.draining && h.queue.is_empty() {
+                st.held.remove(&c.sid);
+            }
+            (refused, drain)
+        };
+        if let Some((code, msg)) = refusal {
+            for m in refused.into_iter().filter(|m| m.kind() == Kind::Request) {
+                self.to_client(&jsonrpc::new_error(
+                    &m.id.clone().unwrap_or_default(),
+                    *code,
+                    msg,
+                ));
+            }
+        }
+        if drain {
+            // Never on the task that reads the agent: it must keep reading while
+            // actp writes to the agent, or both could block on full pipes.
+            tokio::spawn(self.clone().drain_held(c.sid.clone()));
+        }
+    }
+
+    /// Hands queued messages on one at a time, and stops when one of them
+    /// starts a new check (a queued load), which then owns what follows.
+    async fn drain_held(self: Arc<Self>, sid: String) {
+        loop {
+            let m = {
+                let mut st = self.st();
+                let Some(h) = st.held.get_mut(&sid) else {
+                    return;
+                };
+                if h.checks > 0 {
+                    h.draining = false;
+                    return;
+                }
+                let Some(m) = h.queue.pop_front() else {
+                    st.held.remove(&sid);
+                    return;
+                };
+                h.bytes = h.bytes.saturating_sub(m.raw.len());
+                m
+            };
+            Box::pin(self.handle_client(m)).await;
+        }
+    }
+
+    /// Queues a client message for a session under check; returns it when it
+    /// can go on now. A full queue refuses the message.
+    fn hold_if_checking(&self, m: Message) -> Option<Message> {
+        let sid = params_session_id(&m);
+        if sid.is_empty() {
+            return Some(m);
+        }
+        let (max_n, max_b) = (
+            self.srv.inner.opts.max_held_messages,
+            self.srv.inner.opts.max_held_bytes,
+        );
+        {
+            let mut st = self.st();
+            let Some(h) = st.held.get_mut(&sid) else {
+                return Some(m);
+            };
+            if h.queue.len() < max_n && h.bytes + m.raw.len() <= max_b {
+                h.bytes += m.raw.len();
+                h.queue.push_back(m);
+                return None;
+            }
+        }
+        self.srv.audit().event(
+            "held_overflow",
+            [
+                ("link", sv(short(&self.id))),
+                ("session", sv(&sid)),
+                ("method", sv(&m.method)),
+            ],
+        );
+        if m.kind() == Kind::Request {
+            self.to_client(&jsonrpc::new_error(
+                &m.id.clone().unwrap_or_default(),
+                jsonrpc::CODE_SERVER_ERROR,
+                "session busy: too many messages are waiting for this session's mode check",
+            ));
+        }
+        None
+    }
+
+    /// Ends a load or resume the agent did not answer in time: the client gets
+    /// an error for it and for everything queued, the agent's late answer is
+    /// dropped, and the session is closed.
+    async fn time_out_check(self: &Arc<Self>, c: &SessionCheck) {
+        if !Self::claim_check(c) {
+            return;
+        }
+        let req_id = c.req_id.clone().unwrap_or_default();
+        let can_close = {
+            let mut st = self.st();
+            st.client_reqs.remove(&req_id);
+            st.abandoned.insert(req_id.clone());
+            st.sessions.remove(&c.sid);
+            st.can_close
+        };
+        self.srv.audit().event(
+            "load_timed_out",
+            [("link", sv(short(&self.id))), ("session", sv(&c.sid))],
+        );
+        let refusal = (
+            jsonrpc::CODE_SERVER_ERROR,
+            "session refused: the agent did not answer in time".to_string(),
+        );
+        self.to_client(&jsonrpc::new_error(&req_id, refusal.0, &refusal.1));
+        self.end_check(c, Some(&refusal));
+        self.srv.release_session(&self.agent.id, &c.sid, self);
+        if can_close {
+            self.server_request("session/close", map([("sessionId", s(c.sid.clone()))]))
+                .await;
         }
     }
 
@@ -635,13 +857,22 @@ impl Link {
                         }
                         return;
                     }
+                    if st.abandoned.remove(&m.id_key()) {
+                        return; // actp answered it already (timed out)
+                    }
                     st.client_reqs.remove(&m.id_key())
                 };
+                let check = req.as_ref().and_then(|r| r.check.clone());
+                if let Some(c) = &check
+                    && !Self::claim_check(c)
+                {
+                    return; // the load timed out; the client has its answer
+                }
                 let out = match req {
                     Some(req) => {
                         let (out, opened) = self.after_response(req, m);
                         match opened {
-                            Some(sid) => self.check_starting_mode(out, sid).await,
+                            Some(sid) => self.check_starting_mode(out, sid, check.clone()).await,
                             None => Some(out),
                         }
                     }
@@ -650,6 +881,9 @@ impl Link {
                 // None: held until the agent answers actp's own request.
                 if let Some(out) = out {
                     self.to_client(&out);
+                    if let Some(c) = &check {
+                        self.end_check(c, None);
+                    }
                 }
             }
             Kind::Request => match self.answer_agent_request(&m) {
@@ -883,7 +1117,7 @@ impl Link {
         let id = {
             let mut st = self.st();
             st.next_server_req += 1;
-            let id = format!("\"actp-{}\"", st.next_server_req);
+            let id = server_req_id(st.next_server_req);
             st.server_reqs.insert(id.clone(), None);
             id
         };
@@ -896,18 +1130,18 @@ impl Link {
         &self,
         method: &str,
         params: GoValue,
-    ) -> tokio::sync::oneshot::Receiver<Message> {
+    ) -> (String, tokio::sync::oneshot::Receiver<Message>) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let id = {
             let mut st = self.st();
             st.next_server_req += 1;
-            let id = format!("\"actp-{}\"", st.next_server_req);
+            let id = server_req_id(st.next_server_req);
             st.server_reqs.insert(id.clone(), Some(tx));
             id
         };
         self.write_agent(&jsonrpc::new_request(&id, method, params))
             .await;
-        rx
+        (id, rx)
     }
 
     /// Makes sure a session does not start in a refused mode. An agent can pick
@@ -916,15 +1150,29 @@ impl Link {
     /// never asked for it. The session is switched to an allowed mode before the
     /// client sees the response; if that fails, the session is closed and the
     /// client gets an error. `None`: the response is held until the agent answers.
-    async fn check_starting_mode(self: &Arc<Self>, m: Message, sid: String) -> Option<Message> {
+    ///
+    /// `check` is the client's load or resume holding the session, already
+    /// claimed; for a new or forked session one is started when a reset is needed.
+    async fn check_starting_mode(
+        self: &Arc<Self>,
+        m: Message,
+        sid: String,
+        check: Option<Arc<SessionCheck>>,
+    ) -> Option<Message> {
         let (current, offered) = crate::modes::starting_modes(m.result.as_deref());
         let allowed = |mode: &str| crate::modes::mode_allowed(&self.agent, &self.token, mode);
         let Some(bad) = current.into_iter().find(|mode| !allowed(mode)) else {
             return Some(m);
         };
         let Some(target) = crate::modes::reset_target(&offered, allowed) else {
-            self.refuse_starting_mode(&m, &sid, &bad, "the agent offers no allowed mode")
-                .await;
+            self.refuse_starting_mode(
+                &m,
+                &sid,
+                &bad,
+                "the agent offers no allowed mode",
+                check.as_deref(),
+            )
+            .await;
             return None;
         };
         self.srv.audit().event(
@@ -936,15 +1184,34 @@ impl Link {
                 ("to", sv(&target)),
             ],
         );
-        let rx = self
+        let check = check.unwrap_or_else(|| {
+            let c = self.start_check(&sid, None);
+            Self::claim_check(&c);
+            c
+        });
+        let (req_id, rx) = self
             .server_request_then(
                 "session/set_mode",
                 map([("sessionId", s(sid.clone())), ("modeId", s(target.clone()))]),
             )
             .await;
         let me = self.clone();
+        let timeout = self.srv.inner.opts.mode_reset_timeout;
         tokio::spawn(async move {
-            let Ok(answer) = rx.await else {
+            tokio::pin!(rx);
+            let answer = tokio::select! {
+                a = &mut rx => a,
+                _ = tokio::time::sleep(timeout) => {
+                    // An agent that never answers must not hold the session forever.
+                    let waiting = me.st().server_reqs.remove(&req_id).is_some();
+                    if waiting {
+                        me.refuse_starting_mode(&m, &sid, &bad, "the agent did not answer the switch in time", Some(&check)).await;
+                        return;
+                    }
+                    rx.await
+                }
+            };
+            let Ok(answer) = answer else {
                 return; // the link ended first
             };
             if let Some(e) = &answer.error {
@@ -953,6 +1220,7 @@ impl Link {
                     &sid,
                     &bad,
                     &format!("the agent refused the switch: {}", e.message),
+                    Some(&check),
                 )
                 .await;
                 return;
@@ -960,17 +1228,33 @@ impl Link {
             match crate::modes::rewrite_starting_mode(m.result.as_deref(), &target)
                 .and_then(|r| m.with_result(&r).ok())
             {
-                Some(out) => me.to_client(&out),
+                Some(out) => {
+                    me.to_client(&out);
+                    me.end_check(&check, None);
+                }
                 None => {
-                    me.refuse_starting_mode(&m, &sid, &bad, "the response could not be rewritten")
-                        .await
+                    me.refuse_starting_mode(
+                        &m,
+                        &sid,
+                        &bad,
+                        "the response could not be rewritten",
+                        Some(&check),
+                    )
+                    .await
                 }
             }
         });
         None
     }
 
-    async fn refuse_starting_mode(&self, m: &Message, sid: &str, bad: &str, reason: &str) {
+    async fn refuse_starting_mode(
+        self: &Arc<Self>,
+        m: &Message,
+        sid: &str,
+        bad: &str,
+        reason: &str,
+        check: Option<&SessionCheck>,
+    ) {
         self.srv.audit().event(
             "mode_reset_failed",
             [
@@ -991,11 +1275,16 @@ impl Link {
                 .await;
         }
         let id = m.id.clone().unwrap_or_default();
-        self.to_client(&jsonrpc::new_error(
-            &id,
+        let refusal = (
             jsonrpc::CODE_SERVER_ERROR,
-            &format!("session refused: it starts in mode {bad}, which is not allowed here, and could not be switched to an allowed mode"),
-        ));
+            format!(
+                "session refused: it starts in mode {bad}, which is not allowed here, and could not be switched to an allowed mode"
+            ),
+        );
+        self.to_client(&jsonrpc::new_error(&id, refusal.0, &refusal.1));
+        if let Some(c) = check {
+            self.end_check(c, Some(&refusal));
+        }
     }
 
     async fn cancel_running_turns(&self) {
@@ -1215,6 +1504,42 @@ impl Link {
     pub(crate) fn pid(&self) -> u32 {
         self.proc.pid()
     }
+}
+
+/// The client messages of one session, held while its starting mode is checked.
+#[derive(Default)]
+struct HeldSession {
+    queue: VecDeque<Message>,
+    bytes: usize,
+    /// Checks still running.
+    checks: usize,
+    /// A drain task owns the queue.
+    draining: bool,
+}
+
+/// One running check of a session's starting mode.
+#[derive(Debug)]
+struct SessionCheck {
+    sid: String,
+    /// The client's load or resume request; `None` for a reset of a new session.
+    req_id: Option<String>,
+    done: AtomicBool,
+}
+
+/// The sessionId a client message names, if any.
+fn params_session_id(m: &Message) -> String {
+    let mut errs = Vec::new();
+    gojson::object(m.params.as_deref().unwrap_or(""))
+        .ok()
+        .flatten()
+        .and_then(|p| p.string("sessionId", &mut errs))
+        .unwrap_or_default()
+}
+
+/// An id for actp's own requests to the agent. Client ids starting with
+/// `actp-` are refused; the random part also keeps these ids from being guessed.
+fn server_req_id(n: u64) -> String {
+    format!("\"actp-{n}-{}\"", &crate::server::new_id()[..16])
 }
 
 /// Whether any session has a turn running (design 3.7).

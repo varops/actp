@@ -1097,6 +1097,65 @@ async fn starting_mode(bridge: Impl, server: Impl) {
     }
 }
 
+/// Requests for a session wait while its starting mode is checked, and get
+/// the refusal when the check fails; client ids may not imitate actp's own.
+async fn mode_check_hardening(bridge: Impl, server: Impl) {
+    let s = ServerProc::start(server, "hardening", false).await;
+    let dir = s.dirs.site.join("slow").join(".claude");
+    std::fs::create_dir_all(&dir).unwrap();
+    let write = |body: &str| std::fs::write(dir.join("settings.json"), body).unwrap();
+    write(r#"{"permissions":{"defaultMode":"bypass"},"actpTest":{"setModeDelayMs":300}}"#);
+    let mut c = Client::start(bridge, &s, s.port, "test", TOKEN, &[]).await;
+    c.initialize().await;
+    let sid = c.new_session("actp://site/slow").await;
+
+    // A prompt sent right after session/load waits for the load's mode check.
+    c.request(
+        "session/load",
+        json!({"sessionId": sid, "cwd": "actp://site/slow", "mcpServers": []}),
+    )
+    .await;
+    let id = c.prompt(&sid, "mode").await;
+    c.response(id).await;
+    assert!(
+        c.chunks().contains(&"mode: default".to_string())
+            && !c.chunks().contains(&"mode: bypassPermissions".to_string()),
+        "{:?}",
+        c.chunks()
+    );
+
+    // When the check ends in a refusal, the waiting request gets the same error.
+    write(
+        r#"{"permissions":{"defaultMode":"bypass"},"actpTest":{"setModeDelayMs":300,"refuseSetMode":true}}"#,
+    );
+    let load = c
+        .request(
+            "session/load",
+            json!({"sessionId": sid, "cwd": "actp://site/slow", "mcpServers": []}),
+        )
+        .await;
+    let id = c.prompt(&sid, "echo should not run").await;
+    let refusal = |n: i64| {
+        format!(
+            r#"{{"error":{{"code":-32000,"message":"session refused: it starts in mode bypassPermissions, which is not allowed here, and could not be switched to an allowed mode"}},"id":{n},"jsonrpc":"2.0"}}"#
+        )
+    };
+    assert_eq!(c.response(load).await.0, refusal(load));
+    assert_eq!(c.response(id).await.0, refusal(id));
+
+    // Client ids that look like actp's own are refused.
+    c.send(json!({"jsonrpc": "2.0", "id": "actp-1", "method": "session/list", "params": {}}))
+        .await;
+    let (raw, _) = c.wait("reserved id answer", |v| v["id"] == "actp-1").await;
+    assert_eq!(
+        raw,
+        r#"{"error":{"code":-32600,"message":"invalid request: ids starting with \"actp-\" are reserved for actp"},"id":"actp-1","jsonrpc":"2.0"}"#
+    );
+    assert!(s.audit().contains("\"event\":\"id_refused\""));
+    c.close_stdin();
+    assert_eq!(c.exit().await.0, 0);
+}
+
 async fn wait_until(what: &str, f: impl Fn() -> bool) {
     let deadline = tokio::time::Instant::now() + WAIT;
     while !f() {
@@ -1141,6 +1200,7 @@ pairings!(ambiguous_envelope);
 pairings!(session_routes);
 pairings!(session_modes);
 pairings!(starting_mode);
+pairings!(mode_check_hardening);
 #[cfg(unix)]
 pairings!(token_revoke);
 

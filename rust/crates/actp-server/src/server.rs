@@ -31,6 +31,15 @@ pub struct Options {
     pub probe_on_start: bool,
     /// For tools like `actp doctor`: no crash cleanup, no audit log.
     pub read_only: bool,
+    /// How long an agent may take to answer actp's switch of a session's
+    /// starting mode (10 s).
+    pub mode_reset_timeout: Duration,
+    /// How long a `session/load` or `session/resume` may hold the session's
+    /// next messages (60 s), and how many messages and bytes it may hold
+    /// (256, 8 MB).
+    pub held_load_timeout: Duration,
+    pub max_held_messages: usize,
+    pub max_held_bytes: usize,
     /// Who a bearer token belongs to (default: the config's hashed tokens).
     pub authenticator: Arc<dyn Authenticator>,
 }
@@ -44,6 +53,10 @@ impl Default for Options {
             tick: Duration::from_secs(1),
             probe_on_start: false,
             read_only: false,
+            mode_reset_timeout: Duration::from_secs(10),
+            held_load_timeout: Duration::from_secs(60),
+            max_held_messages: 256,
+            max_held_bytes: 8 << 20,
             authenticator: Arc::new(ConfigTokens),
         }
     }
@@ -672,7 +685,7 @@ impl Drop for Slot {
 }
 
 /// A random link id: 192 bits, hex.
-fn new_id() -> String {
+pub(crate) fn new_id() -> String {
     use rand::RngCore;
     let mut b = [0u8; 24];
     rand::rng().fill_bytes(&mut b);

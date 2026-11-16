@@ -50,6 +50,8 @@ type session struct {
 	Mode       string          `json:"mode,omitempty"`
 	Modes      []string        `json:"modes,omitempty"`
 	RefuseMode bool            `json:"refuseSetMode,omitempty"`
+	ModeDelay  int             `json:"setModeDelayMs,omitempty"`
+	IgnoreMode bool            `json:"ignoreSetMode,omitempty"`
 	History    []string        `json:"history"`
 }
 
@@ -178,7 +180,8 @@ func (a *agent) handle(m *jsonrpc.Message) {
 		}
 		_ = json.Unmarshal(m.Params, &p)
 		s := &session{ID: p.SessionID, Cwd: p.Cwd, MCPServers: p.MCPServers, Dirs: p.Dirs, Meta: p.Meta}
-		s.Mode, s.Modes, s.RefuseMode = projectSettings(p.Cwd)
+		st := projectSettings(p.Cwd)
+		s.Mode, s.Modes, s.RefuseMode, s.ModeDelay, s.IgnoreMode = st.mode, st.modes, st.refuse, st.delayMs, st.ignore
 		for _, c := range p.Config {
 			if c.ConfigID == "mode" {
 				s.Mode = c.Value
@@ -192,6 +195,9 @@ func (a *agent) handle(m *jsonrpc.Message) {
 		} else if m.Method == "session/new" {
 			s.ID = fmt.Sprintf("s-%d", time.Now().UnixNano())
 		} else {
+			if st.loadMs > 0 {
+				time.Sleep(time.Duration(st.loadMs) * time.Millisecond)
+			}
 			stored, err := a.load(p.SessionID)
 			if err != nil {
 				a.send(jsonrpc.NewError(m.ID, jsonrpc.CodeInvalidParams, "unknown session", nil))
@@ -223,6 +229,19 @@ func (a *agent) handle(m *jsonrpc.Message) {
 		_ = json.Unmarshal(m.Params, &p)
 		a.mu.Lock()
 		s := a.sessions[p.SessionID]
+		var delay int
+		if s != nil {
+			delay = s.ModeDelay
+		}
+		if s != nil && s.IgnoreMode {
+			a.mu.Unlock()
+			return // never answers, like a wedged agent
+		}
+		if delay > 0 {
+			a.mu.Unlock()
+			time.Sleep(time.Duration(delay) * time.Millisecond)
+			a.mu.Lock()
+		}
 		if s != nil && s.RefuseMode {
 			a.mu.Unlock()
 			a.send(jsonrpc.NewError(m.ID, jsonrpc.CodeInvalidRequest, "mode changes are locked", nil))
@@ -466,11 +485,20 @@ func (a *agent) load(id string) (*session, error) {
 
 var testModes = []string{"default", "acceptEdits", "plan", "bypassPermissions"}
 
+type settings struct {
+	mode    string
+	modes   []string
+	refuse  bool
+	delayMs int
+	ignore  bool
+	loadMs  int
+}
+
 // projectSettings reads the starting mode from the workspace, as Claude's
 // adapter does: settings.local.json over settings.json, case-insensitive
 // mode names, "bypass" as an alias.
-func projectSettings(cwd string) (mode string, modes []string, refuse bool) {
-	mode, modes = "default", testModes
+func projectSettings(cwd string) settings {
+	out := settings{mode: "default", modes: testModes}
 	for _, name := range []string{"settings.json", "settings.local.json"} {
 		data, err := os.ReadFile(filepath.Join(cwd, ".claude", name))
 		if err != nil {
@@ -481,8 +509,11 @@ func projectSettings(cwd string) (mode string, modes []string, refuse bool) {
 				DefaultMode string `json:"defaultMode"`
 			} `json:"permissions"`
 			ActpTest struct {
-				Modes         []string `json:"modes"`
-				RefuseSetMode bool     `json:"refuseSetMode"`
+				Modes          []string `json:"modes"`
+				RefuseSetMode  bool     `json:"refuseSetMode"`
+				SetModeDelayMs int      `json:"setModeDelayMs"`
+				LoadDelayMs    int      `json:"loadDelayMs"`
+				IgnoreSetMode  bool     `json:"ignoreSetMode"`
 			} `json:"actpTest"`
 		}
 		if json.Unmarshal(data, &st) != nil {
@@ -490,14 +521,21 @@ func projectSettings(cwd string) (mode string, modes []string, refuse bool) {
 		}
 		aliases := map[string]string{"default": "default", "manual": "default", "acceptedits": "acceptEdits", "dontask": "dontAsk", "plan": "plan", "auto": "auto", "bypasspermissions": "bypassPermissions", "bypass": "bypassPermissions"}
 		if m, ok := aliases[strings.ToLower(strings.TrimSpace(st.Permissions.DefaultMode))]; ok {
-			mode = m
+			out.mode = m
 		}
 		if len(st.ActpTest.Modes) > 0 {
-			modes = st.ActpTest.Modes
+			out.modes = st.ActpTest.Modes
 		}
-		refuse = refuse || st.ActpTest.RefuseSetMode
+		out.refuse = out.refuse || st.ActpTest.RefuseSetMode
+		out.ignore = out.ignore || st.ActpTest.IgnoreSetMode
+		if st.ActpTest.SetModeDelayMs > 0 {
+			out.delayMs = st.ActpTest.SetModeDelayMs
+		}
+		if st.ActpTest.LoadDelayMs > 0 {
+			out.loadMs = st.ActpTest.LoadDelayMs
+		}
 	}
-	return mode, modes, refuse
+	return out
 }
 
 func modeState(current string, offered []string) map[string]any {
