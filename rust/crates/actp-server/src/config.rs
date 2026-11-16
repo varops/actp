@@ -3,7 +3,8 @@
 //! Unknown keys and duplicate keys are refused, like Go's strict decoder. The
 //! tunnel, dashboard and remotes sections are read and validated so the same
 //! file works with both implementations; this crate does not act on the tunnel
-//! or dashboard settings.
+//! or dashboard settings. The `relay` section is Rust only (docs/relay.md):
+//! the Go server refuses a file that has one.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -47,6 +48,8 @@ pub struct Server {
     pub shell_env: Option<bool>,
     pub audit: Audit,
     pub tunnel: Tunnel,
+    /// Relay mode (Rust only): dial out to a relay instead of listening.
+    pub relay: Option<Relay>,
     pub workspaces: Vec<Workspace>,
     pub agents: Vec<Agent>,
     pub tokens: Vec<Token>,
@@ -64,6 +67,21 @@ pub struct Tunnel {
     pub provider: String,
     pub mode: String,
     pub token_env: String,
+}
+
+/// Relay mode (docs/relay.md): the machine connects out to one relay over
+/// WSS with its device certificate and serves the callers the relay routes
+/// to it. Nothing listens on the machine. Not part of the Go server.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Relay {
+    /// `wss://host[:port][/prefix]`.
+    pub url: String,
+    /// The device certificate (PEM, leaf first, then any intermediates).
+    pub cert: String,
+    /// The device certificate's private key (PEM).
+    pub key: String,
+    /// Roots that sign the relay's certificate (PEM). Empty: the OS trust store.
+    pub ca: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -316,6 +334,11 @@ impl Config {
         s.log_dir = expand_home(&s.log_dir);
         s.state_dir = expand_home(&s.state_dir);
         s.tokens_file = expand_home(&s.tokens_file);
+        if let Some(r) = s.relay.as_mut() {
+            r.cert = expand_home(&r.cert);
+            r.key = expand_home(&r.key);
+            r.ca = expand_home(&r.ca);
+        }
         for w in &mut s.workspaces {
             w.path = expand_home(&w.path);
         }
@@ -507,6 +530,19 @@ impl Config {
             }
             if s.tls_cert.is_empty() != s.tls_key.is_empty() {
                 errs.push("tls_cert and tls_key must be set together".into());
+            }
+            if let Some(r) = &s.relay {
+                if !r.url.starts_with("wss://") {
+                    errs.push("relay url must start with wss://".into());
+                }
+                if r.cert.is_empty() || r.key.is_empty() {
+                    errs.push(
+                        "relay mode needs the device certificate: set relay cert and key".into(),
+                    );
+                }
+                if s.tunnel.mode != "off" {
+                    errs.push("relay mode and a tunnel cannot be used together".into());
+                }
             }
         }
         let mut remotes = std::collections::HashSet::new();
@@ -903,6 +939,21 @@ impl Decoder {
                         }
                     }
                 }
+                "relay" => {
+                    if let Some(rm) = self.mapping(v, "relay") {
+                        let mut r = Relay::default();
+                        for (k, v) in rm {
+                            match k.as_str() {
+                                "url" => r.url = self.string(v, &k).unwrap_or_default(),
+                                "cert" => r.cert = self.string(v, &k).unwrap_or_default(),
+                                "key" => r.key = self.string(v, &k).unwrap_or_default(),
+                                "ca" => r.ca = self.string(v, &k).unwrap_or_default(),
+                                _ => self.unknown(&k),
+                            }
+                        }
+                        s.relay = Some(r);
+                    }
+                }
                 "workspaces" => {
                     if let Some(seq) = self.sequence(v, "workspaces") {
                         for it in seq {
@@ -1254,6 +1305,31 @@ remotes:
                 && e.contains(r#"unknown default_workspace "other""#),
             "{e}"
         );
+    }
+
+    #[test]
+    fn relay_mode() {
+        let base = "server:\n  relay:\n    url: wss://relay.example.com\n    cert: /d/device.pem\n    key: /d/device.key\n";
+        let c = Config::parse(base).unwrap();
+        c.validate().unwrap();
+        let r = c.server.unwrap().relay.unwrap();
+        assert_eq!(r.url, "wss://relay.example.com");
+        assert!(r.ca.is_empty());
+        for (bad, want) in [
+            (base.replace("wss://", "https://"), "must start with wss://"),
+            (
+                base.replace("    key: /d/device.key\n", ""),
+                "device certificate",
+            ),
+            (
+                format!("{base}  tunnel:\n    mode: quick\n"),
+                "cannot be used together",
+            ),
+        ] {
+            let e = Config::parse(&bad).unwrap().validate().unwrap_err().0;
+            assert!(e.contains(want), "{e}");
+        }
+        assert!(Config::parse(&format!("{base}    insecure: true\n")).is_err());
     }
 
     #[test]

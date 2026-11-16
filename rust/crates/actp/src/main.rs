@@ -412,7 +412,9 @@ async fn cmd_serve(args: &[String]) -> Result<(), Exit> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .try_init();
-    check_listen(&sc)?;
+    if sc.relay.is_none() {
+        check_listen(&sc)?;
+    }
     if sc.tunnel.mode != "off" {
         if !sc.tls_cert.is_empty() {
             return Err(fail(
@@ -429,7 +431,15 @@ async fn cmd_serve(args: &[String]) -> Result<(), Exit> {
     if sc.agents.is_empty() {
         tracing::warn!("no agents configured");
     }
-    let listener = tokio::net::TcpListener::bind(&sc.listen).await?;
+    // Relay mode: nothing listens here; the machine dials out to the relay.
+    let relay_tls = match &sc.relay {
+        Some(r) => Some(actp_server::relay::client_tls(r)?),
+        None => None,
+    };
+    let listener = match &sc.relay {
+        Some(_) => None,
+        None => Some(tokio::net::TcpListener::bind(&sc.listen).await?),
+    };
     let server = actp_server::Server::new(
         sc.clone(),
         actp_server::Options {
@@ -451,7 +461,18 @@ async fn cmd_serve(args: &[String]) -> Result<(), Exit> {
                 &sc.tls_key,
             )?)
         };
+        let relay = sc
+            .relay
+            .as_ref()
+            .zip(relay_tls)
+            .map(|(r, tls)| actp_server::relay::RelayOptions::new(r.url.clone(), tls));
         tokio::spawn(async move {
+            if let Some(opts) = relay {
+                let acceptor =
+                    actp_server::relay::RelayAcceptor::start(server.clone(), opts, stop.clone());
+                return actp_server::http::serve(server, acceptor, stop).await;
+            }
+            let listener = listener.expect("listening when not in relay mode");
             match tls {
                 Some(cfg) => {
                     actp_server::http::serve(
@@ -471,7 +492,14 @@ async fn cmd_serve(args: &[String]) -> Result<(), Exit> {
             }
         })
     };
-    tracing::info!(addr = %sc.listen, version = VERSION, agents = sc.agents.len(), "actp server listening");
+    match &sc.relay {
+        Some(r) => {
+            tracing::info!(relay = %r.url, version = VERSION, agents = sc.agents.len(), "actp server in relay mode")
+        }
+        None => {
+            tracing::info!(addr = %sc.listen, version = VERSION, agents = sc.agents.len(), "actp server listening")
+        }
+    }
 
     #[cfg(unix)]
     let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
@@ -487,7 +515,7 @@ async fn cmd_serve(args: &[String]) -> Result<(), Exit> {
                     Ok(c) => match c.server {
                         Some(next) => {
                             let running = server.config();
-                            if next.listen != running.listen || next.tls_cert != running.tls_cert {
+                            if next.listen != running.listen || next.tls_cert != running.tls_cert || next.relay != running.relay {
                                 tracing::warn!("listen and TLS changes need a restart; other changes apply now");
                             }
                             server.reload(next);

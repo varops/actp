@@ -5,7 +5,8 @@
 //!
 //! The core ([`Server`]) does not listen on anything itself:
 //! - [`http::serve`] serves it over HTTP/WebSocket from any [`http::Acceptor`]
-//!   (TCP and TLS listeners here; a relay connection later);
+//!   (TCP and TLS listeners, or [`relay::RelayAcceptor`], which dials out to a
+//!   relay and serves the callers it routes here);
 //! - [`Server::check_agent`] and [`Server::open_link`] open links for any
 //!   transport that can carry `actp.v1` frames as a [`actp_proto::FrameConn`].
 //!
@@ -22,6 +23,7 @@ mod leftovers;
 mod link;
 pub mod modes;
 mod probe;
+pub mod relay;
 pub mod rewrite;
 mod server;
 

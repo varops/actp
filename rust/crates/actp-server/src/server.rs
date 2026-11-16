@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -91,6 +92,8 @@ pub(crate) struct Inner {
     pub st: Mutex<State>,
     /// Orders state-file writes; once true (after close), they stop.
     pids_closed: Mutex<bool>,
+    /// Relay mode: the relay's org-wide stop is on.
+    org_stopped: AtomicBool,
 }
 
 /// A running server. Cheap to clone.
@@ -231,6 +234,7 @@ impl Server {
                     next_slot: 0,
                 }),
                 pids_closed: Mutex::new(false),
+                org_stopped: AtomicBool::new(false),
                 opts,
             }),
         };
@@ -350,6 +354,43 @@ impl Server {
             .collect()
     }
 
+    /// Relay mode: turns the org-wide stop on or off, as the relay says. While
+    /// it is on, no link opens or resumes; turning it on ends every link.
+    /// Returns whether it changed.
+    pub async fn set_org_stopped(&self, on: bool) -> bool {
+        let was = self.inner.org_stopped.swap(on, Ordering::SeqCst);
+        if was == on {
+            if on {
+                // A link may have slipped in before the flag was seen; end it too.
+                self.end_all_links("the organization-wide stop is on").await;
+            }
+            return false;
+        }
+        self.inner
+            .audit
+            .event(if on { "org_stop" } else { "org_release" }, []);
+        tracing::warn!(stopped = on, "organization-wide stop changed by the relay");
+        if on {
+            self.end_all_links("the organization-wide stop is on").await;
+        }
+        true
+    }
+
+    /// Whether the org-wide stop is on.
+    pub fn org_stopped(&self) -> bool {
+        self.inner.org_stopped.load(Ordering::SeqCst)
+    }
+
+    /// Ends every open link and its agent, without waiting for running turns.
+    pub async fn end_all_links(&self, reason: &str) {
+        let links: Vec<Arc<Link>> = self.st().links.values().cloned().collect();
+        futures_util::future::join_all(links.iter().map(|l| l.end(ERR_ENDED_BY_ADMIN, reason)))
+            .await;
+        for l in &links {
+            l.finalize();
+        }
+    }
+
     /// Ends a link on an operator's request.
     pub async fn end_link(&self, id: &str) -> bool {
         let l = self.st().links.get(id).cloned();
@@ -466,6 +507,13 @@ impl Server {
         tok: &Token,
         req: &LinkRequest,
     ) -> Result<PendingLink, Rejection> {
+        if self.org_stopped() {
+            return Err(Rejection::new(
+                503,
+                "org_stopped",
+                "the organization-wide stop is on",
+            ));
+        }
         let cfg = self.config();
         let Some(agent) = cfg.agent(&req.agent_id).cloned() else {
             return Err(Rejection::new(
@@ -510,11 +558,25 @@ impl Server {
             )
             .await
         {
-            Ok(link) => Ok(PendingLink {
-                link,
-                last_seq: 0,
-                resumed: false,
-            }),
+            Ok(link) => {
+                // The stop may have come while the agent started: the link is
+                // in the table now, so either the stop ended it or this sees it.
+                if self.org_stopped() {
+                    link.end(ERR_ENDED_BY_ADMIN, "the organization-wide stop is on")
+                        .await;
+                    link.finalize();
+                    return Err(Rejection::new(
+                        503,
+                        "org_stopped",
+                        "the organization-wide stop is on",
+                    ));
+                }
+                Ok(PendingLink {
+                    link,
+                    last_seq: 0,
+                    resumed: false,
+                })
+            }
             Err(e) => Err(Rejection::new(503, "agent_unavailable", e)),
         }
     }

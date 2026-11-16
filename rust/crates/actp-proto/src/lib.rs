@@ -9,6 +9,8 @@ pub mod endpoint;
 pub mod frame;
 pub mod gojson;
 pub mod jsonrpc;
+pub mod relay;
+pub mod wsio;
 
 pub use conn::{FrameConn, Incoming, Outgoing};
 pub use endpoint::{Deliver, Endpoint, Options, ServeEnd, deliver_fn};

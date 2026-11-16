@@ -1,0 +1,141 @@
+# Relay mode
+
+**Rust only.** Relay mode and the relay (`actp-relay`) exist only in the Rust build (`rust/`). The Go `actp serve` does not read the `relay` section and refuses a config file that has one.
+
+In relay mode, a machine does not listen for connections. It connects out to one relay over WSS on port 443, and callers reach it through that relay. This suits a fleet of laptops: nothing listens on a laptop, so there are no firewall rules, no Wi-Fi isolation problems and no VPN, and only one server (the relay) faces callers.
+
+```
+ caller (actp bridge, IT app)                 relay (one, client-hosted)                 laptop
+ ────────────────────────────                 ──────────────────────────                 ─────────────────────
+ https://relay/m/<machine>/… ──── TLS ────►   routes by machine address   ◄── WSS out, device certificate ── actp serve (relay mode)
+```
+
+## What the relay does and does not do
+
+- **It routes.** A caller asks for `/m/<machine>/<path>`. The relay forwards the request, headers and all, to that machine as `<path>`, over a stream the machine opens for it. The caller's credentials reach the machine untouched, and the machine checks them. The relay never decides who may use a machine.
+- **It knows the machines by their device certificates.** Machines log in with the organization's device certificate over mutual TLS. The machine's address is a name in that certificate (the common name by default). The relay never assigns addresses.
+- **It knows who is online,** and when each machine was last seen.
+- **It holds the org-wide stop.** One switch drops every session on every machine and refuses new ones until it is released. Machines are told, and end their sessions themselves too.
+- **It writes its half of the audit:** which caller connected to which machine, when and for how long, and every stop and release, with who and why. Ids, addresses, times and byte counts only, never what a session carries.
+
+The relay sees the traffic it routes, in plaintext. A compromised relay cannot get past a machine's checks with credentials it does not have, but it can read sessions and act inside a session a real caller opened. Host it like any other server that IT relies on.
+
+## The machine
+
+Add a `relay` section to the server config. Nothing else changes: agents, workspaces, tokens and every check apply as before. `listen`, `tls_cert` and `tls_key` are not used, and a tunnel cannot be on.
+
+```yaml
+server:
+  relay:
+    url: wss://relay.example.com          # the relay, on port 443 unless the URL says otherwise
+    cert: /etc/actp/device.pem            # the device certificate, leaf first, then intermediates
+    key: /etc/actp/device.key
+    ca: /etc/actp/relay-ca.pem            # optional: roots for the relay's certificate (default: the OS store)
+  agents: …
+  tokens: …
+```
+
+`actp serve` then connects to the relay and keeps the connection up. After a drop it reconnects, waiting 1 s, then 2 s, and so on up to 30 s, with some jitter so a fleet does not reconnect in step. Sessions survive a drop as usual: the bridge reconnects through the relay and catches up.
+
+The device key is read from a PEM file. Keys that the OS keeps non-exportable (the macOS keychain, the Windows certificate store) need a signer that uses the key store; the `actp_server::relay` API takes any `rustls::ClientConfig`, so an embedding program can supply one.
+
+## The relay
+
+```yaml
+# actp-relay.yaml
+listen: 0.0.0.0:443
+tls_cert: /etc/actp-relay/relay.pem       # the relay's own certificate
+tls_key: /etc/actp-relay/relay.key
+device_ca: /etc/actp-relay/device-ca.pem  # roots of the org's device certificates
+device_crls: []                           # optional revocation lists (PEM or DER)
+machine_name: cn                          # cn, dns or uri: which certificate name is the address
+blocked_machines: []                      # addresses refused even with a valid certificate
+state_dir: /var/lib/actp-relay            # stop.json, machines.json
+log_dir: /var/log/actp-relay              # audit.jsonl
+max_streams_per_machine: 32
+admin_tokens:
+  - name: dave                            # recorded with every stop and release
+    hash: sha256:…                        # from `actp-relay token create`
+```
+
+```bash
+actp-relay serve --config /etc/actp-relay/actp-relay.yaml
+```
+
+The relay must terminate TLS itself: a TLS proxy in front of it would hide the device certificates.
+
+A machine address has 1 to 253 characters: letters, digits and `.`, `-`, `_`, `@`, `:`, `+`, `~`. A certificate whose name does not fit, or that carries more than one name of the chosen kind, is refused. Addresses are compared exactly.
+
+### Callers
+
+Point the bridge at the machine's address under the relay:
+
+```bash
+actp claude@https://relay.example.com/m/C02XK1ABJG5H --token-env ACTP_TOKEN
+```
+
+| Answer | Meaning |
+| --- | --- |
+| `503 machine_offline` | The machine is not connected to the relay. |
+| `503 org_stopped` | The org-wide stop is on. |
+| `429 machine_busy` | Too many callers are using the machine (`max_streams_per_machine`). |
+| `504 machine_timeout` | The machine did not open a stream or answer in time. |
+
+Anything else comes from the machine itself.
+
+### Management
+
+All three need an admin token (`Authorization: Bearer …`).
+
+```bash
+curl -H "Authorization: Bearer $ADMIN" https://relay.example.com/relay/v1/machines
+```
+
+```json
+{
+  "stop": {"stopped": false, "by": "", "reason": "", "at": ""},
+  "machines": [
+    {"machine": "C02XK1ABJG5H", "online": true, "connected_since": "2026-11-16T09:12:03.120Z",
+     "first_seen": "2026-11-02T08:00:41.000Z", "last_seen": "2026-11-16T10:40:00.512Z", "sessions": 1}
+  ]
+}
+```
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN" -d '{"reason": "suspicious activity on the IT account"}' https://relay.example.com/relay/v1/stop
+```
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN" -d '{"reason": "account secured"}' https://relay.example.com/relay/v1/release
+```
+
+`GET /relay/v1/stop` shows the stop. A reason is required for both. The stop is written to `state_dir/stop.json` and survives a restart; if that file cannot be read, the relay starts with the stop on. A release is written before it takes effect, so a release that cannot be recorded does not happen.
+
+### Audit
+
+`log_dir/audit.jsonl`, one JSON object per line:
+
+| Event | Fields |
+| --- | --- |
+| `machine_online`, `machine_replaced` | `machine`, `remote` |
+| `machine_offline` | `machine`, `seconds`, `reason` |
+| `machine_refused` | `remote`, `route`, `reason`, and `machine` when the certificate named one |
+| `session_open` | `session`, `machine`, `remote`, `agent`, `link` (first 8 characters), `resumed`, `client_name` |
+| `session_closed` | `session`, `machine`, `seconds`, `bytes_to_machine`, `bytes_to_caller`, `reason` |
+| `caller_answered` | `machine`, `remote`, `agent`, `status` (a link request the machine refused) |
+| `caller_refused` | `machine`, `remote`, `reason` |
+| `org_stop` | `by`, `reason`, `sessions_dropped` |
+| `org_release` | `by`, `reason` |
+| `admin_refused` | `remote`, `route` |
+
+`client_name` is what the caller says about itself; the relay does not check it. The machine's own audit log records who the machine authenticated.
+
+## Protocol
+
+Between a machine and the relay (`actp_proto::relay`):
+
+1. The machine opens `wss://<relay>/relay/v1/connect` with its device certificate and the WebSocket subprotocol `actp-relay.v1`. The relay answers with `{"type":"hello","machine":"<address>","stopped":<bool>}` and pings every 15 s; the machine pings every 20 s. Either side drops a connection that stays silent too long.
+2. When a caller arrives, the relay sends `{"type":"open","stream":"<64 hex>"}`. The machine opens `wss://<relay>/relay/v1/stream/<id>` with its certificate and subprotocol `actp-relay-stream.v1`. Only the machine that was asked can take the stream. Binary messages on it carry the caller's HTTP connection byte for byte, and the machine serves it like any other connection.
+3. `{"type":"stop"}` and `{"type":"release"}` carry the org-wide stop. While it is on, the machine ends every link and refuses new ones and resumes with `503 org_stopped`, whatever the relay does next.
+
+Unknown message types are ignored, so a newer relay can add messages.

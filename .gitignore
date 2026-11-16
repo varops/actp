@@ -1,1 +1,4 @@
 dist/
+
+# Scratch files for local work
+.scratch/
