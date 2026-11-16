@@ -435,15 +435,30 @@ async fn only_the_machine_asked_can_take_a_stream() {
     let env = start_relay(&pki, &dir).await;
     let a = pki.device("laptop-a", None);
     let b = pki.device("laptop-b", None);
-    let mut ctl = dial_as(&pki, env.port, &a, "/relay/v1/connect", PROTOCOL_CONTROL)
+    let ctl = dial_as(&pki, env.port, &a, "/relay/v1/connect", PROTOCOL_CONTROL)
         .await
         .unwrap();
-    let next = |m: Option<Result<Message, _>>| match m {
-        Some(Ok(Message::Text(t))) => Control::decode(t.as_str()).unwrap(),
-        other => panic!("expected a control message, got {other:?}"),
+    // Read the control connection all the time, as a machine does, so pings
+    // are answered; hand the control messages over.
+    let (ctl_tx, mut ctl_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut ctl = ctl;
+        while let Some(Ok(m)) = ctl.next().await {
+            if let Message::Text(t) = m {
+                if let Some(c) = Control::decode(t.as_str()) {
+                    let _ = ctl_tx.send(c);
+                }
+            }
+        }
+    });
+    let mut next = async || {
+        tokio::time::timeout(Duration::from_secs(10), ctl_rx.recv())
+            .await
+            .expect("a control message in time")
+            .expect("control connection open")
     };
     assert_eq!(
-        next(ctl.next().await),
+        next().await,
         Control::Hello {
             machine: "laptop-a".into(),
             stopped: false
@@ -463,9 +478,8 @@ async fn only_the_machine_asked_can_take_a_stream() {
         request_with(tls, port, "GET", "/m/laptop-a/api/v1/info", TOKEN, None).await
     });
     let id = loop {
-        match next(ctl.next().await) {
-            Control::Open { stream } => break stream,
-            _ => continue,
+        if let Control::Open { stream } = next().await {
+            break stream;
         }
     };
     // laptop-b cannot take laptop-a's stream, and trying does not use it up.
