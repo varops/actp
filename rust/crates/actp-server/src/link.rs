@@ -69,7 +69,8 @@ struct LinkState {
     client_reqs: HashMap<String, ClientReq>,
     agent_reqs: HashMap<String, AgentReq>,
     sessions: HashMap<String, LinkSession>,
-    server_reqs: HashSet<String>,
+    /// actp's own requests; a sender gets the agent's answer.
+    server_reqs: HashMap<String, Option<tokio::sync::oneshot::Sender<Message>>>,
     next_server_req: u64,
     cancel_sent: bool,
     tomb: Option<Tombstone>,
@@ -145,7 +146,7 @@ impl Link {
                     client_reqs: HashMap::new(),
                     agent_reqs: HashMap::new(),
                     sessions: HashMap::new(),
-                    server_reqs: HashSet::new(),
+                    server_reqs: HashMap::new(),
                     next_server_req: 0,
                     cancel_sent: false,
                     tomb: None,
@@ -628,16 +629,28 @@ impl Link {
             Kind::Response => {
                 let req = {
                     let mut st = self.st();
-                    if st.server_reqs.remove(&m.id_key()) {
+                    if let Some(answer) = st.server_reqs.remove(&m.id_key()) {
+                        if let Some(tx) = answer {
+                            let _ = tx.send(m);
+                        }
                         return;
                     }
                     st.client_reqs.remove(&m.id_key())
                 };
                 let out = match req {
-                    Some(req) => self.after_response(req, m),
-                    None => m,
+                    Some(req) => {
+                        let (out, opened) = self.after_response(req, m);
+                        match opened {
+                            Some(sid) => self.check_starting_mode(out, sid).await,
+                            None => Some(out),
+                        }
+                    }
+                    None => Some(m),
                 };
-                self.to_client(&out);
+                // None: held until the agent answers actp's own request.
+                if let Some(out) = out {
+                    self.to_client(&out);
+                }
             }
             Kind::Request => match self.answer_agent_request(&m) {
                 Some(reply) => self.write_agent(&reply).await,
@@ -672,11 +685,12 @@ impl Link {
     }
 
     /// Tracks sessions and turns from a response, and rewrites it for the client.
-    fn after_response(self: &Arc<Self>, req: ClientReq, m: Message) -> Message {
+    /// Also returns the session id when the response opened a session.
+    fn after_response(self: &Arc<Self>, req: ClientReq, m: Message) -> (Message, Option<String>) {
         match req.method.as_str() {
             "initialize" => {
                 if m.error.is_some() {
-                    return m;
+                    return (m, None);
                 }
                 let result = gojson::object(m.result.as_deref().unwrap_or(""))
                     .ok()
@@ -717,7 +731,7 @@ impl Link {
                 if let Some(stripped) = rewrite::strip_terminal_auth(m.result.as_deref())
                     && let Ok(out) = m.with_result(&stripped)
                 {
-                    return out;
+                    return (out, None);
                 }
             }
             "session/set_config_option" | "session/options" => {
@@ -745,7 +759,7 @@ impl Link {
                     if is_auth_error(e) {
                         self.srv.mark_auth_required(&self.agent.id, &e.message);
                     }
-                    return m;
+                    return (m, None);
                 }
                 let mut id = req.session_id.clone();
                 if req.method == "session/new" || req.method == "session/fork" {
@@ -780,6 +794,9 @@ impl Link {
                     st.auth_hint.clear();
                     st.error.clear();
                 });
+                if !id.is_empty() {
+                    return (m, Some(id));
+                }
             }
             "session/prompt" => {
                 if let Some(sess) = self.st().sessions.get_mut(&req.session_id) {
@@ -793,7 +810,7 @@ impl Link {
             }
             "session/list" => {
                 if !req.cwd.is_empty() && m.error.is_none() {
-                    return map_list_cwd(&m, &req.cwd, &req.orig_cwd);
+                    return (map_list_cwd(&m, &req.cwd, &req.orig_cwd), None);
                 }
             }
             "session/close" => {
@@ -803,7 +820,7 @@ impl Link {
             }
             _ => {}
         }
-        m
+        (m, None)
     }
 
     /// Answers agent→client requests the server handles itself, and records
@@ -867,11 +884,118 @@ impl Link {
             let mut st = self.st();
             st.next_server_req += 1;
             let id = format!("\"actp-{}\"", st.next_server_req);
-            st.server_reqs.insert(id.clone());
+            st.server_reqs.insert(id.clone(), None);
             id
         };
         self.write_agent(&jsonrpc::new_request(&id, method, params))
             .await;
+    }
+
+    /// `server_request` whose answer arrives on the returned receiver.
+    async fn server_request_then(
+        &self,
+        method: &str,
+        params: GoValue,
+    ) -> tokio::sync::oneshot::Receiver<Message> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let id = {
+            let mut st = self.st();
+            st.next_server_req += 1;
+            let id = format!("\"actp-{}\"", st.next_server_req);
+            st.server_reqs.insert(id.clone(), Some(tx));
+            id
+        };
+        self.write_agent(&jsonrpc::new_request(&id, method, params))
+            .await;
+        rx
+    }
+
+    /// Makes sure a session does not start in a refused mode. An agent can pick
+    /// it from project settings in the workspace (Claude Code reads
+    /// `permissions.defaultMode` from `.claude/settings.json`), so the client
+    /// never asked for it. The session is switched to an allowed mode before the
+    /// client sees the response; if that fails, the session is closed and the
+    /// client gets an error. `None`: the response is held until the agent answers.
+    async fn check_starting_mode(self: &Arc<Self>, m: Message, sid: String) -> Option<Message> {
+        let (current, offered) = crate::modes::starting_modes(m.result.as_deref());
+        let allowed = |mode: &str| crate::modes::mode_allowed(&self.agent, &self.token, mode);
+        let Some(bad) = current.into_iter().find(|mode| !allowed(mode)) else {
+            return Some(m);
+        };
+        let Some(target) = crate::modes::reset_target(&offered, allowed) else {
+            self.refuse_starting_mode(&m, &sid, &bad, "the agent offers no allowed mode")
+                .await;
+            return None;
+        };
+        self.srv.audit().event(
+            "mode_reset",
+            [
+                ("link", sv(short(&self.id))),
+                ("session", sv(&sid)),
+                ("from", sv(&bad)),
+                ("to", sv(&target)),
+            ],
+        );
+        let rx = self
+            .server_request_then(
+                "session/set_mode",
+                map([("sessionId", s(sid.clone())), ("modeId", s(target.clone()))]),
+            )
+            .await;
+        let me = self.clone();
+        tokio::spawn(async move {
+            let Ok(answer) = rx.await else {
+                return; // the link ended first
+            };
+            if let Some(e) = &answer.error {
+                me.refuse_starting_mode(
+                    &m,
+                    &sid,
+                    &bad,
+                    &format!("the agent refused the switch: {}", e.message),
+                )
+                .await;
+                return;
+            }
+            match crate::modes::rewrite_starting_mode(m.result.as_deref(), &target)
+                .and_then(|r| m.with_result(&r).ok())
+            {
+                Some(out) => me.to_client(&out),
+                None => {
+                    me.refuse_starting_mode(&m, &sid, &bad, "the response could not be rewritten")
+                        .await
+                }
+            }
+        });
+        None
+    }
+
+    async fn refuse_starting_mode(&self, m: &Message, sid: &str, bad: &str, reason: &str) {
+        self.srv.audit().event(
+            "mode_reset_failed",
+            [
+                ("link", sv(short(&self.id))),
+                ("session", sv(sid)),
+                ("mode", sv(bad)),
+                ("reason", sv(reason)),
+            ],
+        );
+        let can_close = {
+            let mut st = self.st();
+            st.sessions.remove(sid);
+            st.can_close
+        };
+        self.srv.release_session(&self.agent.id, sid, self);
+        if can_close {
+            self.server_request("session/close", map([("sessionId", s(sid.to_string()))]))
+                .await;
+        }
+        let id = m.id.clone().unwrap_or_default();
+        self.to_client(&jsonrpc::new_error(
+            &id,
+            jsonrpc::CODE_SERVER_ERROR,
+            &format!("session refused: it starts in mode {bad}, which is not allowed here, and could not be switched to an allowed mode"),
+        ));
     }
 
     async fn cancel_running_turns(&self) {

@@ -137,6 +137,120 @@ pub fn permission_picks_mode(result: Option<&str>, offered: &HashSet<String>) ->
     (offered.contains(id) || id == "bypassPermissions").then(|| id.to_string())
 }
 
+/// A session response's current mode values (`modes.currentModeId` and the
+/// `currentValue` of mode config options) and the modes it offers, in order.
+pub fn starting_modes(result: Option<&str>) -> (Vec<String>, Vec<String>) {
+    let (mut current, mut offered) = (Vec::new(), Vec::new());
+    let Some(v) = result.and_then(gojson::decode_any) else {
+        return (current, offered);
+    };
+    let add = |list: &mut Vec<String>, v: Option<&serde_json::Value>| {
+        if let Some(s) = v.and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+            && !list.iter().any(|x| x == s)
+        {
+            list.push(s.to_string());
+        }
+    };
+    add(&mut current, v.pointer("/modes/currentModeId"));
+    for m in v
+        .pointer("/modes/availableModes")
+        .and_then(|m| m.as_array())
+        .into_iter()
+        .flatten()
+    {
+        add(&mut offered, m.get("id"));
+    }
+    for o in v
+        .get("configOptions")
+        .and_then(|c| c.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let is_mode = o.get("category").and_then(|c| c.as_str()) == Some("mode")
+            || o.get("id").and_then(|c| c.as_str()) == Some("mode");
+        if !is_mode {
+            continue;
+        }
+        add(&mut current, o.get("currentValue"));
+        for opt in o
+            .get("options")
+            .and_then(|c| c.as_array())
+            .into_iter()
+            .flatten()
+        {
+            add(&mut offered, opt.get("value"));
+        }
+    }
+    (current, offered)
+}
+
+/// The mode a session that starts in a refused mode is switched to: the
+/// agent's `default` when offered and allowed, else the first allowed mode it
+/// offers, else none.
+pub fn reset_target(offered: &[String], allowed: impl Fn(&str) -> bool) -> Option<String> {
+    if offered.iter().any(|m| m == "default") && allowed("default") {
+        return Some("default".into());
+    }
+    offered.iter().find(|m| allowed(m)).cloned()
+}
+
+/// Shows `mode` as the session's current mode in a session response.
+pub fn rewrite_starting_mode(result: Option<&str>, mode: &str) -> Option<String> {
+    let mut r = gojson::decode_raw_map(result).ok()??;
+    let enc = gojson::string(mode);
+    if let Some(raw) = r.get("modes").cloned()
+        && let Ok(Some(mut modes)) = gojson::decode_raw_map(Some(&raw))
+    {
+        modes.insert("currentModeId".into(), enc.clone());
+        r.insert("modes".into(), gojson::encode_raw_map(&Some(modes)));
+    }
+    if let Some(raw) = r.get("configOptions").cloned()
+        && let Ok(mut opts) = gojson::decode_raw_maps(Some(&raw))
+    {
+        for o in opts.iter_mut().flatten().flatten() {
+            let id = gojson::string_or_empty(o.get("id").map(String::as_str));
+            let category = gojson::string_or_empty(o.get("category").map(String::as_str));
+            if category == "mode" || id == "mode" {
+                o.insert("currentValue".into(), enc.clone());
+            }
+        }
+        r.insert("configOptions".into(), gojson::encode_raw_maps(&opts));
+    }
+    Some(gojson::encode_raw_map(&Some(r)))
+}
+
+#[cfg(test)]
+mod starting_tests {
+    use super::*;
+
+    #[test]
+    fn starting_mode_helpers() {
+        let result = r#"{"sessionId":"s","modes":{"currentModeId":"bypassPermissions","availableModes":[{"id":"bypassPermissions"},{"id":"acceptEdits"},{"id":"default"}]},"configOptions":[{"id":"mode","category":"mode","type":"select","currentValue":"bypassPermissions","options":[{"value":"bypassPermissions"},{"value":"plan"}]},{"id":"model","currentValue":"opus"}]}"#;
+        let (current, offered) = starting_modes(Some(result));
+        assert_eq!(current, ["bypassPermissions"]);
+        assert_eq!(
+            offered,
+            ["bypassPermissions", "acceptEdits", "default", "plan"]
+        );
+        let agent = Agent {
+            permissions: "forward".into(),
+            ..Default::default()
+        };
+        let tok = Token::default();
+        let allowed = |m: &str| mode_allowed(&agent, &tok, m);
+        assert_eq!(reset_target(&offered, allowed).as_deref(), Some("default"));
+        assert_eq!(
+            reset_target(&["bypassPermissions".into(), "plan".into()], allowed).as_deref(),
+            Some("plan")
+        );
+        assert_eq!(reset_target(&["bypassPermissions".into()], allowed), None);
+        assert_eq!(
+            rewrite_starting_mode(Some(result), "default").unwrap(),
+            r#"{"configOptions":[{"category":"mode","currentValue":"default","id":"mode","options":[{"value":"bypassPermissions"},{"value":"plan"}],"type":"select"},{"currentValue":"opus","id":"model"}],"modes":{"availableModes":[{"id":"bypassPermissions"},{"id":"acceptEdits"},{"id":"default"}],"currentModeId":"default"},"sessionId":"s"}"#
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

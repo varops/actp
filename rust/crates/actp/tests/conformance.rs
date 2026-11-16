@@ -1010,6 +1010,93 @@ async fn session_modes(bridge: Impl, server: Impl) {
     }
 }
 
+/// A session must not start in a refused mode that the agent picked from
+/// project settings in the workspace (`.claude/settings.json`): it is switched
+/// to an allowed mode before the client sees it, or refused.
+async fn open_in(c: &mut Client, dir: &str) -> (String, Value) {
+    c.call(
+        "session/new",
+        json!({"cwd": format!("actp://site/{dir}"), "mcpServers": []}),
+    )
+    .await
+}
+
+async fn starting_mode(bridge: Impl, server: Impl) {
+    let s = ServerProc::start(server, "startmode", false).await;
+    let settings = |dir: &str, file: &str, body: &str| {
+        let d = s.dirs.site.join(dir).join(".claude");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(file), body).unwrap();
+    };
+    settings(
+        "bypass",
+        "settings.json",
+        r#"{"permissions":{"defaultMode":"Bypass"}}"#,
+    );
+    settings(
+        "edits",
+        "settings.local.json",
+        r#"{"permissions":{"defaultMode":"acceptEdits"}}"#,
+    );
+    settings(
+        "locked",
+        "settings.json",
+        r#"{"permissions":{"defaultMode":"bypass"},"actpTest":{"refuseSetMode":true}}"#,
+    );
+    settings(
+        "only",
+        "settings.json",
+        r#"{"permissions":{"defaultMode":"bypassPermissions"},"actpTest":{"modes":["bypassPermissions"]}}"#,
+    );
+    let starts_in = |v: &Value, mode: &str| {
+        v["result"]["modes"]["currentModeId"] == mode
+            && v["result"]["configOptions"][0]["currentValue"] == mode
+    };
+
+    let mut c = Client::start(bridge, &s, s.port, "test", TOKEN, &[]).await;
+    c.initialize().await;
+    // bypassPermissions from the settings file: switched to default first.
+    let (raw, v) = open_in(&mut c, "bypass").await;
+    assert!(starts_in(&v, "default"), "{raw}");
+    let sid = v["result"]["sessionId"].as_str().unwrap().to_string();
+    let id = c.prompt(&sid, "mode").await;
+    c.wait("agent mode", |v| {
+        v["method"] == "session/update" && chunk_text(v) == "mode: default"
+    })
+    .await;
+    c.response(id).await;
+    // acceptEdits is allowed under forward permissions...
+    let (raw, v) = open_in(&mut c, "edits").await;
+    assert!(starts_in(&v, "acceptEdits"), "{raw}");
+    // ...and if the agent refuses the switch, or offers no allowed mode, the session is refused.
+    let (raw, _) = open_in(&mut c, "locked").await;
+    let refusal = |n: i64| {
+        format!(
+            r#"{{"error":{{"code":-32000,"message":"session refused: it starts in mode bypassPermissions, which is not allowed here, and could not be switched to an allowed mode"}},"id":{n},"jsonrpc":"2.0"}}"#
+        )
+    };
+    assert_eq!(raw, refusal(c.next_id));
+    let (raw, _) = open_in(&mut c, "only").await;
+    assert_eq!(raw, refusal(c.next_id));
+
+    // Under auto_deny, acceptEdits from the settings is switched to default too.
+    let mut strict = Client::start(bridge, &s, s.port, "test", STRICT_TOKEN, &[]).await;
+    strict.initialize().await;
+    let (raw, v) = open_in(&mut strict, "edits").await;
+    assert!(starts_in(&v, "default"), "{raw}");
+
+    let audit = s.audit();
+    assert!(
+        audit.contains("\"event\":\"mode_reset\"")
+            && audit.contains("\"event\":\"mode_reset_failed\""),
+        "{audit}"
+    );
+    for mut client in [c, strict] {
+        client.close_stdin();
+        assert_eq!(client.exit().await.0, 0);
+    }
+}
+
 async fn wait_until(what: &str, f: impl Fn() -> bool) {
     let deadline = tokio::time::Instant::now() + WAIT;
     while !f() {
@@ -1053,6 +1140,7 @@ pairings!(agent_crash);
 pairings!(ambiguous_envelope);
 pairings!(session_routes);
 pairings!(session_modes);
+pairings!(starting_mode);
 #[cfg(unix)]
 pairings!(token_revoke);
 

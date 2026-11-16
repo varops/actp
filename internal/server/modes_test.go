@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/varops/actp/internal/config"
@@ -75,5 +76,32 @@ func TestLearnModesAndPermissionAnswers(t *testing.T) {
 	}
 	if got := permissionPicksMode(json.RawMessage(`{"outcome":{"outcome":"selected","optionId":"bypassPermissions"}}`), nil); got != "bypassPermissions" {
 		t.Errorf("bypass is always a mode: %q", got)
+	}
+}
+
+func TestStartingModes(t *testing.T) {
+	result := json.RawMessage(`{"sessionId":"s","modes":{"currentModeId":"bypassPermissions","availableModes":[{"id":"bypassPermissions"},{"id":"acceptEdits"},{"id":"default"}]},"configOptions":[{"id":"mode","category":"mode","type":"select","currentValue":"bypassPermissions","options":[{"value":"bypassPermissions"},{"value":"plan"}]},{"id":"model","currentValue":"opus"}]}`)
+	current, offered := startingModes(result)
+	if strings.Join(current, ",") != "bypassPermissions" || strings.Join(offered, ",") != "bypassPermissions,acceptEdits,default,plan" {
+		t.Fatalf("current %v offered %v", current, offered)
+	}
+	agent, tok := &config.Agent{Permissions: "forward"}, &config.Token{}
+	allowed := func(m string) bool { return modeAllowed(agent, tok, m) }
+	if got := resetTarget(offered, allowed); got != "default" {
+		t.Errorf("target %q", got)
+	}
+	if got := resetTarget([]string{"bypassPermissions", "plan"}, allowed); got != "plan" {
+		t.Errorf("first allowed: %q", got)
+	}
+	if got := resetTarget([]string{"bypassPermissions"}, allowed); got != "" {
+		t.Errorf("none allowed: %q", got)
+	}
+	out, err := rewriteStartingMode(result, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"configOptions":[{"category":"mode","currentValue":"default","id":"mode","options":[{"value":"bypassPermissions"},{"value":"plan"}],"type":"select"},{"currentValue":"opus","id":"model"}],"modes":{"availableModes":[{"id":"bypassPermissions"},{"id":"acceptEdits"},{"id":"default"}],"currentModeId":"default"},"sessionId":"s"}`
+	if string(out) != want {
+		t.Errorf("rewrite:\n%s\nwant\n%s", out, want)
 	}
 }
