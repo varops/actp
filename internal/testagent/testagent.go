@@ -195,6 +195,9 @@ func (a *agent) handle(m *jsonrpc.Message) {
 		} else if m.Method == "session/new" {
 			s.ID = fmt.Sprintf("s-%d", time.Now().UnixNano())
 		} else {
+			if st.loadMs > 0 {
+				time.Sleep(time.Duration(st.loadMs) * time.Millisecond)
+			}
 			stored, err := a.load(p.SessionID)
 			if err != nil {
 				a.send(jsonrpc.NewError(m.ID, jsonrpc.CodeInvalidParams, "unknown session", nil))
@@ -488,6 +491,7 @@ type settings struct {
 	refuse  bool
 	delayMs int
 	ignore  bool
+	loadMs  int
 }
 
 // projectSettings reads the starting mode from the workspace, as Claude's
@@ -508,6 +512,7 @@ func projectSettings(cwd string) settings {
 				Modes          []string `json:"modes"`
 				RefuseSetMode  bool     `json:"refuseSetMode"`
 				SetModeDelayMs int      `json:"setModeDelayMs"`
+				LoadDelayMs    int      `json:"loadDelayMs"`
 				IgnoreSetMode  bool     `json:"ignoreSetMode"`
 			} `json:"actpTest"`
 		}
@@ -525,6 +530,9 @@ func projectSettings(cwd string) settings {
 		out.ignore = out.ignore || st.ActpTest.IgnoreSetMode
 		if st.ActpTest.SetModeDelayMs > 0 {
 			out.delayMs = st.ActpTest.SetModeDelayMs
+		}
+		if st.ActpTest.LoadDelayMs > 0 {
+			out.loadMs = st.ActpTest.LoadDelayMs
 		}
 	}
 	return out

@@ -36,6 +36,12 @@ type Options struct {
 	// ModeResetTimeout bounds how long an agent may take to answer actp's
 	// switch of a session's starting mode (10 s).
 	ModeResetTimeout time.Duration
+	// HeldLoadTimeout bounds how long a session/load or session/resume may
+	// hold the session's next messages (60 s); MaxHeldMessages and MaxHeldBytes
+	// bound that queue (256 messages, 8 MB).
+	HeldLoadTimeout time.Duration
+	MaxHeldMessages int
+	MaxHeldBytes    int
 }
 
 // Server holds configuration, links and agent status.
@@ -82,6 +88,15 @@ func New(cfg *config.Server, opts Options) (*Server, error) {
 	}
 	if opts.ModeResetTimeout == 0 {
 		opts.ModeResetTimeout = 10 * time.Second
+	}
+	if opts.HeldLoadTimeout == 0 {
+		opts.HeldLoadTimeout = time.Minute
+	}
+	if opts.MaxHeldMessages == 0 {
+		opts.MaxHeldMessages = 256
+	}
+	if opts.MaxHeldBytes == 0 {
+		opts.MaxHeldBytes = 8 << 20
 	}
 	ctx, stop := context.WithCancel(context.Background())
 	s := &Server{
