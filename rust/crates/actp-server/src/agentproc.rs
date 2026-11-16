@@ -50,7 +50,9 @@ impl Process {
         }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // An agent never outlives the runtime that supervises it.
+            .kill_on_drop(true);
         set_process_group(&mut cmd);
         let mut child = cmd.spawn()?;
         let pid = child.id().unwrap_or(0);
@@ -63,7 +65,6 @@ impl Process {
         let tail = stderr.clone();
         let exit2 = exit.clone();
         tokio::spawn(async move {
-            // Like Go's cmd.Wait: done once the process exited and its stderr is drained.
             let copy = async {
                 if let Some(p) = stderr_pipe.as_mut() {
                     let mut buf = [0u8; 4096];
@@ -82,7 +83,17 @@ impl Process {
                     }
                 }
             };
-            let (status, _) = tokio::join!(child.wait(), copy);
+            // Like Go's cmd.Wait, done waits for stderr to drain, but only briefly after
+            // the exit: on Windows a pipe handle inherited by a sibling agent spawned at
+            // the same moment can keep stderr open long after this agent exited.
+            tokio::pin!(copy);
+            let status = tokio::select! {
+                s = child.wait() => {
+                    let _ = tokio::time::timeout(Duration::from_secs(2), &mut copy).await;
+                    s
+                }
+                _ = &mut copy => child.wait().await,
+            };
             let code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
             *exit2.lock().unwrap_or_else(|e| e.into_inner()) = Some(code);
             done_tx.send_replace(true);
