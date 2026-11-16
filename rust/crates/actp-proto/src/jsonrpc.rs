@@ -87,10 +87,10 @@ pub fn parse(raw: &str) -> Result<Message, DecodeError> {
         result,
         error,
     };
-    match id.as_deref() {
-        Some("null") if m.method.is_empty() => m.id = Some("null".into()),
-        Some("null") | None => {}
-        Some(other) => m.id = Some(gojson::compact(other, false)),
+    // An id key makes a message with a method a request, even with a null id:
+    // that is how agents (for example the ACP TypeScript SDK) read it.
+    if let Some(id) = id.as_deref() {
+        m.id = Some(gojson::compact(id, false));
     }
     if m.method.is_empty() && m.id.is_none() {
         return Err(DecodeError(
@@ -131,6 +131,79 @@ impl Message {
             .insert(key.to_string(), value.to_string());
         parse(&gojson::encode_raw_map(&obj))
     }
+}
+
+/// The JSON-RPC fields actp routes and rewrites by.
+const ENVELOPE_KEYS: [&str; 6] = ["jsonrpc", "id", "method", "params", "result", "error"];
+
+/// A message whose envelope two JSON decoders can read differently.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ambiguous {
+    pub reason: String,
+    /// The message's id when it has exactly one non-null `"id"` key.
+    pub id: Option<String>,
+    /// Whether a method key is present in any spelling.
+    pub request: bool,
+}
+
+impl std::fmt::Display for Ambiguous {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ambiguous JSON-RPC envelope: {}", self.reason)
+    }
+}
+
+impl std::error::Error for Ambiguous {}
+
+/// Refuses a message that Go-style decoding (case-insensitive keys, last one
+/// wins) and a peer's exact-key decoding could read differently: a key that
+/// differs from an envelope field only in case, or an envelope field given
+/// twice. Messages that are not JSON objects are left to [`parse`].
+pub fn check_envelope(raw: &str) -> Result<(), Ambiguous> {
+    if gojson::kind(raw) != gojson::Kind::Object {
+        return Ok(());
+    }
+    let Ok(Some(entries)) = gojson::object(raw) else {
+        return Ok(());
+    };
+    let mut a = Ambiguous {
+        reason: String::new(),
+        id: None,
+        request: false,
+    };
+    let mut seen = [0usize; ENVELOPE_KEYS.len()];
+    let mut ids = Vec::new();
+    for (key, val) in &entries.0 {
+        for (i, name) in ENVELOPE_KEYS.iter().enumerate() {
+            if !gojson::field_matches(key, name) {
+                continue;
+            }
+            if *name == "method" {
+                a.request = true;
+            }
+            if key != name {
+                if a.reason.is_empty() {
+                    a.reason = format!("key {key:?} differs from {name:?} only in case");
+                }
+            } else {
+                seen[i] += 1;
+                if *name == "id" {
+                    ids.push(val.get());
+                }
+                if seen[i] == 2 && a.reason.is_empty() {
+                    a.reason = format!("key {name:?} appears more than once");
+                }
+            }
+        }
+    }
+    if a.reason.is_empty() {
+        return Ok(());
+    }
+    if let [id] = ids.as_slice()
+        && gojson::kind(id) != gojson::Kind::Null
+    {
+        a.id = Some(gojson::compact(id, false));
+    }
+    Err(a)
 }
 
 /// Encodes params the way `WithParams(map[string]json.RawMessage)` does.
@@ -290,11 +363,12 @@ mod tests {
             parse(r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"x"}}"#).unwrap();
         assert_eq!(null_id.kind(), Kind::Response);
         assert_eq!(null_id.id.as_deref(), Some("null"));
+        // An id key, even null, makes a request: agents read it that way.
         assert_eq!(
             parse(r#"{"jsonrpc":"2.0","id":null,"method":"m"}"#)
                 .unwrap()
                 .kind(),
-            Kind::Notification
+            Kind::Request
         );
         assert!(parse(r#"{"jsonrpc":"2.0"}"#).is_err());
         assert!(parse(r#"{"method":5,"id":1}"#).is_err());
@@ -310,6 +384,68 @@ mod tests {
                 data: Some(r#"{"x":1}"#.into())
             })
         );
+    }
+
+    #[test]
+    fn envelope_ambiguity_is_refused() {
+        for ok in [
+            r#"{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/","Cwd":"x"}}"#,
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{},"_meta":{"id":1}}"#,
+            "[1,2]",
+            "not json",
+        ] {
+            assert_eq!(check_envelope(ok), Ok(()), "{ok}");
+        }
+        let refused: &[(&str, Option<&str>, bool)] = &[
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":"session/new","Method":"session/prompt","params":{}}"#,
+                Some("1"),
+                true,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":7,"Id":null,"method":"session/new","params":{}}"#,
+                Some("7"),
+                true,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":"x","Params":{}}"#,
+                Some("1"),
+                true,
+            ),
+            (r#"{"jsonrpc":"2.0","ID":1,"method":"x"}"#, None, true),
+            (r#"{"JSONRPC":"2.0","id":1,"method":"x"}"#, Some("1"), true),
+            (r#"{"jsonrpc":"2.0","id":1,"Result":{}}"#, Some("1"), false),
+            (r#"{"jsonrpc":"2.0","id":1,"ERROR":{}}"#, Some("1"), false),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"id":2,"method":"x"}"#,
+                None,
+                true,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":"x","method":"y"}"#,
+                Some("1"),
+                true,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":"x","params":{},"params":{}}"#,
+                Some("1"),
+                true,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":"x","\u0050arams":{}}"#,
+                Some("1"),
+                true,
+            ),
+            (
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"x\",\"param\u{17f}\":{}}",
+                Some("1"),
+                true,
+            ),
+        ];
+        for (raw, id, request) in refused {
+            let a = check_envelope(raw).expect_err(raw);
+            assert_eq!((a.id.as_deref(), a.request), (*id, *request), "{raw}");
+        }
     }
 
     #[test]

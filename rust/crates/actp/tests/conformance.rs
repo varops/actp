@@ -733,6 +733,65 @@ async fn agent_crash(bridge: Impl, server: Impl) {
     );
 }
 
+/// Messages whose envelope two decoders could read differently (a key in two
+/// spellings) must be refused before any policy, not forwarded: otherwise the
+/// server routes by one reading and the agent acts on the other.
+async fn ambiguous_envelope(bridge: Impl, server: Impl) {
+    let s = ServerProc::start(server, "envelope", false).await;
+    let mut c = Client::start(bridge, &s, s.port, "test", TOKEN, &[]).await;
+    c.initialize().await;
+    // A: the server would see session/prompt, the agent session/new in "/".
+    c.send(json!({"jsonrpc": "2.0", "id": 10, "method": "session/new", "Method": "session/prompt", "params": {"cwd": "/", "mcpServers": [{"name": "x", "command": "not-a-real-command", "args": [], "env": []}]}})).await;
+    let (raw, _) = c.response(10).await;
+    assert_eq!(
+        raw,
+        r#"{"error":{"code":-32600,"message":"invalid request: ambiguous JSON-RPC envelope: key \"Method\" differs from \"method\" only in case"},"id":10,"jsonrpc":"2.0"}"#
+    );
+    // B: the server would see a notification, the agent a request.
+    c.send(json!({"jsonrpc": "2.0", "id": 11, "Id": null, "method": "session/new", "params": {"cwd": "/", "mcpServers": []}})).await;
+    let (raw, _) = c.response(11).await;
+    assert_eq!(
+        raw,
+        r#"{"error":{"code":-32600,"message":"invalid request: ambiguous JSON-RPC envelope: key \"Id\" differs from \"id\" only in case"},"id":11,"jsonrpc":"2.0"}"#
+    );
+    // A null id is still a request, so its cwd is checked.
+    c.send(json!({"jsonrpc": "2.0", "id": null, "method": "session/new", "params": {"cwd": "/", "mcpServers": []}})).await;
+    let (raw, _) = c
+        .wait("null-id answer", |v| {
+            v.get("id") == Some(&Value::Null) && v.get("error").is_some()
+        })
+        .await;
+    assert_eq!(
+        raw,
+        r#"{"error":{"code":-32602,"message":"cwd not allowed: /"},"id":null,"jsonrpc":"2.0"}"#
+    );
+    // The link is still usable, and the agent never opened a session in "/".
+    let sid = c.new_session("actp://site").await;
+    let id = c.prompt(&sid, "echo still fine").await;
+    c.response(id).await;
+    let n = c
+        .lines
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|l| l.contains(r#""id":10,"#) || l.contains(r#""id":11,"#))
+        .count();
+    assert_eq!(n, 2, "the agent answered a refused request");
+    for entry in std::fs::read_dir(s.dirs.root.join("store"))
+        .unwrap()
+        .flatten()
+    {
+        let stored = std::fs::read_to_string(entry.path()).unwrap();
+        assert!(
+            !stored.contains(r#""cwd":"/""#),
+            "the agent opened a session in /: {stored}"
+        );
+    }
+    assert!(s.audit().contains("\"event\":\"message_refused\""));
+    c.close_stdin();
+    assert_eq!(c.exit().await.0, 0);
+}
+
 async fn wait_until(what: &str, f: impl Fn() -> bool) {
     let deadline = tokio::time::Instant::now() + WAIT;
     while !f() {
@@ -773,6 +832,7 @@ pairings!(folder_not_allowed);
 pairings!(full_session);
 pairings!(drop_and_resume);
 pairings!(agent_crash);
+pairings!(ambiguous_envelope);
 #[cfg(unix)]
 pairings!(token_revoke);
 

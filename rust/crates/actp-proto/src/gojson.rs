@@ -299,7 +299,10 @@ pub fn object(raw: &str) -> Result<Option<Entries>, DecodeError> {
 
 /// Go's field-name match: exact or case-insensitive.
 pub fn field_matches(key: &str, name: &str) -> bool {
-    key == name || key.eq_ignore_ascii_case(name) || key.to_lowercase() == name.to_lowercase()
+    key == name
+        || key.eq_ignore_ascii_case(name)
+        || key.to_lowercase() == name.to_lowercase()
+        || key.to_uppercase() == name.to_uppercase()
 }
 
 impl Entries {

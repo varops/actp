@@ -284,6 +284,12 @@ impl Link {
 
     /// Handles one ACP message from the bridge, in order.
     async fn from_client(self: &Arc<Self>, raw: String) {
+        if let Err(a) = jsonrpc::check_envelope(&raw) {
+            if let Some(reply) = self.refuse_ambiguous(&a, "client") {
+                self.to_client(&reply);
+            }
+            return;
+        }
         let m = match jsonrpc::parse(&raw) {
             Ok(m) => m,
             Err(e) => {
@@ -368,6 +374,10 @@ impl Link {
                 }
                 changed = true;
             }
+            // Policy was applied here: forward the re-encoded message, never the original bytes.
+            if p.is_some() {
+                changed = true;
+            }
             if (m.method == "session/load" || m.method == "session/resume")
                 && !req.session_id.is_empty()
             {
@@ -403,6 +413,30 @@ impl Link {
         Ok(m.with_params(&jsonrpc::encode_params(&p)).unwrap_or(m))
     }
 
+    /// Handles a message whose envelope two decoders could read differently (one
+    /// key in two spellings, or twice): actp would route it by one reading and the
+    /// peer act on the other, skipping the rewrites. It is never forwarded. A
+    /// request with a usable id gets an error; anything else is dropped.
+    fn refuse_ambiguous(&self, a: &jsonrpc::Ambiguous, from: &str) -> Option<Message> {
+        tracing::info!(link = short(&self.id), agent = %self.agent.id, from, reason = %a.reason, "refused an ambiguous message");
+        self.srv.audit().event(
+            "message_refused",
+            [
+                ("link", sv(short(&self.id))),
+                ("from", sv(from)),
+                ("reason", sv(&a.reason)),
+            ],
+        );
+        match (&a.id, a.request) {
+            (Some(id), true) => Some(jsonrpc::new_error(
+                id,
+                jsonrpc::CODE_INVALID_REQUEST,
+                &format!("invalid request: {a}"),
+            )),
+            _ => None,
+        }
+    }
+
     /// Handles the agent's output until it exits.
     async fn read_agent(self: Arc<Self>) {
         if let Some(stdout) = self.proc.take_stdout() {
@@ -420,7 +454,14 @@ impl Link {
                     _ = &mut stop => break,
                 };
                 match line {
-                    Ok(Some(Line::Message(m))) => self.from_agent(m).await,
+                    Ok(Some(Line::Message(m))) => match jsonrpc::check_envelope(&m.raw) {
+                        Ok(()) => self.from_agent(m).await,
+                        Err(a) => {
+                            if let Some(reply) = self.refuse_ambiguous(&a, "agent") {
+                                self.write_agent(&reply).await;
+                            }
+                        }
+                    },
                     Ok(Some(Line::Invalid(raw, _))) => {
                         tracing::info!(link = short(&self.id), agent = %self.agent.id, line = %truncate(&raw, 200), "agent wrote a non-JSON-RPC line");
                     }

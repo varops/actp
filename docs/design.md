@@ -309,6 +309,8 @@ Paths are cleaned and symlinks resolved before the check. Responses carry the cl
 
 **Login hints.** In the `initialize` response, the server removes terminal-login metadata from `authMethods` (for example `_meta.terminal-auth`), because the client would run that login on its own machine. Descriptions stay, so the user still sees what to do on the agent host.
 
+**Ambiguous envelopes.** Before any rewrite or policy, in both directions, the server refuses a message with a key that differs from `jsonrpc`, `id`, `method`, `params`, `result` or `error` only in case, or with one of them twice: the server and the peer could read it differently. A request with a usable id gets `-32600`; anything else is dropped and logged (`message_refused` in the audit log). A message with an `id` key and a `method` counts as a request even when the id is `null`. Requests the server has checked go on re-encoded, not as the original bytes.
+
 **Requests the server sends itself** (for example `session/close` when a link ends) use ids in their own namespace (`actp-1`, `actp-2`, ...), so they cannot clash with the client's ids. Their replies are not forwarded.
 
 Everything else passes through untouched: ids, unknown methods and fields, extension methods (`elicitation/create`, `_x.ai/*`), and request cancellation in both directions. Message order is kept.
