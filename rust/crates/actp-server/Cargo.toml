@@ -1,0 +1,33 @@
+[package]
+name = "actp-server"
+description = "The actp server as a library: tokens, agents in allowed folders, links that survive dropped connections"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+actp-proto.workspace = true
+base64.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+percent-encoding.workspace = true
+rand.workspace = true
+rustls.workspace = true
+serde_json.workspace = true
+serde_norway.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-tungstenite.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
