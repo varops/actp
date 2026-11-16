@@ -17,6 +17,11 @@
 //	burst-crash <n> send n chunks, then exit with code 4
 //	late-burst-crash <n>  like burst-crash, after 300 ms
 //
+// Like Claude's adapter, a session starts in the mode that
+// <cwd>/.claude/settings.json (or settings.local.json) names in
+// permissions.defaultMode. Test-only keys there: actpTest.modes (the modes
+// offered) and actpTest.refuseSetMode.
+//
 // Sessions are stored as files under $ACTP_TESTAGENT_STORE so session/load
 // works from a fresh process. With ACTP_TESTAGENT_SCENARIO=auth-required,
 // session/new fails with an authentication error.
@@ -43,6 +48,8 @@ type session struct {
 	Dirs       json.RawMessage `json:"additionalDirectories,omitempty"`
 	Meta       json.RawMessage `json:"_meta,omitempty"`
 	Mode       string          `json:"mode,omitempty"`
+	Modes      []string        `json:"modes,omitempty"`
+	RefuseMode bool            `json:"refuseSetMode,omitempty"`
 	History    []string        `json:"history"`
 }
 
@@ -170,7 +177,8 @@ func (a *agent) handle(m *jsonrpc.Message) {
 			} `json:"configOptions"`
 		}
 		_ = json.Unmarshal(m.Params, &p)
-		s := &session{ID: p.SessionID, Cwd: p.Cwd, MCPServers: p.MCPServers, Dirs: p.Dirs, Meta: p.Meta, Mode: "default"}
+		s := &session{ID: p.SessionID, Cwd: p.Cwd, MCPServers: p.MCPServers, Dirs: p.Dirs, Meta: p.Meta}
+		s.Mode, s.Modes, s.RefuseMode = projectSettings(p.Cwd)
 		for _, c := range p.Config {
 			if c.ConfigID == "mode" {
 				s.Mode = c.Value
@@ -200,7 +208,7 @@ func (a *agent) handle(m *jsonrpc.Message) {
 		a.sessions[s.ID] = s
 		a.mu.Unlock()
 		a.save(s)
-		result := map[string]any{"modes": modeState(s.Mode), "configOptions": modeOptions(s.Mode)}
+		result := map[string]any{"modes": modeState(s.Mode, s.Modes), "configOptions": modeOptions(s.Mode, s.Modes)}
 		if m.Method == "session/new" || m.Method == "session/fork" {
 			result["sessionId"] = s.ID
 		}
@@ -215,6 +223,11 @@ func (a *agent) handle(m *jsonrpc.Message) {
 		_ = json.Unmarshal(m.Params, &p)
 		a.mu.Lock()
 		s := a.sessions[p.SessionID]
+		if s != nil && s.RefuseMode {
+			a.mu.Unlock()
+			a.send(jsonrpc.NewError(m.ID, jsonrpc.CodeInvalidRequest, "mode changes are locked", nil))
+			return
+		}
 		if s != nil && m.Method == "session/set_mode" {
 			s.Mode = p.ModeID
 		} else if s != nil && p.ConfigID == "mode" {
@@ -228,7 +241,7 @@ func (a *agent) handle(m *jsonrpc.Message) {
 		if m.Method == "session/set_mode" {
 			a.send(jsonrpc.NewResult(m.ID, map[string]any{}))
 		} else {
-			a.send(jsonrpc.NewResult(m.ID, map[string]any{"configOptions": modeOptions(s.Mode)}))
+			a.send(jsonrpc.NewResult(m.ID, map[string]any{"configOptions": modeOptions(s.Mode, s.Modes)}))
 		}
 	case "session/list":
 		entries, _ := os.ReadDir(a.store)
@@ -453,17 +466,57 @@ func (a *agent) load(id string) (*session, error) {
 
 var testModes = []string{"default", "acceptEdits", "plan", "bypassPermissions"}
 
-func modeState(current string) map[string]any {
-	modes := make([]any, len(testModes))
-	for i, id := range testModes {
+// projectSettings reads the starting mode from the workspace, as Claude's
+// adapter does: settings.local.json over settings.json, case-insensitive
+// mode names, "bypass" as an alias.
+func projectSettings(cwd string) (mode string, modes []string, refuse bool) {
+	mode, modes = "default", testModes
+	for _, name := range []string{"settings.json", "settings.local.json"} {
+		data, err := os.ReadFile(filepath.Join(cwd, ".claude", name))
+		if err != nil {
+			continue
+		}
+		var st struct {
+			Permissions struct {
+				DefaultMode string `json:"defaultMode"`
+			} `json:"permissions"`
+			ActpTest struct {
+				Modes         []string `json:"modes"`
+				RefuseSetMode bool     `json:"refuseSetMode"`
+			} `json:"actpTest"`
+		}
+		if json.Unmarshal(data, &st) != nil {
+			continue
+		}
+		aliases := map[string]string{"default": "default", "manual": "default", "acceptedits": "acceptEdits", "dontask": "dontAsk", "plan": "plan", "auto": "auto", "bypasspermissions": "bypassPermissions", "bypass": "bypassPermissions"}
+		if m, ok := aliases[strings.ToLower(strings.TrimSpace(st.Permissions.DefaultMode))]; ok {
+			mode = m
+		}
+		if len(st.ActpTest.Modes) > 0 {
+			modes = st.ActpTest.Modes
+		}
+		refuse = refuse || st.ActpTest.RefuseSetMode
+	}
+	return mode, modes, refuse
+}
+
+func modeState(current string, offered []string) map[string]any {
+	if len(offered) == 0 {
+		offered = testModes
+	}
+	modes := make([]any, len(offered))
+	for i, id := range offered {
 		modes[i] = map[string]any{"id": id, "name": id}
 	}
 	return map[string]any{"currentModeId": current, "availableModes": modes}
 }
 
-func modeOptions(current string) []any {
-	opts := make([]any, len(testModes))
-	for i, id := range testModes {
+func modeOptions(current string, offered []string) []any {
+	if len(offered) == 0 {
+		offered = testModes
+	}
+	opts := make([]any, len(offered))
+	for i, id := range offered {
 		opts[i] = map[string]any{"value": id, "name": id}
 	}
 	return []any{map[string]any{"id": "mode", "name": "Mode", "category": "mode", "type": "select", "currentValue": current, "options": opts}}
