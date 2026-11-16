@@ -1,0 +1,18 @@
+[package]
+name = "actp-proto"
+description = "ACTP wire format: frames, JSON-RPC peeking, sequencing, acks, heartbeats and replay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytes.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
