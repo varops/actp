@@ -84,7 +84,7 @@ fn server_config(d: &Dirs, port: u16, tokens_in_file: bool) -> String {
     };
     std::fs::write(d.root.join("tokens.yaml"), file).unwrap();
     format!(
-        "server:\n  name: conformance\n  listen: 127.0.0.1:{port}\n  shell_env: false\n  idle_close: 2s\n  prompt_timeout: 30s\n  log_dir: {}\n  state_dir: {}\n  tokens_file: {}\n  workspaces:\n    - name: site\n      path: {}\n  agents:\n    - id: test\n      command: {}\n      env:\n        ACTP_TESTAGENT_STORE: {}\n      max_unattended: 5s\n    - id: other\n      command: {}\n{inline}remotes_file: {}\n",
+        "server:\n  name: conformance\n  listen: 127.0.0.1:{port}\n  shell_env: false\n  idle_close: 2s\n  prompt_timeout: 30s\n  log_dir: {}\n  state_dir: {}\n  tokens_file: {}\n  workspaces:\n    - name: site\n      path: {}\n  agents:\n    - id: test\n      command: {}\n      env:\n        ACTP_TESTAGENT_STORE: {}\n      max_unattended: 5s\n      keep_session_meta: [keep]\n    - id: other\n      command: {}\n{inline}remotes_file: {}\n",
         yaml_path(&d.root.join("logs")),
         yaml_path(&d.root.join("state")),
         yaml_path(&d.root.join("tokens.yaml")),
@@ -792,6 +792,121 @@ async fn ambiguous_envelope(bridge: Impl, server: Impl) {
     assert_eq!(c.exit().await.0, 0);
 }
 
+/// Every session route goes through the folder and MCP policy: fork, the
+/// additionalDirectories list, `_meta` (dropped unless allow-listed), and
+/// unknown session methods that carry policy fields (refused).
+async fn session_routes(bridge: Impl, server: Impl) {
+    let s = ServerProc::start(server, "routes", false).await;
+    std::fs::create_dir_all(s.dirs.site.join("sub")).unwrap();
+    let sub = s.dirs.site.join("sub").to_string_lossy().into_owned();
+    let mut c = Client::start(bridge, &s, s.port, "test", TOKEN, &[]).await;
+    c.initialize().await;
+
+    // Inside: actp:// forms are rewritten like cwd; _meta keeps only allow-listed keys.
+    let (raw, v) = c
+        .call("session/new", json!({"cwd": "actp://site", "mcpServers": [], "additionalDirectories": ["actp://site/sub"], "_meta": {"claudeCode": {"options": {"mcpServers": {"x": {"command": "not-a-real-command"}}}}, "keep": 1}}))
+        .await;
+    let sid = v["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{raw}"))
+        .to_string();
+    let id = c.prompt(&sid, "dirs").await;
+    let dirs = chunk_text(&c.chunk("dirs: ").await);
+    let dirs: Value = serde_json::from_str(dirs.strip_prefix("dirs: ").unwrap()).unwrap();
+    assert_eq!(dirs, json!([sub]));
+    c.response(id).await;
+    let id = c.prompt(&sid, "meta").await;
+    assert_eq!(chunk_text(&c.chunk("meta: ").await), r#"meta: {"keep":1}"#);
+    c.response(id).await;
+
+    // Outside: the whole request is refused.
+    let (raw, _) = c.call("session/new", json!({"cwd": "actp://site", "mcpServers": [], "additionalDirectories": ["actp://site", "/"]})).await;
+    let n = c.next_id;
+    assert_eq!(
+        raw,
+        format!(
+            r#"{{"error":{{"code":-32602,"message":"additional directory not allowed: /"}},"id":{n},"jsonrpc":"2.0"}}"#
+        )
+    );
+
+    // Fork gets the same checks as new.
+    let (raw, _) = c
+        .call(
+            "session/fork",
+            json!({"sessionId": sid, "cwd": "/", "mcpServers": []}),
+        )
+        .await;
+    let n = c.next_id;
+    assert_eq!(
+        raw,
+        format!(
+            r#"{{"error":{{"code":-32602,"message":"cwd not allowed: /"}},"id":{n},"jsonrpc":"2.0"}}"#
+        )
+    );
+    let (raw, v) = c
+        .call("session/fork", json!({"sessionId": sid, "cwd": "actp://site", "mcpServers": [{"name": "x", "command": "not-a-real-command", "args": [], "env": []}, {"name": "web", "type": "http", "url": "https://mcp.example.com", "headers": []}], "_meta": {"other": true}}))
+        .await;
+    let fork = v["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{raw}"))
+        .to_string();
+    let id = c.prompt(&fork, "mcp").await;
+    let mcp = chunk_text(&c.chunk("mcp.example.com").await);
+    assert!(
+        !mcp.contains("not-a-real-command"),
+        "stdio MCP server reached the agent: {mcp}"
+    );
+    c.response(id).await;
+    let id = c.prompt(&fork, "meta").await;
+    let (_, m) = c
+        .wait("fork meta", |v| {
+            v["method"] == "session/update"
+                && v["params"]["sessionId"] == fork.as_str()
+                && chunk_text(v).starts_with("meta: ")
+        })
+        .await;
+    assert_eq!(chunk_text(&m), "meta: ");
+    c.response(id).await;
+
+    // An unknown session method: refused when it carries a policy field, forwarded otherwise.
+    let (raw, _) = c
+        .call("session/frobnicate", json!({"sessionId": sid, "cwd": "/"}))
+        .await;
+    let n = c.next_id;
+    assert_eq!(
+        raw,
+        format!(
+            r#"{{"error":{{"code":-32600,"message":"invalid request: actp does not know session/frobnicate and cannot check its \"cwd\""}},"id":{n},"jsonrpc":"2.0"}}"#
+        )
+    );
+    let (raw, _) = c
+        .call("session/frobnicate", json!({"sessionId": sid}))
+        .await;
+    let n = c.next_id;
+    assert_eq!(
+        raw,
+        format!(
+            r#"{{"error":{{"code":-32601,"message":"Method not found"}},"id":{n},"jsonrpc":"2.0"}}"#
+        )
+    );
+
+    for entry in std::fs::read_dir(s.dirs.root.join("store"))
+        .unwrap()
+        .flatten()
+    {
+        let stored = std::fs::read_to_string(entry.path()).unwrap();
+        assert!(
+            !stored.contains(r#""/""#)
+                && !stored.contains("not-a-real-command")
+                && !stored.contains("claudeCode"),
+            "policy bypassed: {stored}"
+        );
+    }
+    assert!(s.audit().contains("\"event\":\"session_method_refused\""));
+    c.close_stdin();
+    assert_eq!(c.exit().await.0, 0);
+}
+
 async fn wait_until(what: &str, f: impl Fn() -> bool) {
     let deadline = tokio::time::Instant::now() + WAIT;
     while !f() {
@@ -833,6 +948,7 @@ pairings!(full_session);
 pairings!(drop_and_resume);
 pairings!(agent_crash);
 pairings!(ambiguous_envelope);
+pairings!(session_routes);
 #[cfg(unix)]
 pairings!(token_revoke);
 

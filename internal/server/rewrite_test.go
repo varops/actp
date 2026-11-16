@@ -98,3 +98,61 @@ func TestFilterMCPServers(t *testing.T) {
 		t.Fatalf("all: %s", out)
 	}
 }
+
+func TestResolveAdditionalDirectories(t *testing.T) {
+	s, root := testServerConfig(t)
+	site := filepath.Join(root, "site")
+	tok := &config.Token{Workspaces: []string{"site"}, DefaultWorkspace: "site", CwdFallback: true}
+	got, err := resolveAdditionalDirectories(s, tok, json.RawMessage(`["actp://site/sub"]`))
+	want, _ := json.Marshal([]string{filepath.Join(site, "sub")})
+	if err != nil || string(got) != string(want) {
+		t.Fatalf("inside: %s, %v", got, err)
+	}
+	for _, raw := range []string{`["actp://site","/"]`, `["actp://other"]`, `[""]`, `"actp://site"`, `[1]`} {
+		if _, err := resolveAdditionalDirectories(s, tok, json.RawMessage(raw)); err == nil {
+			t.Errorf("%s: accepted (cwd_fallback must not apply to additional directories)", raw)
+		}
+	}
+	if got, err := resolveAdditionalDirectories(s, tok, json.RawMessage(`null`)); err != nil || string(got) != "null" {
+		t.Errorf("null: %s, %v", got, err)
+	}
+	if _, err := resolveAdditionalDirectories(s, tok, json.RawMessage(`["/"]`)); err == nil || err.Error() != "additional directory not allowed: /" {
+		t.Errorf("message: %v", err)
+	}
+}
+
+func TestKeepMetaKeys(t *testing.T) {
+	meta := json.RawMessage(`{"claudeCode":{"options":{"mcpServers":{}}},"trace":"x"}`)
+	if got := keepMetaKeys(meta, nil); got != nil {
+		t.Errorf("default must drop _meta, got %s", got)
+	}
+	if got := keepMetaKeys(meta, []string{"trace"}); string(got) != `{"trace":"x"}` {
+		t.Errorf("allow-list: %s", got)
+	}
+	if got := keepMetaKeys(meta, []string{"absent"}); got != nil {
+		t.Errorf("nothing kept: %s", got)
+	}
+}
+
+func TestUncheckedSessionField(t *testing.T) {
+	p := map[string]json.RawMessage{"sessionId": json.RawMessage(`"s"`), "cwd": json.RawMessage(`"/"`)}
+	cases := map[string]string{
+		"session/frobnicate": "cwd",
+		"session/prompt":     "",
+		"session/fork":       "", // checked, not refused
+		"initialize":         "",
+	}
+	for method, want := range cases {
+		if got := uncheckedSessionField(method, p); got != want {
+			t.Errorf("%s: %q, want %q", method, got, want)
+		}
+	}
+	for _, f := range []string{"additionalDirectories", "mcpServers", "_meta"} {
+		if got := uncheckedSessionField("session/frobnicate", map[string]json.RawMessage{f: json.RawMessage(`null`)}); got != f {
+			t.Errorf("%s: %q", f, got)
+		}
+	}
+	if got := uncheckedSessionField("session/frobnicate", map[string]json.RawMessage{"sessionId": json.RawMessage(`"s"`)}); got != "" {
+		t.Errorf("plain unknown method refused: %q", got)
+	}
+}

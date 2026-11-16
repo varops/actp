@@ -143,6 +143,7 @@ server:
       max_links: 16
       on_client_exit: finish      # finish | cancel (section 3.1)
       max_unattended: 1h          # longest a turn may run after its client left
+      keep_session_meta: []       # _meta keys kept in session requests (default: drop all of _meta)
     - id: codex
       preset: codex
     - id: my-agent
@@ -293,7 +294,7 @@ The server reads the ACP traffic and changes only these things.
 - Every other client capability passes through, because they change agent behaviour (some agents only ask structured questions when `elicitation.form` is present).
 - This matches where ACP is going: the ACP v2 draft removes the client file and terminal methods completely.
 
-**Working folder (`cwd`).** A client's `cwd` is a path on the client machine and usually means nothing on the server. In `session/new`, `session/load`, `session/resume` and `session/list`, the server resolves it in this order:
+**Working folder (`cwd`).** A client's `cwd` is a path on the client machine and usually means nothing on the server. In `session/new`, `session/load`, `session/resume`, `session/fork`, `session/options` and `session/list` (where it may be omitted), the server resolves it in this order:
 
 1. `actp://<workspace>/<sub/path>` → that workspace's path plus the sub path (which may not leave the workspace).
 2. An absolute path inside a workspace the token may use → unchanged.
@@ -302,6 +303,12 @@ The server reads the ACP traffic and changes only these things.
 5. Otherwise → JSON-RPC `invalidParams` with `cwd not allowed: <path>`.
 
 Paths are cleaned and symlinks resolved before the check. Responses carry the client's original `cwd` back.
+
+**Additional folders.** Every entry of `additionalDirectories` in those requests goes through the same rules (without the `cwd_fallback`, so an unknown folder never becomes the default workspace) and is rewritten to the server path. If any entry is not allowed, the whole request gets `invalidParams` with `additional directory not allowed: <path>`.
+
+**Session `_meta`.** Agents read `_meta` in session requests as options (Claude's adapter takes SDK options and extra MCP servers from it), which would get around the checks here. So the server drops `_meta` from the requests above, except for the top-level keys an agent lists in `keep_session_meta`.
+
+**Unknown session methods.** A `session/*` method actp does not know is forwarded only when it carries none of `cwd`, `additionalDirectories`, `mcpServers` and `_meta`; otherwise a request gets `-32600` and a notification is dropped (default deny). Known methods without folders (`session/prompt`, `session/cancel`, `session/close`, `session/set_mode`, `session/set_model`, `session/set_config_option`, `session/status`, `session/set_title`, `session/delete`, `session/archive`, `session/unarchive`) pass through.
 
 **MCP servers.** A `stdio` entry in `mcpServers` would run a command on the server machine. Per token: `none`, `remote` (default: keep `http` and `sse`, drop `stdio`), or `all`. Entries whose URL points at `localhost` or a loopback address are dropped as well: they meant the client's machine, not the agent host. Dropped entries are logged.
 

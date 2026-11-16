@@ -88,6 +88,8 @@ pub struct Agent {
     pub max_links: i64,
     pub on_client_exit: String,
     pub max_unattended: Duration,
+    /// Top-level `_meta` keys kept in session requests; the rest is dropped.
+    pub keep_session_meta: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -946,6 +948,7 @@ impl Decoder {
                 "max_links" => a.max_links = self.int(v, &k).unwrap_or(0),
                 "on_client_exit" => a.on_client_exit = self.string(v, &k).unwrap_or_default(),
                 "max_unattended" => a.max_unattended = self.duration(v, &k).unwrap_or_default(),
+                "keep_session_meta" => a.keep_session_meta = self.strings(v, &k),
                 _ => self.unknown(&k),
             }
         }
