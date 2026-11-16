@@ -26,7 +26,7 @@ The relay sees the traffic it routes in plaintext, credentials included. Someone
 - keep the credentials callers present and use them again, against any machine that accepts them, for as long as they stay valid. With actp tokens that is until the token is revoked, on every machine that has it;
 - send a caller to a different machine than the one it asked for, or answer as the machine itself, because the caller does not check which machine it reached.
 
-What it cannot do is get a machine to accept credentials the machine would refuse. Org mode narrows the reuse: Eunomia papers are bound to one machine and expire within minutes. Until callers check the machine end to end (an open question), host the relay like any other server IT relies on, and prefer org mode over shared actp tokens.
+What it cannot do is get a machine to accept credentials the machine would refuse. Org mode, where callers present signed papers instead of tokens, can narrow the reuse to papers that are bound to one machine and expire within minutes. Until callers check the machine end to end (an open question), host the relay like any other server IT relies on, and prefer org mode over shared actp tokens.
 
 ## The machine
 

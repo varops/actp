@@ -1,6 +1,6 @@
 //! Who a bearer token belongs to. Pluggable, so a later build can accept
-//! tokens signed by another authority (for example Ed25519 tokens issued by
-//! Eunomia) next to, or instead of, actp's own hashed tokens.
+//! tokens signed by another authority (for example an organization's
+//! identity service) next to, or instead of, actp's own hashed tokens.
 
 use crate::config::{self, Token};
 
