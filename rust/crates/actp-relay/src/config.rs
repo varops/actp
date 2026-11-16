@@ -44,6 +44,20 @@ pub struct Config {
     /// `audit.jsonl` is rotated at this size (100 MB); ten old files are kept.
     #[serde(default = "default_audit_max_mb")]
     pub audit_max_mb: u64,
+    /// Connections the relay holds at once (20000), and per IP address
+    /// (1000: an office behind one NAT address counts as one).
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+    #[serde(default = "default_max_connections_per_ip")]
+    pub max_connections_per_ip: usize,
+}
+
+fn default_max_connections() -> usize {
+    20_000
+}
+
+fn default_max_connections_per_ip() -> usize {
+    1_000
 }
 
 /// A rate: so many per second on average, up to `burst` at once.
@@ -134,6 +148,9 @@ impl Config {
         if self.caller_rate.per_second == 0 || self.caller_rate.burst == 0 {
             errs.push("caller_rate per_second and burst must be at least 1".into());
         }
+        if self.max_connections == 0 || self.max_connections_per_ip == 0 {
+            errs.push("max_connections and max_connections_per_ip must be at least 1".into());
+        }
         if self.audit_max_mb == 0 {
             errs.push("audit_max_mb must be at least 1".into());
         }
@@ -156,8 +173,9 @@ impl Config {
 }
 
 fn valid_hash(h: &str) -> bool {
+    // Lowercase, as hash_token writes it: an uppercase hash would never match.
     h.strip_prefix("sha256:")
-        .is_some_and(|x| x.len() == 64 && x.bytes().all(|b| b.is_ascii_hexdigit()))
+        .is_some_and(|x| x.len() == 64 && x.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
 }
 
 /// `sha256:<hex>` of a token, as the config stores it.

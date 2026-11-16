@@ -5,6 +5,7 @@
 mod common;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use actp_relay::Relay;
@@ -629,4 +630,363 @@ async fn a_stop_that_cannot_be_recorded_says_so_and_is_recorded_later() {
             .stop_state()
             .stopped
     );
+}
+
+/// A relay config line naming revocation lists.
+fn crls(paths: &[&std::path::Path]) -> String {
+    let list: Vec<String> = paths.iter().map(|p| yaml_path(p)).collect();
+    format!("device_crls: [{}]\n", list.join(", "))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoked_and_expired_certificates_are_refused_and_cut_off() {
+    let dir = scratch("revoke");
+    let pki = Pki::new(&dir);
+    let empty = pki.crl("empty.crl", &[], false);
+    let env = start_relay_with(&pki, &dir, &crls(&[&empty])).await;
+    let mut a = start_laptop(
+        &pki,
+        "laptop-a",
+        env.port,
+        pki.device_with("laptop-a", None, |p| {
+            p.serial_number = Some(rcgen::SerialNumber::from(1001u64))
+        }),
+    )
+    .await;
+    let mut b = start_laptop(
+        &pki,
+        "laptop-b",
+        env.port,
+        pki.device_with("laptop-b", None, |p| {
+            p.serial_number = Some(rcgen::SerialNumber::from(1002u64))
+        }),
+    )
+    .await;
+    a.wait_connected().await;
+    b.wait_connected().await;
+
+    // laptop-a's certificate is revoked: a reload cuts it off and it cannot
+    // come back; laptop-b stays.
+    let revoked = pki.crl("revoked.crl", &[1001], false);
+    let yaml = relay_yaml(&pki, &dir, &crls(&[&revoked]));
+    let cfg = actp_relay::config::Config::parse(&yaml).unwrap();
+    let tls = actp_relay::tls::server_config(&cfg).unwrap();
+    env.relay.reload(cfg, tls);
+    a.wait_status(|s| !matches!(s, Status::Connected { .. }))
+        .await;
+    assert!(
+        env.audit_has("machine_offline", |e| e["machine"] == "laptop-a"
+            && e["reason"] == "certificate_invalid")
+    );
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let online: Vec<String> = env
+        .relay
+        .machines()
+        .into_iter()
+        .filter(|m| m.online)
+        .map(|m| m.machine)
+        .collect();
+    assert_eq!(online, ["laptop-b"]);
+
+    // A list past its next update fails closed: everyone is cut off.
+    let stale = pki.crl("stale.crl", &[], true);
+    let yaml = relay_yaml(&pki, &dir, &crls(&[&stale]));
+    let cfg = actp_relay::config::Config::parse(&yaml).unwrap();
+    let tls = actp_relay::tls::server_config(&cfg).unwrap();
+    env.relay.reload(cfg, tls);
+    eventually("nobody online", || {
+        env.relay.machines().iter().all(|m| !m.online)
+    })
+    .await;
+    b.wait_status(|s| !matches!(s, Status::Connected { .. }))
+        .await;
+
+    // An expired certificate never connects.
+    let dir2 = scratch("expired");
+    let pki2 = Pki::new(&dir2);
+    let env2 = start_relay(&pki2, &dir2).await;
+    let mut old = start_laptop(
+        &pki2,
+        "laptop-old",
+        env2.port,
+        pki2.device_with("laptop-old", None, |p| {
+            p.not_before = time::OffsetDateTime::now_utc() - time::Duration::days(30);
+            p.not_after = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+        }),
+    )
+    .await;
+    old.wait_status(|s| matches!(s, Status::Disconnected { .. }))
+        .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(env2.relay.machines().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn busy_timed_out_replaced_and_offline_machines() {
+    use actp_proto::relay::PROTOCOL_CONTROL;
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let dir = scratch("lifecycle");
+    let pki = Pki::new(&dir);
+    let env = start_relay_with(&pki, &dir, "max_streams_per_machine: 1\n").await;
+
+    // One caller at a time: the second gets machine_busy.
+    let mut a = start_laptop(&pki, "laptop-a", env.port, pki.device("laptop-a", None)).await;
+    a.wait_connected().await;
+    let mut caller = Caller::start(&pki, env.port, "laptop-a");
+    assert!(
+        caller
+            .call(1, "initialize", json!({"protocolVersion": 1}))
+            .await
+            .get("result")
+            .is_some()
+    );
+    let (status, body) = request(
+        &pki,
+        env.port,
+        "GET",
+        "/m/laptop-a/api/v1/info",
+        TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (429, Some("machine_busy"))
+    );
+
+    // The machine goes away: its session ends at the relay.
+    drop(a);
+    eventually("the session cut", || {
+        env.audit_has("session_closed", |e| {
+            e["machine"] == "laptop-a" && e["reason"] == "machine_offline"
+        })
+    })
+    .await;
+    drop(caller);
+
+    // A machine that never opens the stream: the caller gets machine_timeout.
+    let c = pki.device("laptop-c", None);
+    let first = dial_as(&pki, env.port, &c, "/relay/v1/connect", PROTOCOL_CONTROL)
+        .await
+        .unwrap();
+    let (first_tx, mut first_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut ws = first;
+        while let Some(m) = ws.next().await {
+            let _ = first_tx.send(m.map(|m| matches!(m, Message::Close(_))));
+        }
+        let _ = first_tx.send(Ok(true));
+    });
+    eventually("laptop-c online", || {
+        env.relay
+            .machines()
+            .iter()
+            .any(|m| m.machine == "laptop-c" && m.online)
+    })
+    .await;
+    let started = std::time::Instant::now();
+    let (status, body) = request(
+        &pki,
+        env.port,
+        "GET",
+        "/m/laptop-c/api/v1/info",
+        TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (504, Some("machine_timeout"))
+    );
+    assert!(started.elapsed() >= Duration::from_secs(4));
+
+    // The same machine connects again: the older connection is closed.
+    let second = dial_as(&pki, env.port, &c, "/relay/v1/connect", PROTOCOL_CONTROL)
+        .await
+        .unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(m) = first_rx.recv().await {
+            if matches!(m, Ok(true) | Err(_)) {
+                return true;
+            }
+        }
+        true
+    })
+    .await
+    .unwrap();
+    assert!(closed);
+    assert!(env.audit_has("machine_replaced", |e| e["machine"] == "laptop-c"));
+    drop(second);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_release_that_cannot_be_recorded_leaves_the_stop_on() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("unreleased");
+    let pki = Pki::new(&dir);
+    let env = start_relay(&pki, &dir).await;
+    let (status, _) = request(
+        &pki,
+        env.port,
+        "POST",
+        "/relay/v1/stop",
+        ADMIN,
+        Some(json!({"reason": "incident"})),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let state = dir.join("state");
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o500)).unwrap();
+    if std::fs::write(state.join("probe"), b"x").is_ok() {
+        return; // running as root: permissions do not stop writes
+    }
+    let (status, body) = request(
+        &pki,
+        env.port,
+        "POST",
+        "/relay/v1/release",
+        ADMIN,
+        Some(json!({"reason": "all clear"})),
+    )
+    .await;
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (500, Some("not_released"))
+    );
+    assert!(env.relay.stop_state().stopped);
+    // Who stopped and why is kept apart from the rotated audit log.
+    let kept = std::fs::read_to_string(dir.join("logs").join("org_stops.jsonl")).unwrap();
+    assert!(kept.contains("\"event\":\"org_stop\"") && kept.contains("incident"));
+}
+
+/// A fake relay: TLS with the relay's certificate, WebSockets on any path.
+/// It sends `script` on every control connection and records the paths
+/// machines dial.
+struct FakeRelay {
+    port: u16,
+    dialed: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+// The callback's error type is set by tungstenite.
+#[allow(clippy::result_large_err)]
+async fn fake_relay(pki: &Pki, script: Vec<String>) -> FakeRelay {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+    let cfg = actp_relay::config::Config::parse(&relay_yaml(pki, &pki.dir, "")).unwrap();
+    let tls = actp_relay::tls::server_config(&cfg).unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls.config);
+    let ln = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = ln.local_addr().unwrap().port();
+    let dialed: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    let d2 = dialed.clone();
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = ln.accept().await {
+            let (acceptor, dialed, script) = (acceptor.clone(), d2.clone(), script.clone());
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                let path = Arc::new(std::sync::Mutex::new(String::new()));
+                let p2 = path.clone();
+                let cb = move |req: &Request, mut resp: Response| {
+                    *p2.lock().unwrap() = req.uri().path().to_string();
+                    if let Some(proto) = req.headers().get("Sec-WebSocket-Protocol") {
+                        resp.headers_mut()
+                            .insert("Sec-WebSocket-Protocol", proto.clone());
+                    }
+                    Ok(resp)
+                };
+                let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(tls, cb).await else {
+                    return;
+                };
+                let path = path.lock().unwrap().clone();
+                dialed.lock().unwrap().push(path.clone());
+                if path == "/relay/v1/connect" {
+                    for m in &script {
+                        let _ = ws.send(Message::text(m.clone())).await;
+                    }
+                }
+                // Hold the connection open, answering pings.
+                while let Some(Ok(_)) = ws.next().await {}
+            });
+        }
+    });
+    FakeRelay { port, dialed }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_machine_checks_what_the_relay_says() {
+    use actp_proto::relay::Control;
+    let dir = scratch("fake-relay");
+    let pki = Pki::new(&dir);
+    let open = |id: &str| Control::Open { stream: id.into() }.encode();
+    let hello = Control::Hello {
+        machine: "laptop-a".into(),
+        stopped: false,
+    }
+    .encode();
+
+    // Anything before the hello: the machine hangs up.
+    let fake = fake_relay(&pki, vec![open(&"ab".repeat(32))]).await;
+    let mut a = start_laptop(&pki, "laptop-a", fake.port, pki.device("laptop-a", None)).await;
+    a.wait_status(|s| matches!(s, Status::Disconnected { error } if error.contains("hello first")))
+        .await;
+    assert!(
+        !fake
+            .dialed
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.starts_with("/relay/v1/stream/"))
+    );
+    drop(a);
+
+    // A malformed address in the hello: the machine hangs up.
+    let bad_hello = Control::Hello {
+        machine: "a/b".into(),
+        stopped: false,
+    }
+    .encode();
+    let fake = fake_relay(&pki, vec![bad_hello]).await;
+    let mut b = start_laptop(&pki, "laptop-b", fake.port, pki.device("laptop-b", None)).await;
+    b.wait_status(|s| matches!(s, Status::Disconnected { error } if error.contains("malformed")))
+        .await;
+    drop(b);
+
+    // Malformed stream ids are not dialed, and no more streams are opened
+    // than the machine allows at once.
+    let script = vec![
+        hello,
+        open("../../relay/v1/connect"),
+        open(&"AB".repeat(32)),
+        open(&"01".repeat(32)),
+        open(&"02".repeat(32)),
+        open(&"03".repeat(32)),
+    ];
+    let fake = fake_relay(&pki, script).await;
+    let mut c = start_laptop_full(
+        &pki,
+        "laptop-c",
+        fake.port,
+        pki.device("laptop-c", None),
+        "",
+        |o| o.max_streams = 1,
+    )
+    .await;
+    c.wait_connected().await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let streams: Vec<String> = fake
+        .dialed
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|p| p.starts_with("/relay/v1/stream/"))
+        .cloned()
+        .collect();
+    assert_eq!(streams, [format!("/relay/v1/stream/{}", "01".repeat(32))]);
 }

@@ -123,10 +123,22 @@ impl Pki {
         cn: &str,
         issuer: Option<&Issuer<'static, KeyPair>>,
     ) -> (PathBuf, PathBuf) {
+        self.device_with(cn, issuer, |_| {})
+    }
+
+    /// [`Pki::device`], with `edit` changing the certificate first (its
+    /// serial number, its validity).
+    pub fn device_with(
+        &self,
+        cn: &str,
+        issuer: Option<&Issuer<'static, KeyPair>>,
+        edit: impl FnOnce(&mut CertificateParams),
+    ) -> (PathBuf, PathBuf) {
         let key = KeyPair::generate().unwrap();
         let mut p = CertificateParams::new(Vec::<String>::new()).unwrap();
         p.distinguished_name.push(DnType::CommonName, cn);
         p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        edit(&mut p);
         let cert = p
             .signed_by(&key, issuer.unwrap_or(&self.device_ca))
             .unwrap();
@@ -137,6 +149,44 @@ impl Pki {
         std::fs::write(&c, cert.pem()).unwrap();
         std::fs::write(&k, key.serialize_pem()).unwrap();
         (c, k)
+    }
+
+    /// A revocation list from the device CA, revoking `serials`, written to
+    /// `name` in the PKI folder; `stale` makes its next update already past.
+    pub fn crl(&self, name: &str, serials: &[u64], stale: bool) -> PathBuf {
+        use rcgen::{
+            CertificateRevocationListParams, KeyIdMethod, RevocationReason, RevokedCertParams,
+            SerialNumber,
+        };
+        let now = time::OffsetDateTime::now_utc();
+        let (this, next) = if stale {
+            (now - time::Duration::days(2), now - time::Duration::days(1))
+        } else {
+            (
+                now - time::Duration::hours(1),
+                now + time::Duration::days(1),
+            )
+        };
+        let params = CertificateRevocationListParams {
+            this_update: this,
+            next_update: next,
+            crl_number: SerialNumber::from(1u64),
+            issuing_distribution_point: None,
+            revoked_certs: serials
+                .iter()
+                .map(|s| RevokedCertParams {
+                    serial_number: SerialNumber::from(*s),
+                    revocation_time: now - time::Duration::minutes(5),
+                    reason_code: Some(RevocationReason::KeyCompromise),
+                    invalidity_date: None,
+                })
+                .collect(),
+            key_identifier_method: KeyIdMethod::Sha256,
+        };
+        let crl = params.signed_by(&self.device_ca).unwrap();
+        let path = self.dir.join(name);
+        std::fs::write(&path, crl.pem().unwrap()).unwrap();
+        path
     }
 
     pub fn caller_tls(&self) -> Arc<rustls::ClientConfig> {
@@ -272,6 +322,18 @@ pub async fn start_laptop_with(
     cert: (PathBuf, PathBuf),
     auth: &str,
 ) -> Laptop {
+    start_laptop_full(pki, name, relay_port, cert, auth, |_| {}).await
+}
+
+/// [`start_laptop_with`], with `adjust` changing the relay options.
+pub async fn start_laptop_full(
+    pki: &Pki,
+    name: &str,
+    relay_port: u16,
+    cert: (PathBuf, PathBuf),
+    auth: &str,
+    adjust: impl FnOnce(&mut RelayOptions),
+) -> Laptop {
     let root = scratch(name);
     std::fs::create_dir_all(root.join("site")).unwrap();
     let yaml = format!(
@@ -308,6 +370,7 @@ pub async fn start_laptop_with(
     opts.dead_after = Duration::from_millis(800);
     opts.max_backoff = Duration::from_millis(200);
     opts.dial_timeout = Duration::from_secs(3);
+    adjust(&mut opts);
     let stop = CancellationToken::new();
     let acceptor = RelayAcceptor::start(srv.clone(), opts, stop.clone());
     let status = acceptor.status();

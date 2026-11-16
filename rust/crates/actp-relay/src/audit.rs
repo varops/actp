@@ -12,6 +12,8 @@ use serde_json::{Map, Value};
 
 pub struct Audit {
     f: Mutex<Option<Log>>,
+    /// `org_stops.jsonl`: the org-wide stop's records, never rotated.
+    stops: Mutex<Option<File>>,
 }
 
 struct Log {
@@ -25,6 +27,10 @@ struct Log {
 const KEEP: u32 = 10;
 
 fn open_log(dir: &Path) -> std::io::Result<File> {
+    open_append(&dir.join("audit.jsonl"))
+}
+
+fn open_append(path: &Path) -> std::io::Result<File> {
     let mut o = OpenOptions::new();
     o.create(true).append(true);
     #[cfg(unix)]
@@ -32,13 +38,14 @@ fn open_log(dir: &Path) -> std::io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         o.mode(0o600);
     }
-    o.open(dir.join("audit.jsonl"))
+    o.open(path)
 }
 
 impl Audit {
     pub fn disabled() -> Self {
         Audit {
             f: Mutex::new(None),
+            stops: Mutex::new(None),
         }
     }
 
@@ -54,11 +61,25 @@ impl Audit {
                 size,
                 max,
             })),
+            stops: Mutex::new(Some(open_append(&dir.join("org_stops.jsonl"))?)),
         })
     }
+    /// Records an event of the org-wide stop: in the audit log, and in
+    /// `org_stops.jsonl`, which is never rotated, so floods of other events
+    /// cannot push who stopped and released out of the record.
+    pub fn kept<const N: usize>(&self, kind: &str, fields: [(&str, Value); N]) {
+        let line = Self::line(kind, fields);
+        let mut g = self.stops.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(f) = g.as_mut() {
+            if let Err(e) = f.write_all(line.as_bytes()) {
+                tracing::error!(error = %e, "could not write org_stops.jsonl");
+            }
+        }
+        drop(g);
+        self.write(line);
+    }
 
-    /// Records one event; keys come out sorted.
-    pub fn event<const N: usize>(&self, kind: &str, fields: [(&str, Value); N]) {
+    fn line<const N: usize>(kind: &str, fields: [(&str, Value); N]) -> String {
         let mut m = Map::new();
         for (k, v) in fields {
             if !v.is_null() {
@@ -69,6 +90,15 @@ impl Audit {
         m.insert("event".into(), Value::String(kind.to_string()));
         let mut line = Value::Object(m).to_string();
         line.push('\n');
+        line
+    }
+
+    /// Records one event; keys come out sorted.
+    pub fn event<const N: usize>(&self, kind: &str, fields: [(&str, Value); N]) {
+        self.write(Self::line(kind, fields));
+    }
+
+    fn write(&self, line: String) {
         let mut g = self.f.lock().unwrap_or_else(|e| e.into_inner());
         let Some(log) = g.as_mut() else {
             return;

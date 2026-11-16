@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use actp_proto::relay::Control;
+use rustls_pki_types::CertificateDer;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
@@ -99,7 +100,7 @@ pub struct Relay {
 
 struct Inner {
     cfg: RwLock<Arc<Config>>,
-    tls: RwLock<Option<tokio_rustls::TlsAcceptor>>,
+    tls: RwLock<Option<tls::Setup>>,
     timing: Timing,
     audit: Audit,
     store: Store,
@@ -108,10 +109,15 @@ struct Inner {
     seen_dirty: AtomicBool,
     /// The stop is on but stop.json does not say so yet.
     stop_unsaved: AtomicBool,
-    /// One writer for the state files at a time.
+    /// One writer for the state files at a time; taken before `st`.
     writing: Mutex<()>,
+    /// When machines.json was last written on the timer.
+    seen_written: Mutex<std::time::Instant>,
     callers: RateLimiter,
     refusals: Throttle,
+    /// Connections held, before and after the TLS handshake.
+    connections: Arc<tokio::sync::Semaphore>,
+    per_ip: Mutex<HashMap<std::net::IpAddr, usize>>,
 }
 
 struct State {
@@ -132,6 +138,8 @@ struct Machine {
 
 struct Conn {
     id: u64,
+    /// The device certificate chain the machine connected with.
+    chain: Vec<CertificateDer<'static>>,
     tx: mpsc::Sender<Control>,
     cut: Cut,
     since: SystemTime,
@@ -204,6 +212,7 @@ impl Relay {
             tracing::warn!(by = %stop.by, reason = %stop.reason, "the org-wide stop is on");
         }
         let callers = RateLimiter::new(cfg.caller_rate.per_second, cfg.caller_rate.burst);
+        let max_connections = cfg.max_connections;
         Ok(Relay {
             inner: Arc::new(Inner {
                 cfg: RwLock::new(Arc::new(cfg)),
@@ -221,8 +230,11 @@ impl Relay {
                 seen_dirty: AtomicBool::new(false),
                 stop_unsaved: AtomicBool::new(false),
                 writing: Mutex::new(()),
+                seen_written: Mutex::new(std::time::Instant::now()),
                 callers,
                 refusals: Throttle::new(20, Duration::from_secs(60)),
+                connections: Arc::new(tokio::sync::Semaphore::new(max_connections)),
+                per_ip: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -264,49 +276,76 @@ impl Relay {
     /// admin tokens, limits, the device roots and revocation lists. The
     /// listen address and the state and log folders need a restart. A machine
     /// that is now blocked is cut off.
-    pub fn reload(&self, cfg: Config, tls: Arc<rustls::ServerConfig>) {
-        let blocked = cfg.blocked_machines.clone();
+    pub fn reload(&self, cfg: Config, tls: tls::Setup) {
+        let blocked = cfg.blocked_machines.len();
         self.inner
             .callers
             .set_rate(cfg.caller_rate.per_second, cfg.caller_rate.burst);
         *self.inner.cfg.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(cfg);
-        *self.inner.tls.write().unwrap_or_else(|p| p.into_inner()) =
-            Some(tokio_rustls::TlsAcceptor::from(tls));
-        let cut: Vec<Cut> = {
-            let st = self.st();
-            let mut v: Vec<Cut> = st
-                .machines
-                .iter()
-                .filter(|(name, _)| blocked.contains(name))
-                .filter_map(|(_, m)| m.conn.as_ref().map(|c| c.cut.clone()))
-                .collect();
-            v.extend(
-                st.sessions
-                    .values()
-                    .filter(|s| blocked.contains(&s.machine))
-                    .map(|s| s.cut.clone()),
-            );
-            v
-        };
-        for c in cut {
-            c.cut("blocked");
-        }
+        *self.inner.tls.write().unwrap_or_else(|p| p.into_inner()) = Some(tls);
+        let cut = self.recheck_machines();
         self.inner.audit.event(
             "config_reloaded",
-            [("blocked_machines", json!(blocked.len()))],
+            [
+                ("blocked_machines", json!(blocked)),
+                ("machines_cut", json!(cut)),
+            ],
         );
         tracing::info!("configuration reloaded");
+    }
+
+    /// Whether a device certificate chain is valid now, by the TLS setup in force.
+    pub(crate) fn chain_valid(&self, chain: &[CertificateDer<'static>]) -> bool {
+        self.inner
+            .tls
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .is_some_and(|t| t.still_valid(chain))
+    }
+
+    /// Cuts off every online machine that is blocked now, or whose device
+    /// certificate is no longer valid (expired, revoked, new roots), with its
+    /// sessions. Returns how many machines.
+    fn recheck_machines(&self) -> usize {
+        let cfg = self.config();
+        let mut cut: Vec<(Cut, &'static str)> = Vec::new();
+        let mut machines = 0;
+        {
+            let st = self.st();
+            for (name, m) in &st.machines {
+                let Some(c) = m.conn.as_ref() else { continue };
+                let why = if cfg.blocked_machines.contains(name) {
+                    "blocked"
+                } else if !self.chain_valid(&c.chain) {
+                    "certificate_invalid"
+                } else {
+                    continue;
+                };
+                machines += 1;
+                cut.push((c.cut.clone(), why));
+                cut.extend(
+                    st.sessions
+                        .values()
+                        .filter(|s| &s.machine == name)
+                        .map(|s| (s.cut.clone(), why)),
+                );
+            }
+        }
+        for (c, why) in cut {
+            c.cut(why);
+        }
+        machines
     }
 
     /// Serves machines and callers on `listener` until `shutdown` is cancelled.
     pub async fn serve(
         &self,
         listener: TcpListener,
-        tls: Arc<rustls::ServerConfig>,
+        tls: tls::Setup,
         shutdown: CancellationToken,
     ) -> std::io::Result<()> {
-        *self.inner.tls.write().unwrap_or_else(|p| p.into_inner()) =
-            Some(tokio_rustls::TlsAcceptor::from(tls));
+        *self.inner.tls.write().unwrap_or_else(|p| p.into_inner()) = Some(tls);
         let flush = {
             let relay = self.clone();
             let shutdown = shutdown.clone();
@@ -332,6 +371,12 @@ impl Relay {
                     }
                 },
             };
+            // Caps on connections held, all told and per address, before any
+            // work is done for them.
+            let Some(held) = self.hold_connection(remote.ip()) else {
+                drop(tcp);
+                continue;
+            };
             let _ = tcp.set_nodelay(true);
             // Notice peers that vanish (a laptop that sleeps mid-session).
             let ka = socket2::TcpKeepalive::new()
@@ -343,13 +388,15 @@ impl Relay {
                 .tls
                 .read()
                 .unwrap_or_else(|p| p.into_inner())
-                .clone()
+                .as_ref()
+                .map(|t| tokio_rustls::TlsAcceptor::from(t.config.clone()))
             else {
                 continue;
             };
             let relay = self.clone();
             let shutdown = shutdown.clone();
             tokio::spawn(async move {
+                let _held = held;
                 let tls = match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(tcp))
                     .await
                 {
@@ -361,13 +408,24 @@ impl Relay {
                     Err(_) => return,
                 };
                 let which = relay.config().machine_name;
-                let machine = tls
+                let chain: Vec<CertificateDer<'static>> = tls
                     .get_ref()
                     .1
                     .peer_certificates()
-                    .and_then(|c| c.first())
-                    .map(|c| tls::machine_name(c, which));
-                http::serve_connection(relay, tls, http::Peer { remote, machine }, shutdown).await;
+                    .map(|c| c.iter().map(|c| c.clone().into_owned()).collect())
+                    .unwrap_or_default();
+                let machine = chain.first().map(|c| tls::machine_name(c, which));
+                http::serve_connection(
+                    relay,
+                    tls,
+                    http::Peer {
+                        remote,
+                        machine,
+                        chain,
+                    },
+                    shutdown,
+                )
+                .await;
             });
         }
         // Machines reconnect to the next relay process; sessions end with it.
@@ -379,6 +437,23 @@ impl Relay {
         flush.abort();
         self.flush().await;
         Ok(())
+    }
+    /// A place among the connections the relay holds, or `None` when the
+    /// relay, or this address, is at its limit.
+    fn hold_connection(&self, ip: std::net::IpAddr) -> Option<Held> {
+        let permit = self.inner.connections.clone().try_acquire_owned().ok()?;
+        let max = self.config().max_connections_per_ip;
+        let mut m = self.inner.per_ip.lock().unwrap_or_else(|p| p.into_inner());
+        let n = m.entry(ip).or_default();
+        if *n >= max {
+            return None;
+        }
+        *n += 1;
+        Some(Held {
+            relay: self.clone(),
+            ip,
+            _permit: permit,
+        })
     }
 
     fn drop_everything(&self) {
@@ -403,6 +478,9 @@ impl Relay {
 
     /// Writes what is behind: machines.json, and a stop not yet recorded.
     async fn flush(&self) {
+        // Certificates expire and revocation lists go stale while machines
+        // stay connected.
+        self.recheck_machines();
         let relay = self.clone();
         let _ = tokio::task::spawn_blocking(move || {
             let _w = relay
@@ -416,7 +494,7 @@ impl Relay {
                     match relay.inner.store.save_stop(&stop) {
                         Ok(()) => {
                             relay.inner.stop_unsaved.store(false, Ordering::SeqCst);
-                            relay.inner.audit.event("org_stop_saved", []);
+                            relay.inner.audit.kept("org_stop_saved", []);
                         }
                         Err(e) => {
                             tracing::error!(error = %e, "still cannot record the org-wide stop")
@@ -426,7 +504,20 @@ impl Relay {
                     relay.inner.stop_unsaved.store(false, Ordering::SeqCst);
                 }
             }
-            let seen: BTreeMap<String, Seen> = {
+            let due = relay.inner.seen_dirty.swap(false, Ordering::SeqCst) || {
+                let mut last = relay
+                    .inner
+                    .seen_written
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                if last.elapsed() >= Duration::from_secs(60) {
+                    *last = std::time::Instant::now();
+                    true
+                } else {
+                    false
+                }
+            };
+            let seen: Option<BTreeMap<String, Seen>> = due.then(|| {
                 let mut st = relay.st();
                 let now = unix(SystemTime::now());
                 for m in st.machines.values_mut() {
@@ -438,11 +529,12 @@ impl Relay {
                     .iter()
                     .map(|(k, m)| (k.clone(), m.seen))
                     .collect()
-            };
-            relay.inner.seen_dirty.store(false, Ordering::SeqCst);
-            if let Err(e) = relay.inner.store.save_seen(&seen) {
-                relay.inner.seen_dirty.store(true, Ordering::SeqCst);
-                tracing::warn!(error = %e, "could not save machines.json");
+            });
+            if let Some(seen) = seen {
+                if let Err(e) = relay.inner.store.save_seen(&seen) {
+                    relay.inner.seen_dirty.store(true, Ordering::SeqCst);
+                    tracing::warn!(error = %e, "could not save machines.json");
+                }
             }
             for (kind, n) in relay.inner.refusals.take_suppressed() {
                 relay.inner.audit.event(
@@ -488,6 +580,9 @@ impl Relay {
     /// told, and no caller gets through until [`Relay::release`]. Pressing it
     /// again while it is on keeps the first record.
     pub fn stop(&self, by: &str, reason: &str) -> Stopped {
+        // The writer lock first, as in release: the record saved below is
+        // the one set here, whatever else happens meanwhile.
+        let writing = self.inner.writing.lock().unwrap_or_else(|p| p.into_inner());
         let (stop, sessions, conns, fresh) = {
             let mut st = self.st();
             let fresh = !st.stop.stopped;
@@ -519,7 +614,7 @@ impl Relay {
             }
         }
         if fresh {
-            self.inner.audit.event(
+            self.inner.audit.kept(
                 "org_stop",
                 [
                     ("by", json!(by)),
@@ -530,7 +625,7 @@ impl Relay {
             tracing::warn!(by, reason, "org-wide stop pressed");
         }
         let saved = {
-            let _w = self.inner.writing.lock().unwrap_or_else(|p| p.into_inner());
+            let _w = writing;
             if fresh || self.inner.stop_unsaved.load(Ordering::SeqCst) {
                 match self.inner.store.save_stop(&stop) {
                     Ok(()) => {
@@ -542,7 +637,7 @@ impl Relay {
                         tracing::error!(error = %e, "could not record the org-wide stop: a restart would lose it; retrying");
                         self.inner
                             .audit
-                            .event("org_stop_not_saved", [("error", json!(e.to_string()))]);
+                            .kept("org_stop_not_saved", [("error", json!(e.to_string()))]);
                         false
                     }
                 }
@@ -564,15 +659,18 @@ impl Relay {
         };
         let conns = {
             let _w = self.inner.writing.lock().unwrap_or_else(|p| p.into_inner());
-            let mut st = self.st();
-            if !st.stop.stopped {
-                return Ok(st.stop.clone());
+            if !self.st().stop.stopped {
+                return Ok(self.st().stop.clone());
             }
+            // Recorded before it takes effect, without holding up the relay
+            // while the disk writes. Only stop and release change the stop,
+            // and both hold the writer lock.
             self.inner
                 .store
                 .save_stop(&next)
                 .map_err(|e| format!("could not record the release: {e}"))?;
             self.inner.stop_unsaved.store(false, Ordering::SeqCst);
+            let mut st = self.st();
             st.stop = next.clone();
             st.machines
                 .values()
@@ -584,7 +682,7 @@ impl Relay {
                 cut.cut("could not deliver the release");
             }
         }
-        self.inner.audit.event(
+        self.inner.audit.kept(
             "org_release",
             [("by", json!(by)), ("reason", json!(reason))],
         );
@@ -600,11 +698,17 @@ impl Relay {
         &self,
         machine: &str,
         remote: SocketAddr,
-    ) -> (u64, mpsc::Receiver<Control>, Cut, bool) {
+        chain: Vec<CertificateDer<'static>>,
+    ) -> Option<(u64, mpsc::Receiver<Control>, Cut, bool)> {
         let (tx, rx) = mpsc::channel(256);
         let cut = Cut::default();
         let (id, stopped, replaced) = {
             let mut st = self.st();
+            // Checked under the lock a reload takes to cut machines off, so a
+            // machine blocked meanwhile cannot slip in.
+            if self.blocked(machine) || !self.chain_valid(&chain) {
+                return None;
+            }
             st.next_id += 1;
             let id = st.next_id;
             let stopped = st.stop.stopped;
@@ -616,6 +720,7 @@ impl Relay {
             m.seen.last_seen = unix(now);
             let replaced = m.conn.replace(Conn {
                 id,
+                chain,
                 tx,
                 cut: cut.clone(),
                 since: now,
@@ -640,7 +745,7 @@ impl Relay {
             ],
         );
         self.inner.seen_dirty.store(true, Ordering::SeqCst);
-        (id, rx, cut, stopped)
+        Some((id, rx, cut, stopped))
     }
 
     fn machine_seen(&self, machine: &str) {
@@ -705,6 +810,9 @@ impl Relay {
             let Some(conn) = m.conn.as_ref() else {
                 return Err(Refusal::Offline);
             };
+            if self.blocked(machine) {
+                return Err(Refusal::Offline);
+            }
             if m.streams >= max {
                 return Err(Refusal::Busy);
             }
@@ -758,10 +866,13 @@ impl Relay {
 
     /// Registers a caller's session; `None` while the stop is on or the
     /// machine is gone.
-    fn session_started(&self, machine: &str) -> Option<(u64, Cut)> {
+    fn session_started(&self, machine: &str) -> Result<(u64, Cut), Refusal> {
         let mut st = self.st();
-        if st.stop.stopped || st.machines.get(machine).is_none_or(|m| m.conn.is_none()) {
-            return None;
+        if st.stop.stopped {
+            return Err(Refusal::Stopped);
+        }
+        if st.machines.get(machine).is_none_or(|m| m.conn.is_none()) {
+            return Err(Refusal::Offline);
         }
         st.next_id += 1;
         let id = st.next_id;
@@ -773,7 +884,7 @@ impl Relay {
                 cut: cut.clone(),
             },
         );
-        Some((id, cut))
+        Ok((id, cut))
     }
 
     fn session_ended(&self, id: u64) {
@@ -838,6 +949,30 @@ impl Drop for StreamSlot {
     fn drop(&mut self) {
         if let Some(m) = self.relay.st().machines.get_mut(&self.machine) {
             m.streams = m.streams.saturating_sub(1);
+        }
+    }
+}
+
+/// A connection's place under the connection limits.
+struct Held {
+    relay: Relay,
+    ip: std::net::IpAddr,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let mut m = self
+            .relay
+            .inner
+            .per_ip
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(n) = m.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.ip);
+            }
         }
     }
 }

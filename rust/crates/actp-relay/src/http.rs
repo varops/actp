@@ -60,6 +60,8 @@ pub(crate) struct Peer {
     pub remote: SocketAddr,
     /// The machine named by a verified device certificate; `None` without one.
     pub machine: Option<Result<String, String>>,
+    /// That certificate's chain, leaf first, checked again on every request.
+    pub chain: Vec<rustls_pki_types::CertificateDer<'static>>,
 }
 
 pub(crate) async fn serve_connection<S>(
@@ -185,6 +187,23 @@ fn machine_of(relay: &Relay, peer: &Peer, route: &str) -> Result<String, Box<Res
                 "machine_blocked",
                 "this machine is blocked at the relay",
             )))
+        } // Checked again on every request: the certificate may have expired,
+        // or been revoked by a reload, since the handshake.
+        Some(Ok(m)) if !relay.chain_valid(&peer.chain) => {
+            relay.refusal(
+                "machine_refused",
+                [
+                    ("machine", json!(m)),
+                    ("remote", json!(peer.remote.to_string())),
+                    ("route", json!(route)),
+                    ("reason", json!("certificate_invalid")),
+                ],
+            );
+            Err(Box::new(error(
+                StatusCode::FORBIDDEN,
+                "bad_device_certificate",
+                "the device certificate is no longer valid",
+            )))
         }
         Some(Ok(m)) => Ok(m.clone()),
     }
@@ -265,6 +284,7 @@ fn machine_control(
     let on_upgrade = hyper::upgrade::on(&mut req);
     let relay = relay.clone();
     let remote = peer.remote;
+    let chain = peer.chain.clone();
     tokio::spawn(async move {
         let Ok(up) = on_upgrade.await else {
             return;
@@ -275,7 +295,7 @@ fn machine_control(
             Some(ws_config(64 << 10)),
         )
         .await;
-        run_control(relay, machine, remote, ws, shutdown).await;
+        run_control(relay, machine, remote, chain, ws, shutdown).await;
     });
     resp
 }
@@ -284,10 +304,15 @@ async fn run_control(
     relay: Relay,
     machine: String,
     remote: SocketAddr,
-    ws: WebSocketStream<TokioIo<Upgraded>>,
+    chain: Vec<rustls_pki_types::CertificateDer<'static>>,
+    mut ws: WebSocketStream<TokioIo<Upgraded>>,
     shutdown: CancellationToken,
 ) {
-    let (id, mut rx, cut, stopped) = relay.machine_connected(&machine, remote);
+    let Some((id, mut rx, cut, stopped)) = relay.machine_connected(&machine, remote, chain) else {
+        // Blocked, or its certificate stopped being valid, since the request.
+        let _ = ws.close(None).await;
+        return;
+    };
     tracing::info!(machine = %machine, %remote, "machine online");
     let (mut sink, mut stream) = ws.split();
     let timing = relay.timing().clone();
@@ -606,17 +631,20 @@ async fn caller(relay: &Relay, peer: &Peer, mut req: Request<Incoming>, rest: &s
     let resumed = parts.headers.contains_key(HEADER_LINK_ID);
     let link = header_str(resp.headers(), HEADER_LINK_ID).map(|l| short(&l));
     let client_name = header_str(&parts.headers, HEADER_CLIENT_NAME);
-
     if status != StatusCode::SWITCHING_PROTOCOLS || caller_upgrade.is_none() {
-        relay.audit().event(
-            "caller_answered",
-            [
-                ("machine", json!(machine)),
-                ("remote", json!(remote)),
-                ("route", json!(route)),
-                ("status", json!(status.as_u16())),
-            ],
-        );
+        let fields = [
+            ("machine", json!(machine)),
+            ("remote", json!(remote)),
+            ("route", json!(route)),
+            ("status", json!(status.as_u16())),
+        ];
+        // Refusals by the machine cost a caller nothing, so they are
+        // throttled like the relay's own.
+        if status.as_u16() >= 400 {
+            relay.refusal("caller_answered", fields);
+        } else {
+            relay.audit().event("caller_answered", fields);
+        }
         if status == StatusCode::SWITCHING_PROTOCOLS {
             // The caller asked for no upgrade: a machine has no business switching.
             return error(
@@ -636,8 +664,9 @@ async fn caller(relay: &Relay, peer: &Peer, mut req: Request<Incoming>, rest: &s
 
     // A link: register the session (refused if the stop came meanwhile) and
     // pipe the two upgraded connections into each other.
-    let Some((session, cut)) = relay.session_started(&machine) else {
-        return refuse(Refusal::Stopped);
+    let (session, cut) = match relay.session_started(&machine) {
+        Ok(s) => s,
+        Err(r) => return refuse(r),
     };
     relay.audit().event(
         "session_open",

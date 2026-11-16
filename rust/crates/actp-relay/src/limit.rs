@@ -16,6 +16,7 @@ struct Buckets {
     per_second: f64,
     burst: f64,
     map: HashMap<IpAddr, (f64, Instant)>,
+    pruned: Instant,
 }
 
 impl RateLimiter {
@@ -25,6 +26,7 @@ impl RateLimiter {
                 per_second: per_second as f64,
                 burst: burst.max(1) as f64,
                 map: HashMap::new(),
+                pruned: Instant::now(),
             }),
         }
     }
@@ -40,10 +42,13 @@ impl RateLimiter {
         let mut b = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
         let (rate, burst) = (b.per_second, b.burst);
-        if b.map.len() > 50_000 {
-            // Forget addresses that have refilled completely.
+        if b.map.len() > 50_000 && now.duration_since(b.pruned) >= Duration::from_secs(10) {
+            // Forget addresses that have refilled completely; at most every
+            // ten seconds, so a flood of addresses cannot make every request
+            // scan the map.
             let full = Duration::from_secs_f64(burst / rate.max(0.001));
             b.map.retain(|_, (_, t)| now.duration_since(*t) < full);
+            b.pruned = now;
         }
         let (tokens, last) = b.map.entry(ip).or_insert((burst, now));
         *tokens = (*tokens + now.duration_since(*last).as_secs_f64() * rate).min(burst);
