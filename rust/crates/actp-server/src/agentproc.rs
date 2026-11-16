@@ -170,9 +170,9 @@ impl Process {
                 {
                     return;
                 }
-                terminate_group(self.pid);
+                terminate_group(self.pid).await;
                 if tokio::time::timeout(grace, self.wait()).await.is_err() {
-                    kill_group(self.pid);
+                    kill_group(self.pid).await;
                     self.wait().await;
                 }
             })
@@ -193,7 +193,7 @@ fn set_process_group(cmd: &mut Command) {
 }
 
 #[cfg(unix)]
-fn terminate_group(pid: u32) {
+async fn terminate_group(pid: u32) {
     if pid > 0 {
         // SAFETY: kill(2) with a negative pid signals the agent's process group.
         unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGTERM) };
@@ -201,7 +201,7 @@ fn terminate_group(pid: u32) {
 }
 
 #[cfg(unix)]
-fn kill_group(pid: u32) {
+async fn kill_group(pid: u32) {
     if pid > 0 {
         // SAFETY: as above.
         unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
@@ -209,22 +209,26 @@ fn kill_group(pid: u32) {
 }
 
 // npm-installed agents are .cmd shims; only killing the tree stops the real agent.
+// taskkill runs as an async child, so stopping an agent never blocks a runtime thread.
 #[cfg(windows)]
-fn terminate_group(pid: u32) {
-    let _ = std::process::Command::new("taskkill")
-        .args(["/T", "/PID", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+async fn terminate_group(pid: u32) {
+    taskkill(&["/T", "/PID", &pid.to_string()]).await;
 }
 
 #[cfg(windows)]
-fn kill_group(pid: u32) {
-    let _ = std::process::Command::new("taskkill")
-        .args(["/T", "/F", "/PID", &pid.to_string()])
+async fn kill_group(pid: u32) {
+    taskkill(&["/T", "/F", "/PID", &pid.to_string()]).await;
+}
+
+#[cfg(windows)]
+async fn taskkill(args: &[&str]) {
+    let _ = Command::new("taskkill")
+        .args(args)
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
+        .status()
+        .await;
 }
 
 /// Stops a leftover process group from an earlier run. Agents lead their own
@@ -244,10 +248,15 @@ pub fn kill_group_by_pid(pid: i64) {
     }
 }
 
+/// Runs once at server start, before any agent, so a blocking taskkill is fine here.
 #[cfg(windows)]
 pub fn kill_group_by_pid(pid: i64) {
     if pid > 0 {
-        kill_group(pid as u32);
+        let _ = std::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 }
 
