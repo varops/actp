@@ -105,6 +105,8 @@ fn free_port() -> u16 {
 }
 
 struct ServerProc {
+    // Held to keep the server running (killed on drop); signalled by the revoke test.
+    #[cfg_attr(not(unix), allow(dead_code))]
     child: Child,
     port: u16,
     dirs: Dirs,
