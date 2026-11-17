@@ -1396,7 +1396,11 @@ async fn a_stop_while_a_tunnel_waits_answers_at_once() {
     let waiting = tokio::spawn(async move {
         tunnel_request(&route, port, "laptop-a", "GET", "/", "", None).await
     });
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Once the tunnel is waiting on the machine, press the stop.
+    eventually("the tunnel waiting", || {
+        env.relay.machines().iter().any(|m| m.sessions == 1)
+    })
+    .await;
     let (status, _) = request(
         &pki,
         env.port,

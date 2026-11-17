@@ -104,11 +104,6 @@ impl Setup {
     }
 }
 
-/// A client certificate verifier. `handshake` is the one TLS uses for
-/// every connection: it takes no certificate too (`/health`, the
-/// management API), and a certificate whose issuer has no revocation list
-/// (a caller's, when only devices have lists), because every route checks
-/// the certificate again with the strict verifier of its own kind.
 /// Subject, issuer and key of a root, as DER.
 fn identity(c: &CertificateDer<'_>) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     use x509_parser::prelude::{FromDer, X509Certificate};
@@ -139,6 +134,11 @@ fn overlap(a: &[CertificateDer<'_>], b: &[CertificateDer<'_>]) -> Option<String>
     None
 }
 
+/// A client certificate verifier. `handshake` is the one TLS uses for
+/// every connection: it takes no certificate too (`/health`, the
+/// management API), and a certificate whose issuer has no revocation list
+/// (a caller's, when only devices have lists), because every route checks
+/// the certificate again with the strict verifier of its own kind.
 fn verifier(
     roots: &[CertificateDer<'static>],
     crls: Vec<CertificateRevocationListDer<'static>>,
