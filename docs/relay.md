@@ -90,7 +90,7 @@ caller_rate: {per_second: 20, burst: 60}  # per caller IP, for tunnels and the m
 max_connections: 20000                    # connections held at once by anyone but machines
 max_connections_per_ip: 1000              # the same per IP address (IPv6: per /64)
 max_connections_per_machine: 64           # connections one machine may hold before they become its control connection or streams
-machine_key_renewal_days: 30              # a newer certificate with a new key is taken as a renewal this close to the pinned one's expiry (at most 90); 0: never
+machine_key_renewal_days: 0               # off: a new key needs the old key's proof (key continuity) or an admin; set, see Key pinning
 tunnel_idle_seconds: 600                  # a tunnel that carries nothing either way for this long is cut (at least 60)
 audit_max_mb: 100                         # audit.jsonl is rotated at this size; ten old files are kept
 admin_tokens:
@@ -122,16 +122,23 @@ Any certificate under `device_ca` counts as a machine, so use roots that sign on
 
 The first device certificate the relay sees for a machine name pins the name to that certificate's public key (its SubjectPublicKeyInfo, by SHA-256), kept in `state_dir/machines.json` with the certificate's validity. A certificate for the same name with the same key, re-issued or renewed, is taken as before. A certificate with another key, though the org's CA signed it, is refused: its connection counts as anyone's, its requests get `403 machine_key_changed`, and `machine_key_refused` records both keys, once a minute per machine with a count of the rest.
 
-The one exception is a renewal. A certificate with another key is taken when all of these hold:
-- the pinned certificate expires within `machine_key_renewal_days` (30), or has expired;
-- the new certificate was issued after the pinned one (a later notBefore);
-- it expires after the pinned one.
+A machine moves its name to a new key by **key continuity**, with the old key's proof. The MDM puts the renewed certificate and its key next to the current ones, as `<cert>.next` and `<key>.next` (the paths in the machine's `relay:` section, plus `.next`). The machine checks for them every minute while connected. When it finds them:
 
-The pin then moves to the new key, `machine_key_renewed` records both keys, and the machine's connection on the old key is cut with its sessions (`machine_offline`, reason `key_renewed`); callers reconnect. A blocked name is never pinned or renewed. With `machine_key_renewal_days: 0` no new key is ever taken by itself.
+1. It asks the relay for a nonce: `POST /relay/v1/rekey/challenge`, on its current, pinned certificate. The answer is `{"nonce": "<64 hex>"}`. A nonce is good once, for this machine, for 60 seconds, and at most four are open per machine.
+2. It signs, with the current key, `actp-relay-rekey-v1\n<address>\n<nonce>\n` followed by the new leaf certificate's DER. It posts `{"certificates": [<base64 DER>, …], "nonce", "scheme", "signature"}` to `POST /relay/v1/rekey`. `scheme` is the TLS signature scheme number: Ed25519, ECDSA P-256 or P-384, or RSA-PSS SHA-256.
+3. The relay moves the pin only when every check holds:
+   - the nonce is fresh, and was given to this machine;
+   - the new certificate is a valid device certificate now, for the same address, with another key;
+   - the signature verifies with the pinned key.
 
-So a second certificate for a laptop's name, issued by mistake or by someone who reached the MDM, cannot take over the name while the laptop's own certificate has more than the window left. **Inside the window it can:** the relay cannot tell a renewal from a second certificate issued at the same time, as the old key does not vouch for the new one. The real laptop is then cut off and refused, and `machine_key_refused` names it. Watch `machine_key_renewed` and `machine_key_refused`. Where the MDM renews certificates with the same key, set `machine_key_renewal_days: 0`. With one-year certificates and the default window, a name is open to a new key about a twelfth of the time.
+   The nonce is used up whatever the outcome, so a proof cannot be replayed.
+4. The pin moves to the new key. `machine_key_continued` records both keys, and the machine's connection on the old key is cut with its sessions (`machine_offline`, reason `key_continued`). The machine keeps its old files as `<cert>.prev` and `<key>.prev`, moves the next ones into place, and reconnects with them.
 
-When a machine legitimately gets a new key early (a reinstall, a new disk, a lost key), an admin re-pins it, best to the new key itself (the SHA-256 of its public key, as lowercase hex):
+A refusal answers `403` with its reason (`rekey_nonce_unknown`, `rekey_certificate_invalid`, `rekey_other_machine`, `rekey_same_key`, `rekey_signature_invalid`, `rekey_not_pinned`), and is recorded as `machine_refused` with that reason. The machine tries again a minute later. A certificate for the name with a new key and no such proof, from the org's own CA included, is never taken: it cannot even ask for a nonce.
+
+**Renewal window, off by default.** An operator may set `machine_key_renewal_days` (at most 90). A certificate with another key is then also taken without the proof when all of these hold: the pinned certificate expires within that many days (or has expired); the new certificate was issued after the pinned one; and it expires after it. `machine_key_renewed` records it, and the old key's connection is cut (`key_renewed`). The relay warns at start and on reload while the window is above 0. Inside the window, the relay cannot tell a renewal from a second certificate issued at the same time by mistake or by someone who reached the MDM; the real laptop would then be cut off and refused. Use it only for machines that cannot do key continuity.
+
+When a machine cannot prove its new key (it was offline past its certificate's expiry, was reinstalled, or lost its key), an admin re-pins it, best to the new key itself (the SHA-256 of its public key, as lowercase hex):
 
 ```bash
 curl -X POST -H "Authorization: Bearer $ADMIN" -d '{"machine": "C02XK1ABJG5H", "reason": "reinstalled, ticket 4411", "key": "9f86d0…"}' https://relay.example.com/relay/v1/repin
@@ -248,12 +255,13 @@ Keep `state_dir` with the relay: a relay that starts without its `stop.json` kno
 | --- | --- |
 | `machine_online` | `machine`, `remote` |
 | `machine_replaced` | `machine`, `remote`, `old_certificate`, `new_certificate` (SHA-256 fingerprints) |
-| `machine_offline` | `machine`, `seconds`, `reason` (`closed`, `silent`, `blocked`, `certificate_invalid`, `key_changed`, `key_renewed`, `repinned`, `relay stopping`, …) |
+| `machine_offline` | `machine`, `seconds`, `reason` (`closed`, `silent`, `blocked`, `certificate_invalid`, `key_changed`, `key_continued`, `key_renewed`, `repinned`, `relay stopping`, …) |
 | `machine_refused` | `remote`, `route`, `reason`, and `machine` when the certificate named one |
 | `session_open` | `session`, `machine`, `caller`, `caller_certificate` (SHA-256), `on_behalf_of` (when the caller named one), `remote` |
 | `session_closed` | `session`, `machine`, `caller`, `seconds`, `bytes_to_machine`, `bytes_to_caller`, `reason` (`closed`, `idle`, `org_stop`, `machine_offline`, `blocked`, `certificate_invalid`, `caller_blocked`, `caller_certificate_invalid`, `relay_stopping`, `error`, `upgrade_failed`) |
 | `connection_refused` | `remote` (the address, or the IPv6 /64, at its limit), and `machine` when it was the machine's limit |
-| `machine_key_renewed` | `machine`, `old_key`, `new_key` (SHA-256 of the public keys) |
+| `machine_key_continued` | `machine`, `old_key`, `new_key` (SHA-256 of the public keys): the pin moved with the old key's proof |
+| `machine_key_renewed` | `machine`, `old_key`, `new_key`: the pin moved by the renewal window |
 | `machine_key_refused` | `machine`, `pinned_key`, `presented_key`, `repeats` (refusals left out in the minute before) |
 | `machine_repinned` | `machine`, `by`, `reason`, `key` (or null), `was_pinned` |
 | `caller_refused` | `caller` (when its certificate named one), `machine` (when one was reached), `remote`, `reason` |

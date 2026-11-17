@@ -19,7 +19,7 @@ futures-util.workspace = true
 hex.workspace = true
 http.workspace = true
 http-body-util.workspace = true
-hyper.workspace = true
+hyper = { workspace = true, features = ["client"] }
 hyper-util.workspace = true
 percent-encoding.workspace = true
 rand.workspace = true

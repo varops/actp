@@ -58,6 +58,12 @@ pub struct RelayOptions {
     pub max_streams: usize,
     /// How long dialing one data stream may take (10 s).
     pub dial_timeout: Duration,
+    /// The device certificate's files, for key continuity
+    /// ([`crate::continuity`]): when set, a `<cert>.next` / `<key>.next`
+    /// pair is moved to with the current key's proof. `None`: never.
+    pub continuity: Option<config::Relay>,
+    /// How often to look for a next certificate while connected (60 s).
+    pub continuity_every: Duration,
 }
 
 impl RelayOptions {
@@ -75,6 +81,8 @@ impl RelayOptions {
             dead_after: Duration::from_secs(60),
             max_streams: 64,
             dial_timeout: Duration::from_secs(10),
+            continuity: None,
+            continuity_every: Duration::from_secs(60),
         }
     }
 }
@@ -158,7 +166,7 @@ pub fn client_tls(relay: &config::Relay) -> io::Result<Arc<rustls::ClientConfig>
     Ok(Arc::new(cfg))
 }
 
-fn device_chain(
+pub(crate) fn device_chain(
     relay: &config::Relay,
 ) -> io::Result<(
     Vec<rustls::pki_types::CertificateDer<'static>>,
@@ -241,14 +249,36 @@ async fn dial(
 
 async fn control_loop(
     server: Server,
-    opts: RelayOptions,
+    mut opts: RelayOptions,
     tx: mpsc::Sender<Connecting>,
     status: watch::Sender<Status>,
     shutdown: CancellationToken,
 ) {
     let streams = Arc::new(Semaphore::new(opts.max_streams));
     let mut backoff = Duration::from_secs(1);
+    // The identity can change under key continuity: read before every dial.
+    let identity: crate::continuity::Shared =
+        Arc::new(std::sync::RwLock::new(crate::continuity::Identity {
+            tls: opts.tls.clone(),
+            e2e: opts.e2e.clone(),
+        }));
+    let reconnect = Arc::new(tokio::sync::Notify::new());
+    if let Some(files) = opts.continuity.clone() {
+        tokio::spawn(crate::continuity::run(
+            files,
+            identity.clone(),
+            status.subscribe(),
+            reconnect.clone(),
+            opts.continuity_every,
+            shutdown.clone(),
+        ));
+    }
     loop {
+        {
+            let id = identity.read().unwrap_or_else(|p| p.into_inner());
+            opts.tls = id.tls.clone();
+            opts.e2e = id.e2e.clone();
+        }
         let _ = status.send(Status::Connecting);
         let started = Instant::now();
         let dialed = tokio::select! {
@@ -258,7 +288,17 @@ async fn control_loop(
         let error = match dialed {
             Ok(ws) => {
                 tracing::info!(relay = %opts.url, "connected to the relay");
-                let e = run_control(&server, &opts, ws, &tx, &status, &streams, &shutdown).await;
+                let e = tokio::select! {
+                    e = run_control(&server, &opts, ws, &tx, &status, &streams, &shutdown) => e,
+                    _ = reconnect.notified() => {
+                        // A new device key: reconnect with it at once.
+                        backoff = Duration::from_millis(100);
+                        let _ = status.send(Status::Disconnected {
+                            error: "moving to the next device certificate".into(),
+                        });
+                        continue;
+                    }
+                };
                 if shutdown.is_cancelled() {
                     return;
                 }

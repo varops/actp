@@ -519,10 +519,13 @@ async fn cmd_serve(args: &[String]) -> Result<(), Exit> {
                 &sc.tls_key,
             )?)
         };
-        let relay =
-            sc.relay.as_ref().zip(relay_tls).map(|(r, (tls, e2e))| {
-                actp_server::relay::RelayOptions::new(r.url.clone(), tls, e2e)
-            });
+        let relay = sc.relay.as_ref().zip(relay_tls).map(|(r, (tls, e2e))| {
+            let mut o = actp_server::relay::RelayOptions::new(r.url.clone(), tls, e2e);
+            // Key continuity: a `<cert>.next` / `<key>.next` pair is
+            // moved to with the current key's proof.
+            o.continuity = Some(r.clone());
+            o
+        });
         tokio::spawn(async move {
             if let Some(opts) = relay {
                 let acceptor =

@@ -268,7 +268,8 @@ async fn a_machine_name_keeps_its_first_key_until_an_admin_repins_it() {
 async fn a_new_key_is_taken_as_a_renewal_only_near_the_pinned_expiry() {
     let dir = scratch("renew");
     let pki = Pki::new(&dir);
-    let env = start_relay(&pki, &dir).await;
+    // Off by default: only when an operator sets the window.
+    let env = start_relay_with(&pki, &dir, "machine_key_renewal_days: 30\n").await;
 
     // Pinned to a certificate with 10 days left: within the 30-day window,
     // so a newer certificate with a new key that outlasts it is its renewal.
@@ -518,4 +519,390 @@ async fn a_tunnel_that_carries_nothing_is_cut() {
     let ok = relay_yaml(&pki, &dir, "tunnel_idle_seconds: 60\n");
     assert!(actp_relay::config::Config::parse(&ok).is_ok());
     drop(laptop);
+}
+
+// ---- key continuity ----
+
+/// A POST to the relay as the machine holding `cert`: the status and the
+/// error code or body.
+async fn post_as(
+    pki: &Pki,
+    port: u16,
+    cert: &(PathBuf, PathBuf),
+    path: &str,
+    body: Value,
+) -> (u16, Value) {
+    let tls = device_tls(pki, port, cert).await;
+    let (mut sender, conn) =
+        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tls))
+            .await
+            .unwrap();
+    tokio::spawn(conn);
+    let req = http::Request::post(path)
+        .header("host", "localhost")
+        .header("content-type", "application/json")
+        .body(http_body_util::Full::new(bytes::Bytes::from(
+            body.to_string(),
+        )))
+        .unwrap();
+    let resp = sender.send_request(req).await.unwrap();
+    let status = resp.status().as_u16();
+    use http_body_util::BodyExt;
+    let body: Value = serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes())
+        .unwrap_or(Value::Null);
+    (status, body)
+}
+
+async fn nonce(pki: &Pki, port: u16, cert: &(PathBuf, PathBuf)) -> String {
+    let (status, b) = post_as(pki, port, cert, "/relay/v1/rekey/challenge", json!({})).await;
+    assert_eq!(status, 200, "{b}");
+    b["nonce"].as_str().unwrap().to_string()
+}
+
+fn der(pem: &std::path::Path) -> Vec<u8> {
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
+    CertificateDer::from_pem_file(pem)
+        .unwrap()
+        .as_ref()
+        .to_vec()
+}
+
+/// A continuity request for `next`'s certificate, signed by `signer`'s key
+/// over `machine` and `signed_nonce`, sent with `sent_nonce`.
+fn proof(
+    next: &(PathBuf, PathBuf),
+    signer: &(PathBuf, PathBuf),
+    machine: &str,
+    signed_nonce: &str,
+    sent_nonce: &str,
+) -> Value {
+    use base64::Engine;
+    use rustls::pki_types::PrivateKeyDer;
+    use rustls::pki_types::pem::PemObject;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let leaf = der(&next.0);
+    let key = PrivateKeyDer::from_pem_file(&signer.1).unwrap();
+    let msg = actp_proto::relay::rekey_message(machine, signed_nonce, &leaf);
+    let (scheme, sig) = actp_proto::relay::rekey_sign(&key, &msg).unwrap();
+    json!({
+        "certificates": [b64.encode(&leaf)],
+        "nonce": sent_nonce,
+        "scheme": scheme,
+        "signature": b64.encode(sig),
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_machine_moves_to_its_next_key_with_the_old_keys_proof() {
+    let dir = scratch("continuity");
+    let pki = Pki::new(&dir);
+    let env = start_relay(&pki, &dir).await;
+    let (cert, key) = device_for_days(&pki, "laptop-a", "current", 365);
+    let old_key = key_of(&cert);
+    let files = actp_server::config::Relay {
+        url: format!("wss://localhost:{}", env.port),
+        cert: cert.to_string_lossy().into_owned(),
+        key: key.to_string_lossy().into_owned(),
+        ca: dir.join("relay-ca.pem").to_string_lossy().into_owned(),
+    };
+    let tokens = format!(
+        "  tokens:\n    - name: it\n      hash: \"{}\"\n      agents: [\"*\"]\n      workspaces: [\"*\"]\n      default_workspace: site\n",
+        hash(TOKEN)
+    );
+    let mut laptop = start_laptop_full(
+        &pki,
+        "laptop-a",
+        env.port,
+        (cert.clone(), key.clone()),
+        &tokens,
+        None,
+        |o| {
+            o.continuity = Some(files.clone());
+            o.continuity_every = Duration::from_millis(200);
+        },
+    )
+    .await;
+    laptop.wait_connected().await;
+    assert!(is(
+        &as_machine(&pki, env.port, &(cert.clone(), key.clone())).await,
+        ACCEPTED
+    ));
+
+    // The MDM puts a renewed certificate, with a new key, next to the
+    // current one.
+    let next = device_for_days(&pki, "laptop-a", "renewed", 365);
+    let new_key = key_of(&next.0);
+    std::fs::rename(&next.0, format!("{}.next", cert.display())).unwrap();
+    std::fs::rename(&next.1, format!("{}.next", key.display())).unwrap();
+
+    // The machine proves it with the old key, the relay moves the pin, and
+    // the machine reconnects on the new certificate.
+    eventually("the pin moved", || {
+        env.audit_has("machine_key_continued", |e| {
+            e["machine"] == "laptop-a" && e["old_key"] == old_key && e["new_key"] == new_key
+        })
+    })
+    .await;
+    assert!(
+        env.audit_has("machine_offline", |e| e["machine"] == "laptop-a"
+            && e["reason"] == "key_continued")
+    );
+    eventually("installed", || key_of(&cert) == new_key).await;
+    assert_eq!(
+        key_of(std::path::Path::new(&format!("{}.prev", cert.display()))),
+        old_key
+    );
+    assert!(!std::path::Path::new(&format!("{}.next", cert.display())).exists());
+    laptop.wait_connected().await;
+    eventually("reconnected", || {
+        env.relay.machines().iter().any(|m| {
+            m.machine == "laptop-a" && m.online && m.key.as_deref() == Some(new_key.as_str())
+        })
+    })
+    .await;
+    // Callers reach it on the new certificate; the old key is a stranger.
+    let (status, body) = request(
+        &pki,
+        env.port,
+        "GET",
+        "/m/laptop-a/api/v1/info",
+        TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!((status, body["name"].as_str()), (200, Some("laptop-a")));
+    assert!(is(
+        &as_machine(
+            &pki,
+            env.port,
+            &(
+                PathBuf::from(format!("{}.prev", cert.display())),
+                PathBuf::from(format!("{}.prev", key.display()))
+            )
+        )
+        .await,
+        KEY_CHANGED
+    ));
+    drop(laptop);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn continuity_proofs_are_checked() {
+    let dir = scratch("continuity-proofs");
+    let pki = Pki::new(&dir);
+    let env = start_relay(&pki, &dir).await;
+    // Off by default: no window.
+    let cfg = actp_relay::config::Config::parse(&relay_yaml(&pki, &dir, "")).unwrap();
+    assert_eq!(cfg.machine_key_renewal_days, 0);
+
+    // Pinned to a certificate with 10 days left.
+    let old = device_issued(&pki, "laptop-a", "old", 48, 10);
+    let next = device_issued(&pki, "laptop-a", "next", 24, 365);
+    let stranger = device_issued(&pki, "laptop-a", "stranger", 24, 365);
+    assert!(is(&as_machine(&pki, env.port, &old).await, ACCEPTED));
+
+    // A certificate from the org's CA without the old key's proof is
+    // refused, near expiry too, and cannot even ask for a nonce.
+    assert!(is(&as_machine(&pki, env.port, &next).await, KEY_CHANGED));
+    let (status, b) = post_as(
+        &pki,
+        env.port,
+        &next,
+        "/relay/v1/rekey/challenge",
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        (status, b["error"].as_str()),
+        (403, Some("machine_key_changed"))
+    );
+
+    let refused = |status: u16, b: &Value, code: &str| {
+        assert_eq!((status, b["error"].as_str()), (403, Some(code)), "{b}");
+    };
+    let rekey = "/relay/v1/rekey";
+    // Signed by a key other than the pinned one.
+    let n = nonce(&pki, env.port, &old).await;
+    let (s, b) = post_as(
+        &pki,
+        env.port,
+        &old,
+        rekey,
+        proof(&next, &stranger, "laptop-a", &n, &n),
+    )
+    .await;
+    refused(s, &b, "rekey_signature_invalid");
+    // That nonce is used up: the right proof over it is refused now.
+    let (s, b) = post_as(
+        &pki,
+        env.port,
+        &old,
+        rekey,
+        proof(&next, &old, "laptop-a", &n, &n),
+    )
+    .await;
+    refused(s, &b, "rekey_nonce_unknown");
+    // A proof over one nonce, sent with another.
+    let (n1, n2) = (
+        nonce(&pki, env.port, &old).await,
+        nonce(&pki, env.port, &old).await,
+    );
+    let (s, b) = post_as(
+        &pki,
+        env.port,
+        &old,
+        rekey,
+        proof(&next, &old, "laptop-a", &n1, &n2),
+    )
+    .await;
+    refused(s, &b, "rekey_signature_invalid");
+    // A nonce never given, or given to another machine.
+    let (s, b) = post_as(
+        &pki,
+        env.port,
+        &old,
+        rekey,
+        proof(&next, &old, "laptop-a", &"ab".repeat(32), &"ab".repeat(32)),
+    )
+    .await;
+    refused(s, &b, "rekey_nonce_unknown");
+    let b_cert = pki.device("laptop-b", None);
+    assert!(is(&as_machine(&pki, env.port, &b_cert).await, ACCEPTED));
+    let nb = nonce(&pki, env.port, &b_cert).await;
+    let (s, b) = post_as(
+        &pki,
+        env.port,
+        &old,
+        rekey,
+        proof(&next, &old, "laptop-a", &nb, &nb),
+    )
+    .await;
+    refused(s, &b, "rekey_nonce_unknown");
+    // Signed over another machine's name.
+    let n = nonce(&pki, env.port, &old).await;
+    let (s, b) = post_as(
+        &pki,
+        env.port,
+        &old,
+        rekey,
+        proof(&next, &old, "laptop-b", &n, &n),
+    )
+    .await;
+    refused(s, &b, "rekey_signature_invalid");
+    // A certificate for another machine, or from another CA, or the same key.
+    let other = device_issued(&pki, "laptop-c", "other", 24, 365);
+    let n = nonce(&pki, env.port, &old).await;
+    let (s, b) = post_as(
+        &pki,
+        env.port,
+        &old,
+        rekey,
+        proof(&other, &old, "laptop-a", &n, &n),
+    )
+    .await;
+    refused(s, &b, "rekey_other_machine");
+    let (rp, rk, _) = ca("rogue CA");
+    let rogue = rcgen::Issuer::new(rp, rk);
+    let rogue_cert = pki.device_with("laptop-a", Some(&rogue), |_| {});
+    let rogue_next = (dir.join("rogue.pem"), dir.join("rogue.key"));
+    std::fs::rename(&rogue_cert.0, &rogue_next.0).unwrap();
+    std::fs::rename(&rogue_cert.1, &rogue_next.1).unwrap();
+    let n = nonce(&pki, env.port, &old).await;
+    let (s, b) = post_as(
+        &pki,
+        env.port,
+        &old,
+        rekey,
+        proof(&rogue_next, &old, "laptop-a", &n, &n),
+    )
+    .await;
+    refused(s, &b, "rekey_certificate_invalid");
+    let n = nonce(&pki, env.port, &old).await;
+    let (s, b) = post_as(
+        &pki,
+        env.port,
+        &old,
+        rekey,
+        proof(&old, &old, "laptop-a", &n, &n),
+    )
+    .await;
+    refused(s, &b, "rekey_same_key");
+    assert!(!env.audit_has("machine_key_continued", |_| true));
+
+    // The proof, once: the pin moves, recorded; replaying it is refused
+    // (the old key is no longer pinned, and the nonce is spent).
+    let n = nonce(&pki, env.port, &old).await;
+    let good = proof(&next, &old, "laptop-a", &n, &n);
+    let (s, b) = post_as(&pki, env.port, &old, rekey, good.clone()).await;
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(b["key"], key_of(&next.0).as_str());
+    assert!(
+        env.audit_has("machine_key_continued", |e| e["machine"] == "laptop-a"
+            && e["old_key"] == key_of(&old.0)
+            && e["new_key"] == key_of(&next.0))
+    );
+    let (s, b) = post_as(&pki, env.port, &old, rekey, good).await;
+    assert_eq!((s, b["error"].as_str()), (403, Some("machine_key_changed")));
+    assert!(is(&as_machine(&pki, env.port, &next).await, ACCEPTED));
+    assert!(is(&as_machine(&pki, env.port, &old).await, KEY_CHANGED));
+
+    // Only so many open nonces per machine.
+    let mut last = 200;
+    for _ in 0..5 {
+        last = post_as(
+            &pki,
+            env.port,
+            &next,
+            "/relay/v1/rekey/challenge",
+            json!({}),
+        )
+        .await
+        .0;
+    }
+    assert_eq!(last, 429);
+    // GET is not a way in.
+    let (s, _) = post_as(&pki, env.port, &next, "/relay/v1/rekey", json!({"x": 1})).await;
+    assert_eq!(s, 400);
+}
+
+#[test]
+fn continuity_proofs_work_for_each_key_type_and_only_as_signed() {
+    use rcgen::{
+        CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256, PKCS_ECDSA_P384_SHA384, PKCS_ED25519,
+    };
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    let cert_for = |key: &KeyPair| {
+        CertificateParams::new(vec![])
+            .unwrap()
+            .self_signed(key)
+            .unwrap()
+            .der()
+            .to_vec()
+    };
+    let other = cert_for(&KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap());
+    for alg in [
+        &PKCS_ED25519,
+        &PKCS_ECDSA_P256_SHA256,
+        &PKCS_ECDSA_P384_SHA384,
+    ] {
+        let key = KeyPair::generate_for(alg).unwrap();
+        let cert = cert_for(&key);
+        let der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
+        let msg = actp_proto::relay::rekey_message("laptop-a", &"ab".repeat(32), b"next leaf");
+        let (scheme, sig) = actp_proto::relay::rekey_sign(&der, &msg).unwrap();
+        assert!(
+            actp_proto::relay::rekey_verify(&cert, scheme, &msg, &sig),
+            "{alg:?}"
+        );
+        // Another key, another message, another scheme number: no.
+        assert!(!actp_proto::relay::rekey_verify(&other, scheme, &msg, &sig));
+        let mut changed = msg.clone();
+        *changed.last_mut().unwrap() ^= 1;
+        assert!(!actp_proto::relay::rekey_verify(
+            &cert, scheme, &changed, &sig
+        ));
+        assert!(!actp_proto::relay::rekey_verify(&cert, 0x0401, &msg, &sig));
+        assert!(!actp_proto::relay::rekey_verify(&cert, 0xffff, &msg, &sig));
+    }
 }
