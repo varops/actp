@@ -329,17 +329,20 @@ async fn a_session_resumes_with_fresh_papers_after_a_drop() {
     let a = org_laptop(&pki, "laptop-a", env.port, &v).await;
     let proxy = Proxy::start(env.port).await;
     let issued = Arc::new(Mutex::new(0u32));
+    let started = std::time::Instant::now();
     let (v2, i2) = (v.clone(), issued.clone());
     let mut caller = Caller::start_with(&pki, proxy.port, "laptop-a", move |o| {
         o.give_up_after = Duration::from_secs(10);
         o.token_source = Some(Arc::new(move || {
-            *i2.lock().unwrap() += 1;
-            // Papers that expire in two seconds.
+            let mut n = i2.lock().unwrap();
+            *n += 1;
+            // The first papers expire in five seconds; later ones last.
+            let ttl = if *n == 1 { 5 } else { 60 };
             let p = v2.issue(
                 "dave",
                 "laptop-a",
                 json!({ GRANT: true }),
-                Duration::from_secs(2),
+                Duration::from_secs(ttl),
             );
             Box::pin(async move { Ok(p) })
         }));
@@ -355,7 +358,7 @@ async fn a_session_resumes_with_fresh_papers_after_a_drop() {
 
     // The first papers expire, then the connection drops while the issuer
     // cannot be asked: the bridge keeps trying instead of giving up.
-    tokio::time::sleep(Duration::from_millis(3100)).await;
+    tokio::time::sleep(Duration::from_secs(7).saturating_sub(started.elapsed())).await;
     v.unavailable.store(true, Ordering::SeqCst);
     proxy.drop_all();
     tokio::time::sleep(Duration::from_millis(1500)).await;
