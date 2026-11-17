@@ -603,10 +603,13 @@ impl Relay {
                 // else's connection keeps its place, upgrades included; a
                 // certificate with another key counts as anyone's, and its
                 // requests are refused.
+                // A blocked name is never pinned or renewed: its holder may
+                // be the one it was blocked against.
                 let pinned = |name: &str| {
-                    chain
-                        .first()
-                        .is_some_and(|l| relay.check_key(name, l).is_ok())
+                    !relay.blocked(name)
+                        && chain
+                            .first()
+                            .is_some_and(|l| relay.check_key(name, l).is_ok())
                 };
                 let (held, _machine_slot) = match &machine {
                     Some(Ok(name)) if pinned(name) => match relay.hold_machine_connection(name) {
@@ -1114,8 +1117,10 @@ impl Relay {
 
     /// Re-pins `machine`: to `key` (the SHA-256 of the public key, as
     /// hex) when given, otherwise to the next certificate seen. The
-    /// machine's current connection is cut, so the old key cannot pin
-    /// itself again by reconnecting first. Recorded with who and why;
+    /// machine's current connection is cut. Without `key`, whoever presents
+    /// a certificate first is pinned, the old key too if its holder
+    /// reconnects first: revoke it beforehand, or pass `key`. Recorded with
+    /// who and why;
     /// returns whether the name was pinned before.
     pub fn repin(&self, by: &str, machine: &str, key: Option<&str>, reason: &str) -> bool {
         let (had, offline) = {

@@ -74,9 +74,16 @@ fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
     }
     std::fs::rename(&tmp, path)?;
     // The rename itself survives a crash only once the folder is synced.
+    // Some file systems (network and FUSE mounts) cannot sync a folder;
+    // the file itself is synced, so that is no reason to report a failure.
     #[cfg(unix)]
     if let Some(dir) = path.parent() {
-        std::fs::File::open(dir)?.sync_all()?;
+        match std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+            Err(e)
+                if e.kind() == io::ErrorKind::Unsupported
+                    || e.kind() == io::ErrorKind::InvalidInput => {}
+            r => r?,
+        }
     }
     Ok(())
 }

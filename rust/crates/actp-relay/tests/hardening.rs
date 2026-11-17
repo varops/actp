@@ -238,6 +238,19 @@ async fn a_machine_name_keeps_its_first_key_until_an_admin_repins_it() {
     assert!(is(&as_machine(&pki, env.port, &third).await, ACCEPTED));
     drop(laptop);
 
+    // A blocked name (the test relay blocks lost-laptop) is never pinned:
+    // its holder may be the one it was blocked against.
+    let lost = pki.device("lost-laptop", None);
+    let (status, _) = as_machine(&pki, env.port, &lost).await;
+    assert_eq!(status, 403);
+    assert!(
+        !env.relay
+            .machines()
+            .iter()
+            .any(|m| m.machine == "lost-laptop"),
+        "a blocked name gets no pin"
+    );
+
     // Re-pinning a name never seen says so.
     let (status, b) = request(
         &pki,

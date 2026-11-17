@@ -127,7 +127,7 @@ The one exception is a renewal. A certificate with another key is taken when all
 - the new certificate was issued after the pinned one (a later notBefore);
 - it expires after the pinned one.
 
-The pin then moves to the new key, `machine_key_renewed` records both keys, and the machine's connection on the old key is cut (`machine_offline`, reason `key_renewed`). With `machine_key_renewal_days: 0` no new key is ever taken by itself.
+The pin then moves to the new key, `machine_key_renewed` records both keys, and the machine's connection on the old key is cut with its sessions (`machine_offline`, reason `key_renewed`); callers reconnect. A blocked name is never pinned or renewed. With `machine_key_renewal_days: 0` no new key is ever taken by itself.
 
 So a second certificate for a laptop's name, issued by mistake or by someone who reached the MDM, cannot take over the name while the laptop's own certificate has more than the window left. **Inside the window it can:** the relay cannot tell a renewal from a second certificate issued at the same time, as the old key does not vouch for the new one. The real laptop is then cut off and refused, and `machine_key_refused` names it. Watch `machine_key_renewed` and `machine_key_refused`. Where the MDM renews certificates with the same key, set `machine_key_renewal_days: 0`. With one-year certificates and the default window, a name is open to a new key about a twelfth of the time.
 
