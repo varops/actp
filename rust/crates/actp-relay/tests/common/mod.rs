@@ -351,7 +351,7 @@ pub async fn start_laptop_full(
     let root = scratch(name);
     std::fs::create_dir_all(root.join("site")).unwrap();
     let yaml = format!(
-        "server:\n  name: {name}\n  idle_close: 1s\n  log_dir: {}\n  state_dir: {}\n  tokens_file: {}\n  relay:\n    url: wss://localhost:{relay_port}\n    cert: {}\n    key: {}\n    ca: {}\n  workspaces:\n    - name: site\n      path: {}\n  agents:\n    - id: test\n      command: {}\n      env:\n        ACTP_TESTAGENT_STORE: {}\n{auth}",
+        "server:\n  name: {name}\n  idle_close: 5s\n  log_dir: {}\n  state_dir: {}\n  tokens_file: {}\n  relay:\n    url: wss://localhost:{relay_port}\n    cert: {}\n    key: {}\n    ca: {}\n  workspaces:\n    - name: site\n      path: {}\n  agents:\n    - id: test\n      command: {}\n      env:\n        ACTP_TESTAGENT_STORE: {}\n{auth}",
         yaml_path(&root.join("logs")),
         yaml_path(&root.join("state")),
         yaml_path(&root.join("tokens.yaml")),
