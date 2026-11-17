@@ -474,6 +474,15 @@ async fn issuer(relay: &Relay, peer: &Peer, req: Request<Incoming>, path: &str) 
     };
     match issuer.ask(&machine, path, req.uri().query()).await {
         Ok((status, body)) => {
+            // Who asked which question, never its query (it names people).
+            relay.audit().event(
+                "issuer_asked",
+                [
+                    ("machine", json!(machine)),
+                    ("path", json!(path)),
+                    ("status", json!(status.as_u16())),
+                ],
+            );
             let mut r = Response::new(full(body));
             *r.status_mut() = status;
             r.headers_mut().insert(

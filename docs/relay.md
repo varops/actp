@@ -153,28 +153,30 @@ Laptops sometimes need to ask the organization's identity service something (for
 
 ```yaml
 issuer:
-  url: https://idm.internal:8788          # the identity service (http:// on loopback only)
+  url: https://idm.internal:8788          # the identity service (http:// only to a loopback address, such as 127.0.0.1)
   ca: /etc/actp-relay/idm-ca.pem          # roots for its certificate; required for https
   headers:                                # the relay's own credentials there
     X-Example-Caller: relay
-    X-Example-Secret: env:RELAY_IDM_SECRET   # env:NAME reads an environment variable
+    X-Example-Secret: file:/etc/actp-relay/idm-secret   # file:PATH (read again on reload) or env:NAME (read at start)
   paths: [/v1/generation/signed]          # the only paths forwarded, exactly
   rate: {per_second: 1, burst: 10}        # per machine
   timeout_seconds: 5
 ```
 
-A machine sends `GET /relay/v1/issuer/<path>?<query>` with its device certificate (callers and strangers are refused, and blocked machines as on every machine route). If `<path>` is one of `paths`, the relay asks `GET <url><path>?<query>` with the configured headers and hands back the status and the body (at most 64 KB) as JSON. Nothing else from the machine is forwarded (not its headers, not a body), and nothing else of the answer comes back.
+A machine sends `GET /relay/v1/issuer/<path>?<query>` with its device certificate (callers and strangers are refused, and blocked machines as on every machine route). If `<path>` is one of `paths`, the relay asks `GET <url><path>?<query>` with the configured headers, plus `X-Relay-Machine: <the machine's name>` from its certificate (which the machine cannot set or change), and hands back the status (200 to 599 only) and the body (at most 64 KB) as JSON. Nothing else from the machine is forwarded (not its headers, not a body), and nothing else of the answer comes back.
 
 | Answer | Meaning |
 | --- | --- |
 | `404 issuer_path_not_forwarded` | The path is not in `paths`. |
 | `414 issuer_query_too_long` | The query is over 2048 bytes. |
-| `429 issuer_rate_limited` | This machine asked too often (`rate`). |
-| `503 issuer_busy` | 32 questions are already in flight. |
-| `502 issuer_unavailable` | The identity service could not be reached, did not answer in time, or answered more than 64 KB. |
+| `429 issuer_rate_limited` | This machine asked too often (`rate`). Every request counts, refused ones included. |
+| `503 issuer_busy` | This machine has 2 questions in flight, or all machines together 32. |
+| `502 issuer_unavailable` | The identity service could not be reached, did not answer in time, answered more than 64 KB, or answered with a status outside 200 to 599. |
 | `404 not_found` | No `issuer` section. |
 
-The relay sees the questions and the answers, so only forward questions whose answers a machine can check itself: an answer signed by the identity service and bound to a nonce the machine chose cannot be forged or replayed by the relay, only withheld. Refusals are recorded as `issuer_refused` (machine and reason, throttled); questions themselves are not recorded, as their queries name people. A reload replaces the section; one that cannot be used (a missing roots file, an unset variable) leaves the old one in force and logs an error.
+The relay sees the questions and the answers, so only forward questions whose answers a machine can check itself: an answer signed by the identity service and bound to a nonce the machine chose cannot be forged or replayed by the relay, only withheld. Every answered question is recorded as `issuer_asked` (machine, path and status) and every refusal as `issuer_refused` (machine and reason, throttled); never a query, as queries name people. The identity service sees `X-Relay-Machine` too, so it can log and limit per machine although the credentials are the relay's. Only forward questions any machine may ask about anyone: a compromised laptop can ask them.
+
+A reload replaces the section and reads `file:` secrets again, so a secret can be rotated without a restart (`env:` values cannot change without one). The rate limits and in-flight counts carry over. A section that cannot be used (a missing file, an unset variable) leaves the old one in force, logs an error and records `issuer_reload_refused`.
 
 ### Management
 
@@ -221,7 +223,9 @@ Keep `state_dir` with the relay: a relay that starts without its `stop.json` kno
 | `connection_refused` | `remote` (the address, or the IPv6 /64, at its limit) |
 | `caller_refused` | `caller` (when its certificate named one), `machine` (when one was reached), `remote`, `reason` |
 | `caller_rate_limited` | `remote` |
+| `issuer_asked` | `machine`, `path`, `status` |
 | `issuer_refused` | `machine`, `reason` |
+| `issuer_reload_refused` | `error` |
 | `org_stop` | `by`, `reason`, `sessions_dropped` |
 | `org_stop_not_saved`, `org_stop_saved` | `error` / nothing |
 | `org_release` | `by`, `reason` |

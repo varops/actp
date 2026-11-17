@@ -19,18 +19,24 @@ struct FakeIssuer {
     seen: Arc<Mutex<Vec<String>>>,
     answer: Arc<Mutex<(u16, String)>>,
     down: Arc<AtomicBool>,
+    delay_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 async fn fake_issuer() -> FakeIssuer {
-    let ln = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    fake_issuer_on("127.0.0.1:0").await.unwrap()
+}
+
+async fn fake_issuer_on(addr: &str) -> Option<FakeIssuer> {
+    let ln = TcpListener::bind(addr).await.ok()?;
     let port = ln.local_addr().unwrap().port();
     let seen: Arc<Mutex<Vec<String>>> = Arc::default();
     let answer = Arc::new(Mutex::new((200, r#"{"verdict":"current"}"#.to_string())));
     let down = Arc::new(AtomicBool::new(false));
-    let (s, a, d) = (seen.clone(), answer.clone(), down.clone());
+    let delay_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (s, a, d, dl) = (seen.clone(), answer.clone(), down.clone(), delay_ms.clone());
     tokio::spawn(async move {
         while let Ok((mut tcp, _)) = ln.accept().await {
-            let (s, a, d) = (s.clone(), a.clone(), d.clone());
+            let (s, a, d, dl) = (s.clone(), a.clone(), d.clone(), dl.clone());
             tokio::spawn(async move {
                 if d.load(Ordering::SeqCst) {
                     return; // hang up without an answer
@@ -46,6 +52,8 @@ async fn fake_issuer() -> FakeIssuer {
                 s.lock()
                     .unwrap()
                     .push(String::from_utf8_lossy(&buf).to_string());
+                tokio::time::sleep(std::time::Duration::from_millis(dl.load(Ordering::SeqCst)))
+                    .await;
                 let (status, body) = a.lock().unwrap().clone();
                 let resp = format!(
                     "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\nset-cookie: x=y\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -55,12 +63,13 @@ async fn fake_issuer() -> FakeIssuer {
             });
         }
     });
-    FakeIssuer {
+    Some(FakeIssuer {
         port,
         seen,
         answer,
         down,
-    }
+        delay_ms,
+    })
 }
 
 fn issuer_yaml(port: u16, extra: &str) -> String {
@@ -173,6 +182,7 @@ async fn machines_ask_configured_questions_with_the_relays_credentials() {
         &[
             ("authorization", "Bearer machine-secret"),
             ("x-eunomia-caller", "laptop-a"),
+            ("x-relay-machine", "laptop-z"),
         ],
     )
     .await;
@@ -188,10 +198,14 @@ async fn machines_ask_configured_questions_with_the_relays_credentials() {
     // The relay's credentials, never the machine's.
     assert!(head.contains("x-eunomia-caller: relay\r\n"), "{head}");
     assert!(head.contains("x-eunomia-caller-secret: relay-secret-0123456789abcdef0123\r\n"));
+    // Who asked, set by the relay from the certificate; the machine cannot
+    // claim to be another.
+    assert!(head.contains("x-relay-machine: laptop-a\r\n"), "{head}");
     assert!(
-        !head.contains("laptop-a") && !head.contains("machine-secret"),
+        !head.contains("laptop-z") && !head.contains("machine-secret"),
         "{head}"
     );
+    assert!(!head.contains("x-eunomia-caller: laptop-a"), "{head}");
     // The issuer's refusals come back as they are.
     *fake.answer.lock().unwrap() = (422, r#"{"reason":"nonce_invalid"}"#.into());
     let (status, _, body) = ask_as(&pki, env.port, Some(&laptop), "GET", QUESTION, &[]).await;
@@ -199,9 +213,22 @@ async fn machines_ask_configured_questions_with_the_relays_credentials() {
         (status, body["reason"].as_str()),
         (422, Some("nonce_invalid"))
     );
-    // Nothing the machine asked is in the relay's audit.
-    let audit = std::fs::read_to_string(dir.join("logs").join("audit.jsonl")).unwrap_or_default();
-    assert!(!audit.contains("usr_dana"));
+    // Who asked which question is recorded, never the query; refusals too.
+    let long = format!("{QUESTION}&pad={}", "x".repeat(3000));
+    assert_eq!(
+        ask_as(&pki, env.port, Some(&laptop), "GET", &long, &[])
+            .await
+            .0,
+        414
+    );
+    eventually("the questions recorded", || {
+        env.audit_has("issuer_asked", |e| {
+            e["machine"] == "laptop-a" && e["path"] == "/v1/generation/signed" && e["status"] == 422
+        }) && env.audit_has("issuer_refused", |e| e["reason"] == "issuer_query_too_long")
+    })
+    .await;
+    let audit = std::fs::read_to_string(dir.join("logs").join("audit.jsonl")).unwrap();
+    assert!(!audit.contains("usr_dana") && !audit.contains("kZ3v0w1T6mF2yq8Ha9cX0w"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -210,7 +237,13 @@ async fn only_machines_and_only_the_configured_questions() {
     let dir = scratch("issuer-who");
     let pki = Pki::new(&dir);
     let fake = fake_issuer().await;
-    let env = start_relay_with(&pki, &dir, &issuer_yaml(fake.port, "")).await;
+    // Refusals count against the allowance too: room for all of them here.
+    let env = start_relay_with(
+        &pki,
+        &dir,
+        &issuer_yaml(fake.port, "").replace("burst: 3", "burst: 50"),
+    )
+    .await;
     let laptop = pki.device("laptop-a", None);
     let caller = pki.caller("it-bridge-2", None);
     for (cert, method, target, status, code) in [
@@ -374,6 +407,18 @@ fn issuer_configuration_is_checked() {
             "issuer:\n  url: http://127.0.0.1:1\n  paths: [/v1/x]\n  timeout_seconds: 0\n",
             "timeout_seconds",
         ),
+        (
+            "issuer:\n  url: http://localhost:1\n  paths: [/v1/x]\n",
+            "loopback address",
+        ),
+        (
+            "issuer:\n  url: http://127.0.0.1:1\n  paths: [//x/v1]\n",
+            "must start with /",
+        ),
+        (
+            "issuer:\n  url: http://127.0.0.1:1\n  paths: [/v1/x]\n  headers:\n    X-Relay-Machine: me\n",
+            "set by the relay",
+        ),
     ] {
         let e = start(yaml).unwrap_err();
         assert!(e.contains(want), "{yaml}: {e}");
@@ -448,4 +493,152 @@ async fn an_https_issuer_is_checked_against_its_roots() {
         (status, body["error"].as_str()),
         (502, Some("issuer_unavailable"))
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn limits_hold_across_a_reload_and_per_machine() {
+    set_secret();
+    let dir = scratch("issuer-reload");
+    let pki = Pki::new(&dir);
+    let fake = fake_issuer().await;
+    let yaml = relay_yaml(&pki, &dir, &issuer_yaml(fake.port, ""));
+    let env = start_relay_with(&pki, &dir, &issuer_yaml(fake.port, "")).await;
+    let a = pki.device("laptop-a", None);
+    // Use up laptop-a's allowance (3), then reload: still refused.
+    for _ in 0..3 {
+        ask_as(&pki, env.port, Some(&a), "GET", QUESTION, &[]).await;
+    }
+    assert_eq!(
+        ask_as(&pki, env.port, Some(&a), "GET", QUESTION, &[])
+            .await
+            .0,
+        429
+    );
+    let cfg = actp_relay::config::Config::parse(&yaml).unwrap();
+    let tls = actp_relay::tls::server_config(&cfg).unwrap();
+    env.relay.reload(cfg, tls);
+    assert_eq!(
+        ask_as(&pki, env.port, Some(&a), "GET", QUESTION, &[])
+            .await
+            .0,
+        429
+    );
+    // At most two of one machine's questions open at once.
+    fake.delay_ms.store(600, Ordering::SeqCst);
+    let b = pki.device("laptop-b", None);
+    let (r1, r2, r3) = tokio::join!(
+        ask_as(&pki, env.port, Some(&b), "GET", QUESTION, &[]),
+        ask_as(&pki, env.port, Some(&b), "GET", QUESTION, &[]),
+        ask_as(&pki, env.port, Some(&b), "GET", QUESTION, &[]),
+    );
+    let busy = [r1, r2, r3]
+        .iter()
+        .filter(|(s, _, body)| *s == 503 && body["error"] == "issuer_busy")
+        .count();
+    assert_eq!(busy, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn odd_statuses_and_slow_issuers_are_502() {
+    set_secret();
+    let dir = scratch("issuer-odd");
+    let pki = Pki::new(&dir);
+    let fake = fake_issuer().await;
+    let env = start_relay_with(
+        &pki,
+        &dir,
+        &issuer_yaml(fake.port, "  timeout_seconds: 1\n"),
+    )
+    .await;
+    for (i, status) in [101u16, 999].into_iter().enumerate() {
+        *fake.answer.lock().unwrap() = (status, "{}".into());
+        let m = pki.device(&format!("laptop-{i}"), None);
+        let (got, _, body) = ask_as(&pki, env.port, Some(&m), "GET", QUESTION, &[]).await;
+        assert_eq!(
+            (got, body["error"].as_str()),
+            (502, Some("issuer_unavailable")),
+            "{status}"
+        );
+    }
+    *fake.answer.lock().unwrap() = (200, "{}".into());
+    fake.delay_ms.store(3000, Ordering::SeqCst);
+    let m = pki.device("laptop-slow", None);
+    let started = std::time::Instant::now();
+    let (got, _, _) = ask_as(&pki, env.port, Some(&m), "GET", QUESTION, &[]).await;
+    assert_eq!(got, 502);
+    assert!(started.elapsed() < std::time::Duration::from_millis(2500));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ipv6_issuer_is_reached() {
+    set_secret();
+    let Some(fake) = fake_issuer_on("[::1]:0").await else {
+        eprintln!("skipped: no IPv6 loopback here");
+        return;
+    };
+    let dir = scratch("issuer-v6");
+    let pki = Pki::new(&dir);
+    let yaml = issuer_yaml(fake.port, "").replace("http://127.0.0.1:", "http://[::1]:");
+    let env = start_relay_with(&pki, &dir, &yaml).await;
+    let a = pki.device("laptop-a", None);
+    assert_eq!(
+        ask_as(&pki, env.port, Some(&a), "GET", QUESTION, &[])
+            .await
+            .0,
+        200
+    );
+    assert_eq!(fake.seen.lock().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_secret_in_a_file_is_read_again_on_reload() {
+    let dir = scratch("issuer-file");
+    let pki = Pki::new(&dir);
+    let fake = fake_issuer().await;
+    let secret = dir.join("issuer-secret");
+    std::fs::write(&secret, "first-secret-0123456789abcdef0123456\n").unwrap();
+    let extra = format!(
+        "issuer:\n  url: http://127.0.0.1:{}\n  headers:\n    X-Secret: file:{}\n  paths: [/v1/generation/signed]\n",
+        fake.port,
+        secret.display()
+    );
+    let env = start_relay_with(&pki, &dir, &extra).await;
+    let a = pki.device("laptop-a", None);
+    ask_as(&pki, env.port, Some(&a), "GET", QUESTION, &[]).await;
+    std::fs::write(&secret, "second-secret-0123456789abcdef012345\n").unwrap();
+    let reload = |yaml: &str| {
+        let cfg = actp_relay::config::Config::parse(&relay_yaml(&pki, &dir, yaml)).unwrap();
+        let tls = actp_relay::tls::server_config(&cfg).unwrap();
+        env.relay.reload(cfg, tls);
+    };
+    reload(&extra);
+    ask_as(&pki, env.port, Some(&a), "GET", QUESTION, &[]).await;
+    let seen = fake.seen.lock().unwrap().clone();
+    assert!(
+        seen[0]
+            .to_ascii_lowercase()
+            .contains("x-secret: first-secret"),
+        "{}",
+        seen[0]
+    );
+    assert!(
+        seen[1]
+            .to_ascii_lowercase()
+            .contains("x-secret: second-secret"),
+        "{}",
+        seen[1]
+    );
+    // A section that cannot be used keeps the old one, and says so.
+    std::fs::remove_file(&secret).unwrap();
+    reload(&extra);
+    assert_eq!(
+        ask_as(&pki, env.port, Some(&a), "GET", QUESTION, &[])
+            .await
+            .0,
+        200
+    );
+    eventually("the refused reload recorded", || {
+        env.audit_has("issuer_reload_refused", |_| true)
+    })
+    .await;
 }

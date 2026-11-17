@@ -120,6 +120,8 @@ struct Inner {
     callers: RateLimiter,
     /// The issuer pass-through, when configured.
     issuer: RwLock<Option<Arc<issuer::Issuer>>>,
+    /// Its limits, kept across reloads.
+    issuer_limits: Arc<issuer::Limits>,
     refusals: Throttle,
     /// Connections held, before and after the TLS handshake.
     connections: Arc<tokio::sync::Semaphore>,
@@ -222,8 +224,16 @@ impl Relay {
             tracing::warn!(by = %stop.by, reason = %stop.reason, "the org-wide stop is on");
         }
         let callers = RateLimiter::new(cfg.caller_rate.per_second, cfg.caller_rate.burst);
+        let issuer_limits = issuer::Limits::new(
+            cfg.issuer
+                .as_ref()
+                .map_or(config::Rate::default(), |i| i.rate),
+        );
         let issuer = match &cfg.issuer {
-            Some(i) => Some(Arc::new(issuer::Issuer::from_config(i)?)),
+            Some(i) => Some(Arc::new(issuer::Issuer::from_config(
+                i,
+                issuer_limits.clone(),
+            )?)),
             None => None,
         };
         let max_connections = cfg.max_connections;
@@ -247,6 +257,7 @@ impl Relay {
                 seen_written: Mutex::new(std::time::Instant::now()),
                 callers,
                 issuer: RwLock::new(issuer),
+                issuer_limits,
                 refusals: Throttle::new(20, Duration::from_secs(60)),
                 connections: Arc::new(tokio::sync::Semaphore::new(max_connections)),
                 per_ip: Mutex::new(HashMap::new()),
@@ -308,12 +319,23 @@ impl Relay {
             .set_rate(cfg.caller_rate.per_second, cfg.caller_rate.burst);
         // A new issuer section takes effect only if it can be used; a broken
         // one (a missing CA file, an unset variable) keeps the old one.
-        match cfg.issuer.as_ref().map(issuer::Issuer::from_config) {
+        let limits = self.inner.issuer_limits.clone();
+        match cfg
+            .issuer
+            .as_ref()
+            .map(|i| (i.rate, issuer::Issuer::from_config(i, limits.clone())))
+        {
             None => *self.inner.issuer.write().unwrap_or_else(|p| p.into_inner()) = None,
-            Some(Ok(i)) => {
+            Some((rate, Ok(i))) => {
+                limits.set_rate(rate);
                 *self.inner.issuer.write().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(i))
             }
-            Some(Err(e)) => tracing::error!(error = %e, "the issuer section was not reloaded"),
+            Some((_, Err(e))) => {
+                tracing::error!(error = %e, "the issuer section was not reloaded");
+                self.inner
+                    .audit
+                    .event("issuer_reload_refused", [("error", json!(e.to_string()))]);
+            }
         }
         *self.inner.cfg.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(cfg);
         *self.inner.tls.write().unwrap_or_else(|p| p.into_inner()) = Some(tls);

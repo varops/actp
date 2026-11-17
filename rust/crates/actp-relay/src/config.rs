@@ -74,7 +74,7 @@ pub struct Config {
 }
 
 /// The identity service machines may ask through the relay.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Issuer {
     /// `https://host[:port][/prefix]` (`http://` on loopback only).
@@ -94,6 +94,20 @@ pub struct Issuer {
     /// How long one question may take (5 s).
     #[serde(default = "default_issuer_timeout")]
     pub timeout_seconds: u64,
+}
+
+impl std::fmt::Debug for Issuer {
+    // Header values can be secrets: their names only.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Issuer")
+            .field("url", &self.url)
+            .field("ca", &self.ca)
+            .field("headers", &self.headers.keys().collect::<Vec<_>>())
+            .field("paths", &self.paths)
+            .field("rate", &self.rate)
+            .field("timeout_seconds", &self.timeout_seconds)
+            .finish()
+    }
 }
 
 fn default_issuer_rate() -> Rate {
@@ -219,6 +233,7 @@ impl Config {
             for p in &i.paths {
                 let ok = p.starts_with('/')
                     && p.len() <= 256
+                    && !p.contains("//")
                     && !p.split('/').any(|seg| seg == ".." || seg == ".")
                     && p.bytes().all(|b| {
                         b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.')

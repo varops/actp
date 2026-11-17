@@ -35,19 +35,79 @@ pub const MAX_ANSWER: usize = 64 << 10;
 pub const MAX_QUERY: usize = 2048;
 /// Questions in flight to the issuer at once, all machines together.
 pub const MAX_IN_FLIGHT: usize = 32;
+/// Questions in flight from one machine at once.
+pub const MAX_IN_FLIGHT_PER_MACHINE: usize = 2;
+/// The header the relay sets on every question, naming the machine that
+/// asked (from its certificate), whatever else is configured or sent.
+pub const MACHINE_HEADER: &str = "x-relay-machine";
+
+/// The limits on questions, kept across reloads so a reload neither resets
+/// a machine's allowance nor opens more slots.
+pub struct Limits {
+    per_machine: RateLimiter<String>,
+    in_flight: Arc<tokio::sync::Semaphore>,
+    open: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+}
+
+impl Limits {
+    pub fn new(rate: config::Rate) -> Arc<Limits> {
+        Arc::new(Limits {
+            per_machine: RateLimiter::new(rate.per_second, rate.burst),
+            in_flight: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT)),
+            open: Default::default(),
+        })
+    }
+
+    pub fn set_rate(&self, rate: config::Rate) {
+        self.per_machine.set_rate(rate.per_second, rate.burst);
+    }
+
+    fn open(self: &Arc<Self>, machine: &str) -> Option<Open> {
+        let mut m = self.open.lock().unwrap_or_else(|p| p.into_inner());
+        let n = m.entry(machine.to_string()).or_default();
+        if *n >= MAX_IN_FLIGHT_PER_MACHINE {
+            return None;
+        }
+        *n += 1;
+        Some(Open {
+            limits: self.clone(),
+            machine: machine.to_string(),
+        })
+    }
+}
+
+/// One of a machine's open questions.
+struct Open {
+    limits: Arc<Limits>,
+    machine: String,
+}
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        let mut m = self.limits.open.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(n) = m.get_mut(&self.machine) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.machine);
+            }
+        }
+    }
+}
 
 /// The configured issuer, ready to forward to.
 pub struct Issuer {
     scheme_https: bool,
+    /// As in the URL (with brackets for IPv6), for the Host header.
     host: String,
+    /// To connect to and to check the certificate against (no brackets).
+    connect_host: String,
     port: u16,
     prefix: String,
     tls: Option<Arc<rustls::ClientConfig>>,
     headers: Vec<(HeaderName, HeaderValue)>,
     paths: Vec<String>,
     timeout: Duration,
-    per_machine: RateLimiter<String>,
-    in_flight: tokio::sync::Semaphore,
+    limits: Arc<Limits>,
 }
 
 /// Why a question was not answered by the issuer.
@@ -70,16 +130,28 @@ fn bad(what: &str) -> io::Error {
 }
 
 impl Issuer {
-    pub fn from_config(cfg: &config::Issuer) -> io::Result<Issuer> {
+    /// The issuer from its section, under `limits` (kept by the relay
+    /// across reloads).
+    pub fn from_config(cfg: &config::Issuer, limits: Arc<Limits>) -> io::Result<Issuer> {
         let uri: Uri = cfg.url.parse().map_err(|e| bad(&format!("url: {e}")))?;
         let host = uri
             .host()
             .ok_or_else(|| bad("url needs a host"))?
             .to_string();
+        let connect_host = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_string();
         let https = match uri.scheme_str() {
             Some("https") => true,
-            Some("http") if is_loopback(&host) => false,
-            _ => return Err(bad("url must be https:// (http:// on loopback only)")),
+            // Plain http only to a loopback address, by number: a name could
+            // resolve elsewhere and send the credentials in the clear.
+            Some("http") if is_loopback_ip(&connect_host) => false,
+            _ => {
+                return Err(bad(
+                    "url must be https:// (http:// only to a loopback address such as 127.0.0.1)",
+                ));
+            }
         };
         if uri.authority().is_some_and(|a| a.as_str().contains('@')) {
             return Err(bad("url must not carry a user name or password"));
@@ -123,11 +195,21 @@ impl Issuer {
             let name: HeaderName = name
                 .parse()
                 .map_err(|_| bad(&format!("header name {name:?}")))?;
-            // `env:NAME` keeps a secret out of the file.
-            let value = match value.strip_prefix("env:") {
-                Some(var) => std::env::var(var)
-                    .map_err(|_| bad(&format!("header {name}: {var} is not set")))?,
-                None => value.clone(),
+            if name.as_str() == MACHINE_HEADER {
+                return Err(bad(&format!("header {name} is set by the relay")));
+            }
+            // `env:NAME` and `file:/path` keep a secret out of the config
+            // file; a file is read again on every reload, so a secret can be
+            // rotated without a restart (an environment variable cannot).
+            let value = if let Some(var) = value.strip_prefix("env:") {
+                std::env::var(var).map_err(|_| bad(&format!("header {name}: {var} is not set")))?
+            } else if let Some(path) = value.strip_prefix("file:") {
+                std::fs::read_to_string(path)
+                    .map_err(|e| bad(&format!("header {name}: {path}: {e}")))?
+                    .trim()
+                    .to_string()
+            } else {
+                value.clone()
             };
             let mut value =
                 HeaderValue::from_str(&value).map_err(|_| bad(&format!("header {name}")))?;
@@ -137,14 +219,14 @@ impl Issuer {
         Ok(Issuer {
             scheme_https: https,
             host,
+            connect_host,
             port,
             prefix,
             tls,
             headers,
             paths: cfg.paths.clone(),
             timeout: Duration::from_secs(cfg.timeout_seconds),
-            per_machine: RateLimiter::new(cfg.rate.per_second, cfg.rate.burst),
-            in_flight: tokio::sync::Semaphore::new(MAX_IN_FLIGHT),
+            limits,
         })
     }
 
@@ -155,23 +237,34 @@ impl Issuer {
         path: &str,
         query: Option<&str>,
     ) -> Result<(StatusCode, Bytes), Refusal> {
+        // Every request counts against the machine's allowance, refused
+        // ones too, so no machine can fill the audit with refusals.
+        if !self.limits.per_machine.allow_key(machine.to_string()) {
+            return Err(Refusal::RateLimited);
+        }
         if !self.paths.iter().any(|p| p == path) {
             return Err(Refusal::NotForwarded);
         }
         if query.is_some_and(|q| q.len() > MAX_QUERY) {
             return Err(Refusal::QueryTooLong);
         }
-        if !self.per_machine.allow_key(machine.to_string()) {
-            return Err(Refusal::RateLimited);
-        }
-        let Ok(_permit) = self.in_flight.try_acquire() else {
+        let Some(_open) = self.limits.open(machine) else {
+            return Err(Refusal::Busy);
+        };
+        let Ok(_permit) = self.limits.in_flight.try_acquire() else {
             return Err(Refusal::Busy);
         };
         let target = match query {
             Some(q) => format!("{}{path}?{q}", self.prefix),
             None => format!("{}{path}", self.prefix),
         };
-        match tokio::time::timeout(self.timeout, self.send(&target)).await {
+        match tokio::time::timeout(self.timeout, self.send(&target, machine)).await {
+            // Only final answers: an informational or made-up status could
+            // confuse the machine's HTTP client.
+            Ok(Ok((status, _))) if !(200..=599).contains(&status.as_u16()) => {
+                tracing::warn!(%status, "the issuer answered with an odd status");
+                Err(Refusal::Unavailable)
+            }
             Ok(Ok(answer)) => Ok(answer),
             Ok(Err(e)) => {
                 // Not the target: its query names a person.
@@ -185,8 +278,8 @@ impl Issuer {
         }
     }
 
-    async fn send(&self, target: &str) -> io::Result<(StatusCode, Bytes)> {
-        let tcp = TcpStream::connect((self.host.as_str(), self.port)).await?;
+    async fn send(&self, target: &str, machine: &str) -> io::Result<(StatusCode, Bytes)> {
+        let tcp = TcpStream::connect((self.connect_host.as_str(), self.port)).await?;
         let _ = tcp.set_nodelay(true);
         let mut req = Request::get(target)
             .header(http::header::HOST, self.authority())
@@ -196,9 +289,15 @@ impl Issuer {
         for (n, v) in &self.headers {
             req.headers_mut().insert(n.clone(), v.clone());
         }
+        // Who asked, from its certificate: the issuer can log and limit per
+        // machine, though the credentials are the relay's.
+        req.headers_mut().insert(
+            HeaderName::from_static(MACHINE_HEADER),
+            HeaderValue::from_str(machine).map_err(io::Error::other)?,
+        );
         let resp = match &self.tls {
             Some(tls) => {
-                let name = rustls_pki_types::ServerName::try_from(self.host.clone())
+                let name = rustls_pki_types::ServerName::try_from(self.connect_host.clone())
                     .map_err(io::Error::other)?;
                 let stream = tokio_rustls::TlsConnector::from(tls.clone())
                     .connect(name, tcp)
@@ -242,11 +341,6 @@ where
     sender.send_request(req).await.map_err(io::Error::other)
 }
 
-fn is_loopback(host: &str) -> bool {
-    host == "localhost"
-        || host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .parse::<IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
+fn is_loopback_ip(host: &str) -> bool {
+    host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
