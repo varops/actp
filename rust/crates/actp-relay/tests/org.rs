@@ -59,10 +59,19 @@ fn refusals(l: &Laptop) -> Vec<(String, String)> {
 /// Tries to resume `link` on `machine` with `bearer`, through a tunnel;
 /// returns the HTTP status.
 async fn resume_status(pki: &Pki, port: u16, machine: &str, link: &str, bearer: &str) -> u16 {
+    resume_status_via(&pki.route(machine), port, machine, link, bearer).await
+}
+
+/// [`resume_status`] through `route`.
+async fn resume_status_via(
+    route: &actp_client::RelayRoute,
+    port: u16,
+    machine: &str,
+    link: &str,
+    bearer: &str,
+) -> u16 {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-    let tls = open_tunnel(&pki.route(machine), port, machine)
-        .await
-        .unwrap();
+    let tls = open_tunnel(route, port, machine).await.unwrap();
     let mut req = "ws://machine.actp.invalid/actp/v1/agents/test/link"
         .into_client_request()
         .unwrap();
@@ -128,6 +137,23 @@ async fn papers_open_sessions_on_the_machine_they_are_for() {
         resume_status(&pki, env.port, "laptop-a", &link, &alice).await,
         409
     );
+    // Dave himself may, from the start of the link and through another
+    // caller certificate: recorded with what the relay said about who
+    // opened the stream, as every relayed resume is.
+    let dave = papers(&v, "dave", "laptop-a");
+    let other = pki.route_as(&pki.caller("it-bridge-2", None), "laptop-a");
+    assert_eq!(
+        resume_status_via(&other, env.port, "laptop-a", &link, &dave).await,
+        101
+    );
+    eventually("the resume recorded", || {
+        a.audit().iter().any(|e| {
+            e["event"] == "link_resumed"
+                && e["relay_report"] == "given"
+                && e["relay_caller"] == "it-bridge-2"
+        })
+    })
+    .await;
 
     // Papers for laptop-a do not open laptop-b.
     let (status, _) = request(
@@ -372,6 +398,8 @@ async fn a_session_resumes_with_fresh_papers_after_a_drop() {
         *issued.lock().unwrap() >= 2,
         "fresh papers for the reconnect"
     );
-    assert!(a.audit().iter().any(|e| e["event"] == "link_resumed"));
+    assert!(a.audit().iter().any(|e| e["event"] == "link_resumed"
+        && e["relay_report"] == "given"
+        && e["relay_caller"] == CALLER));
     assert_eq!(a.srv.links().len(), 1, "the same link, resumed");
 }

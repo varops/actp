@@ -27,8 +27,9 @@ use std::time::{Duration, Instant};
 
 use actp_proto::api;
 use actp_proto::relay::{
-    Control, PATH_CONNECT, PATH_ISSUER, PATH_STREAM, PATH_TUNNEL, PROTOCOL_CONTROL,
-    PROTOCOL_STREAM, PROTOCOL_TUNNEL, valid_machine_name, valid_stream_id,
+    Control, HEADER_ON_BEHALF_OF, OpenedBy, PATH_CONNECT, PATH_ISSUER, PATH_STREAM, PATH_TUNNEL,
+    PROTOCOL_CONTROL, PROTOCOL_STREAM, PROTOCOL_TUNNEL, valid_machine_name, valid_on_behalf_of,
+    valid_stream_id,
 };
 use actp_proto::wsio::WsIo;
 use base64::Engine;
@@ -622,11 +623,38 @@ async fn tunnel(relay: &Relay, peer: &Peer, mut req: Request<Incoming>, raw_mach
             );
         }
     };
+    // Whom the caller says it acts for: recorded and passed on, not checked.
+    let mut values = req.headers().get_all(HEADER_ON_BEHALF_OF).iter();
+    let on_behalf_of = match (values.next(), values.next()) {
+        (None, _) => None,
+        (Some(v), None) => match std::str::from_utf8(v.as_bytes()) {
+            Ok(v) if valid_on_behalf_of(v) => Some(v.to_string()),
+            _ => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "bad_on_behalf_of",
+                    "X-Actp-On-Behalf-Of must be 1 to 256 bytes of UTF-8, without control, invisible or direction-changing characters or surrounding space",
+                );
+            }
+        },
+        (Some(_), Some(_)) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "bad_on_behalf_of",
+                "X-Actp-On-Behalf-Of may be sent once",
+            );
+        }
+    };
     let resp = match ws_accept(&req, PROTOCOL_TUNNEL) {
         Ok(r) => r,
         Err(r) => return *r,
     };
     let remote = peer.remote.to_string();
+    let opened_by = OpenedBy {
+        caller: caller.clone(),
+        caller_certificate: crate::fingerprint(&peer.chain[0]),
+        on_behalf_of: on_behalf_of.clone(),
+    };
     let refuse = |reason: Refusal| {
         let (status, code, msg) = match reason {
             Refusal::Stopped => (
@@ -701,7 +729,7 @@ async fn tunnel(relay: &Relay, peer: &Peer, mut req: Request<Incoming>, raw_mach
     // machine gone, the caller revoked) answers at once, and is checked
     // once more before the 101.
     let (stream, slot) = tokio::select! {
-        opened = relay.open_stream(&machine) => match opened {
+        opened = relay.open_stream(&machine, opened_by.clone()) => match opened {
             Ok(s) => s,
             Err(r) => return refuse(r),
         },
@@ -710,15 +738,29 @@ async fn tunnel(relay: &Relay, peer: &Peer, mut req: Request<Incoming>, raw_mach
     if cut.is_cut() {
         return refuse(Refusal::Cut(cut.why()));
     }
-    relay.audit().event(
-        "session_open",
-        [
-            ("session", json!(session)),
-            ("machine", json!(machine)),
-            ("caller", json!(caller)),
-            ("remote", json!(remote)),
-        ],
-    );
+    match &on_behalf_of {
+        Some(who) => relay.audit().event(
+            "session_open",
+            [
+                ("session", json!(session)),
+                ("machine", json!(machine)),
+                ("caller", json!(caller)),
+                ("caller_certificate", json!(opened_by.caller_certificate)),
+                ("on_behalf_of", json!(who)),
+                ("remote", json!(remote)),
+            ],
+        ),
+        None => relay.audit().event(
+            "session_open",
+            [
+                ("session", json!(session)),
+                ("machine", json!(machine)),
+                ("caller", json!(caller)),
+                ("caller_certificate", json!(opened_by.caller_certificate)),
+                ("remote", json!(remote)),
+            ],
+        ),
+    }
     let on_upgrade = hyper::upgrade::on(&mut req);
     let relay = relay.clone();
     let held = peer.held.clone();

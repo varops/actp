@@ -74,6 +74,11 @@ pub struct RelayRoute {
     /// lists that change on disk are read again ([`RelayRoute::from_files`]
     /// sets it). An error fails that connection attempt.
     pub reload: Option<MachineTls>,
+    /// Whom this caller acts for, sent as `X-Actp-On-Behalf-Of`: the relay
+    /// records it with the session and the machine with the link. Nobody
+    /// checks it; it is for tracing. Must pass
+    /// [`actp_proto::relay::valid_on_behalf_of`].
+    pub on_behalf_of: Option<String>,
 }
 
 /// See [`RelayRoute::reload`].
@@ -157,6 +162,7 @@ impl RelayRoute {
             relay_tls: Arc::new(relay_tls),
             machine_tls: reload()?,
             reload: Some(reload),
+            on_behalf_of: None,
         })
     }
 }
@@ -689,6 +695,17 @@ impl Bridge {
             "Sec-WebSocket-Protocol",
             HeaderValue::from_static(actp_proto::relay::PROTOCOL_TUNNEL),
         );
+        if let Some(who) = &route.on_behalf_of {
+            if !actp_proto::relay::valid_on_behalf_of(who) {
+                return Err(Error::Other(
+                    "on_behalf_of must be 1 to 256 bytes, without control, invisible or direction-changing characters or surrounding space".into(),
+                ));
+            }
+            req.headers_mut().insert(
+                actp_proto::relay::HEADER_ON_BEHALF_OF,
+                HeaderValue::from_bytes(who.as_bytes()).map_err(|e| Error::Other(e.to_string()))?,
+            );
+        }
         let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
             .max_message_size(Some(1 << 20))
             .max_frame_size(Some(1 << 20));

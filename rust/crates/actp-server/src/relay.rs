@@ -34,7 +34,7 @@ use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_util::sync::CancellationToken;
 
 use crate::config;
-use crate::http::{Acceptor, Connecting, Io};
+use crate::http::{Accepted, Acceptor, Connecting};
 use crate::server::Server;
 
 /// How to reach the relay.
@@ -361,10 +361,19 @@ async fn run_control(
             Control::Release => {
                 server.set_org_stopped(false).await;
             }
-            Control::Open { stream: id } => {
+            Control::Open {
+                stream: id,
+                opened_by,
+            } => {
                 if !valid_stream_id(&id) {
                     tracing::warn!("the relay sent a malformed stream id");
                     continue;
+                }
+                // Recorded with the link, so only in the shape the relay
+                // gives it; a relay could still lie, which it can anyway.
+                let relayed = crate::http::Relayed::from_report(opened_by);
+                if relayed.report == crate::http::RelayReport::Malformed {
+                    tracing::warn!("the relay said who opened a stream in a malformed way");
                 }
                 let Ok(permit) = streams.clone().try_acquire_owned() else {
                     tracing::warn!("too many relayed callers at once; not opening another");
@@ -406,10 +415,13 @@ async fn run_control(
                             return Err(io::Error::from(io::ErrorKind::TimedOut));
                         }
                     };
-                    Ok(Box::new(Held {
-                        io: tls,
-                        _permit: permit,
-                    }) as Box<dyn Io>)
+                    Ok(Accepted {
+                        io: Box::new(Held {
+                            io: tls,
+                            _permit: permit,
+                        }),
+                        relayed: Some(relayed),
+                    })
                 });
                 if tx.try_send(connecting).is_err() {
                     tracing::warn!("relayed streams are arriving faster than they are served");

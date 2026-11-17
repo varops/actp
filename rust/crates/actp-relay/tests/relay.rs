@@ -477,7 +477,7 @@ async fn only_the_machine_asked_can_take_a_stream() {
         tunnel_request(&route, port, "laptop-a", "GET", "/api/v1/info", TOKEN, None).await
     });
     let id = loop {
-        if let Control::Open { stream } = next().await {
+        if let Control::Open { stream, .. } = next().await {
             break stream;
         }
     };
@@ -971,7 +971,13 @@ async fn the_machine_checks_what_the_relay_says() {
     use actp_proto::relay::Control;
     let dir = scratch("fake-relay");
     let pki = Pki::new(&dir);
-    let open = |id: &str| Control::Open { stream: id.into() }.encode();
+    let open = |id: &str| {
+        Control::Open {
+            stream: id.into(),
+            opened_by: None,
+        }
+        .encode()
+    };
     let hello = Control::Hello {
         machine: "laptop-a".into(),
         stopped: false,
@@ -1545,4 +1551,138 @@ async fn a_caller_must_ask_for_the_actp_protocol() {
         tunnel_request(&route, env.port, "laptop-a", "GET", "/health", "", None).await,
         Err(Refused::Tls(_))
     ));
+}
+
+/// SHA-256 of the certificate in `pem`, as hex.
+fn cert_fingerprint(pem: &std::path::Path) -> String {
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
+    use sha2::Digest;
+    let der = CertificateDer::from_pem_file(pem).unwrap();
+    hex::encode(sha2::Sha256::digest(der.as_ref()))
+}
+
+/// A tunnel request to `machine` with `values` as `X-Actp-On-Behalf-Of`;
+/// the relay's status when it refuses.
+async fn tunnel_with_on_behalf_of(pki: &Pki, port: u16, machine: &str, values: &[&[u8]]) -> u16 {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = format!("wss://localhost:{port}/relay/v1/tunnel/{machine}")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut().insert(
+        "Sec-WebSocket-Protocol",
+        actp_proto::relay::PROTOCOL_TUNNEL.parse().unwrap(),
+    );
+    for v in values {
+        req.headers_mut().append(
+            actp_proto::relay::HEADER_ON_BEHALF_OF,
+            http::HeaderValue::from_bytes(v).unwrap(),
+        );
+    }
+    match tokio_tungstenite::connect_async_tls_with_config(
+        req,
+        None,
+        true,
+        Some(tokio_tungstenite::Connector::Rustls(
+            pki.route(machine).relay_tls.clone(),
+        )),
+    )
+    .await
+    {
+        Ok(_) => 101,
+        Err(tokio_tungstenite::tungstenite::Error::Http(r)) => r.status().as_u16(),
+        Err(e) => panic!("{e}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn both_audits_name_the_caller_certificate_and_whom_it_acts_for() {
+    let dir = scratch("on-behalf-of");
+    let pki = Pki::new(&dir);
+    let env = start_relay(&pki, &dir).await;
+    let mut a = start_laptop(&pki, "laptop-a", env.port, pki.device("laptop-a", None)).await;
+    a.wait_connected().await;
+    let fp = cert_fingerprint(&dir.join(format!("caller-{CALLER}.pem")));
+
+    // A caller that says whom it acts for.
+    let mut caller = Caller::start_with(&pki, env.port, "laptop-a", |o| {
+        o.relay.as_mut().unwrap().on_behalf_of = Some("Zoë <carol@acme.com>".into());
+    });
+    let init = caller
+        .call(1, "initialize", json!({"protocolVersion": 1}))
+        .await;
+    assert!(init.get("result").is_some(), "{init}");
+    eventually("the link", || a.srv.links().len() == 1).await;
+    // The relay: the caller and its certificate, which it checked, and the
+    // person, as the caller said.
+    assert!(env.audit_has("session_open", |e| e["caller"] == CALLER
+        && e["caller_certificate"] == fp
+        && e["on_behalf_of"] == "Zoë <carol@acme.com>"));
+    // The machine: the same, as the relay told it, beside its own token.
+    eventually("the machine's record", || {
+        a.audit().iter().any(|e| {
+            e["event"] == "link_opened"
+                && e["token"] == "it"
+                && e["relay_report"] == "given"
+                && e["relay_caller"] == CALLER
+                && e["relay_caller_certificate"] == fp
+                && e["relay_on_behalf_of"] == "Zoë <carol@acme.com>"
+        })
+    })
+    .await;
+    drop(caller);
+
+    // A caller that names nobody: recorded as such.
+    let mut caller = Caller::start(&pki, env.port, "laptop-a");
+    let init = caller
+        .call(1, "initialize", json!({"protocolVersion": 1}))
+        .await;
+    assert!(init.get("result").is_some(), "{init}");
+    eventually("the second link", || {
+        a.audit()
+            .iter()
+            .filter(|e| e["event"] == "link_opened")
+            .count()
+            == 2
+    })
+    .await;
+    let opened: Vec<_> = a
+        .audit()
+        .into_iter()
+        .filter(|e| e["event"] == "link_opened")
+        .collect();
+    assert_eq!(opened[1]["relay_on_behalf_of"], "");
+    assert_eq!(opened[1]["relay_caller_certificate"], fp.as_str());
+    let sessions: Vec<_> = env
+        .audit()
+        .into_iter()
+        .filter(|e| e["event"] == "session_open")
+        .collect();
+    assert_eq!(sessions.len(), 2);
+    assert!(sessions[1].get("on_behalf_of").is_none());
+    drop(caller);
+
+    // Malformed, or sent twice: refused before the machine is asked.
+    // (Space around a header value is not part of it in HTTP.)
+    for values in [
+        &[b"".as_slice()][..],
+        &[b"a\tb"],
+        &[b"\xff\xfe"],
+        &["a".repeat(257).as_bytes()],
+        &[b"carol", b"dave"],
+    ] {
+        assert_eq!(
+            tunnel_with_on_behalf_of(&pki, env.port, "laptop-a", values).await,
+            400,
+            "{values:?}"
+        );
+    }
+    assert_eq!(
+        env.audit()
+            .iter()
+            .filter(|e| e["event"] == "session_open")
+            .count(),
+        2
+    );
+    drop(a);
 }

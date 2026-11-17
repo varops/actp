@@ -1235,7 +1235,11 @@ impl Relay {
 
     /// Asks `machine` for a stream for a caller. Holds a place under the
     /// machine's limit until the returned slot is dropped.
-    async fn open_stream(&self, machine: &str) -> Result<(Stream, StreamSlot), Refusal> {
+    async fn open_stream(
+        &self,
+        machine: &str,
+        opened_by: actp_proto::relay::OpenedBy,
+    ) -> Result<(Stream, StreamSlot), Refusal> {
         let max = self.config().max_streams_per_machine;
         let (rx, slot, _pending) = {
             let mut st = self.st();
@@ -1257,7 +1261,10 @@ impl Relay {
             let id = new_stream_id();
             if conn
                 .tx
-                .try_send(Control::Open { stream: id.clone() })
+                .try_send(Control::Open {
+                    stream: id.clone(),
+                    opened_by: Some(opened_by),
+                })
                 .is_err()
             {
                 return Err(Refusal::Busy);
@@ -1443,7 +1450,7 @@ fn take_offline(st: &mut State, machine: &str) -> Option<(Vec<Cut>, SystemTime)>
 }
 
 /// The SHA-256 of a certificate, as hex.
-fn fingerprint(c: &CertificateDer<'_>) -> String {
+pub(crate) fn fingerprint(c: &CertificateDer<'_>) -> String {
     use sha2::Digest;
     hex::encode(sha2::Sha256::digest(c.as_ref()))
 }
