@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/actp-proto", "crates/actp-server", "crates/actp-client", "crates/actp"]
+members = ["crates/actp-proto", "crates/actp-server", "crates/actp-client", "crates/actp", "crates/actp-relay"]
 
 [workspace.package]
 version = "0.1.0"

@@ -486,6 +486,10 @@ What v0.1.0 does:
 - **Release:** CI on Linux, macOS and Windows, including building `actp.app` on a Mac runner. Tagging `v*` builds every platform into a draft GitHub release.
 - **Checked with real agents:** a full prompt with Droid through a quick tunnel, from one Mac to another (thinking, answer, stop reason). Handshakes and sessions with the Claude, OpenCode and Grok adapters (`docs/agents.md`).
 
+Since v0.1.1, in the Rust build only (`rust/`):
+
+- **Relay mode and the relay** (`docs/relay.md`): machines connect out to one relay with their device certificates; callers reach them through it. The relay routes, tracks who is online, holds the org-wide stop and writes its half of the audit. The Go server has no relay mode.
+
 Not yet:
 
 - Signed and notarized builds (the macOS app is ad-hoc signed: fine on your own Mac, Gatekeeper warns elsewhere).
