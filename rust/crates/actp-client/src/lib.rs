@@ -53,6 +53,92 @@ pub struct Options {
     /// connection attempt. Its error text is shown to the client and logged,
     /// so it must not carry credentials.
     pub token_source: Option<TokenSource>,
+    /// Reach the machine through an actp relay, encrypted end to end. With
+    /// this set, `base_url` is the relay (`https://relay.example.com`) and
+    /// `tls` is not used.
+    pub relay: Option<RelayRoute>,
+}
+
+/// How to reach a machine through a relay (docs/relay.md).
+#[derive(Clone)]
+pub struct RelayRoute {
+    /// The machine's address at the relay.
+    pub machine: String,
+    /// TLS to the relay: the roots for the relay's certificate, and the
+    /// caller certificate the relay asks for.
+    pub relay_tls: Arc<rustls::ClientConfig>,
+    /// TLS to the machine, end to end inside the relayed stream:
+    /// [`actp_proto::e2e::client_config`] for this machine.
+    pub machine_tls: Arc<rustls::ClientConfig>,
+}
+
+impl RelayRoute {
+    /// A route from PEM files: the caller certificate and key the relay
+    /// asks for, the roots for the relay's own certificate (`None`: the OS
+    /// store), the org's device roots and revocation lists (PEM or DER) for
+    /// the machine's certificate, and which name in it is the address.
+    pub fn from_files(
+        machine: &str,
+        caller_cert: &std::path::Path,
+        caller_key: &std::path::Path,
+        relay_ca: Option<&std::path::Path>,
+        device_ca: &std::path::Path,
+        device_crls: &[std::path::PathBuf],
+        which: actp_proto::e2e::MachineName,
+    ) -> Result<RelayRoute, String> {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer};
+        let certs = |p: &std::path::Path| -> Result<Vec<CertificateDer<'static>>, String> {
+            let v: Vec<_> = CertificateDer::pem_file_iter(p)
+                .and_then(|i| i.collect::<Result<_, _>>())
+                .map_err(|e| format!("{}: {e}", p.display()))?;
+            if v.is_empty() {
+                return Err(format!("{}: no certificate in the file", p.display()));
+            }
+            Ok(v)
+        };
+        let key = PrivateKeyDer::from_pem_file(caller_key)
+            .map_err(|e| format!("{}: {e}", caller_key.display()))?;
+        let mut roots = rustls::RootCertStore::empty();
+        match relay_ca {
+            Some(p) => {
+                for c in certs(p)? {
+                    roots.add(c).map_err(|e| format!("{}: {e}", p.display()))?;
+                }
+            }
+            None => {
+                for c in rustls_native_certs::load_native_certs().certs {
+                    let _ = roots.add(c);
+                }
+            }
+        }
+        let relay_tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?
+        .with_root_certificates(roots)
+        .with_client_auth_cert(certs(caller_cert)?, key)
+        .map_err(|e| format!("{}: {e}", caller_cert.display()))?;
+        let mut crls = Vec::new();
+        for p in device_crls {
+            let bytes = std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?;
+            if bytes.starts_with(b"-----BEGIN") {
+                for c in CertificateRevocationListDer::pem_slice_iter(&bytes) {
+                    crls.push(c.map_err(|e| format!("{}: {e}", p.display()))?);
+                }
+            } else {
+                crls.push(CertificateRevocationListDer::from(bytes));
+            }
+        }
+        let machine_tls =
+            actp_proto::e2e::client_config(&certs(device_ca)?, &crls, which, machine)?;
+        Ok(RelayRoute {
+            machine: machine.to_string(),
+            relay_tls: Arc::new(relay_tls),
+            machine_tls,
+        })
+    }
 }
 
 /// See [`Options::token_source`].
@@ -76,6 +162,7 @@ impl Default for Options {
             max_backoff: Duration::from_secs(30),
             tls: None,
             token_source: None,
+            relay: None,
         }
     }
 }
@@ -453,7 +540,11 @@ impl Bridge {
     }
 
     async fn dial(&self) -> Result<(FrameConn, i64), Error> {
-        let target = link_url(&self.opts.base_url, &self.opts.agent).map_err(Error::Other)?;
+        let base = match &self.opts.relay {
+            Some(_) => TUNNEL_BASE,
+            None => self.opts.base_url.as_str(),
+        };
+        let target = link_url(base, &self.opts.agent).map_err(Error::Other)?;
         let mut req = target
             .as_str()
             .into_client_request()
@@ -483,13 +574,30 @@ impl Bridge {
                 h.insert(HEADER_LAST_SEQ, hv(&self.ep.last_received().to_string())?);
             }
         }
-        let connect = tokio_tungstenite::connect_async_tls_with_config(
-            req,
-            Some(websocket_config()),
-            true,
-            Some(Connector::Rustls(self.tls.clone())),
-        );
-        let (ws, resp) = match tokio::time::timeout(Duration::from_secs(15), connect).await {
+        let connect = async {
+            match &self.opts.relay {
+                None => tokio_tungstenite::connect_async_tls_with_config(
+                    req,
+                    Some(websocket_config()),
+                    true,
+                    Some(Connector::Rustls(self.tls.clone())),
+                )
+                .await
+                .map(|(ws, resp)| (FrameConn::from_websocket(ws), resp)),
+                Some(route) => {
+                    let tls = match self.tunnel(route).await {
+                        Ok(tls) => tls,
+                        Err(e) => return Ok(Err(e)),
+                    };
+                    tokio_tungstenite::client_async_with_config(req, tls, Some(websocket_config()))
+                        .await
+                        .map(|(ws, resp)| (FrameConn::from_websocket(ws), resp))
+                }
+            }
+            .map(Ok)
+        };
+        let (conn, resp) = match tokio::time::timeout(Duration::from_secs(15), connect).await {
+            Ok(Ok(Err(e))) => return Err(e),
             Err(_) => {
                 return Err(Error::Other(format!(
                     "failed to WebSocket dial {target}: timed out"
@@ -514,7 +622,7 @@ impl Bridge {
                     "failed to WebSocket dial {target}: {e}"
                 )));
             }
-            Ok(Ok(x)) => x,
+            Ok(Ok(Ok(x))) => x,
         };
         if let Some(id) = resp
             .headers()
@@ -530,9 +638,98 @@ impl Bridge {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<i64>().ok())
             .unwrap_or(0);
-        Ok((FrameConn::from_websocket(ws), last))
+        Ok((conn, last))
+    }
+
+    /// A tunnel through the relay to the machine, and TLS to the machine
+    /// inside it: the relay checks the caller certificate and carries bytes
+    /// it cannot read.
+    async fn tunnel(
+        &self,
+        route: &RelayRoute,
+    ) -> Result<
+        tokio_rustls::client::TlsStream<
+            actp_proto::wsio::WsIo<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+        >,
+        Error,
+    > {
+        let url = tunnel_url(&self.opts.base_url, &route.machine).map_err(Error::Other)?;
+        let mut req = url
+            .as_str()
+            .into_client_request()
+            .map_err(|e| Error::Other(e.to_string()))?;
+        req.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            HeaderValue::from_static(actp_proto::relay::PROTOCOL_TUNNEL),
+        );
+        let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+            .max_message_size(Some(1 << 20))
+            .max_frame_size(Some(1 << 20));
+        let ws = match tokio_tungstenite::connect_async_tls_with_config(
+            req,
+            Some(config),
+            true,
+            Some(Connector::Rustls(route.relay_tls.clone())),
+        )
+        .await
+        {
+            Ok((ws, _)) => ws,
+            Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+                let (code, message) =
+                    api::decode_error_body(resp.body().as_deref().unwrap_or_default());
+                return Err(Error::Status(StatusError {
+                    status: resp.status().as_u16(),
+                    code,
+                    message,
+                }));
+            }
+            Err(e) => {
+                return Err(Error::Other(format!(
+                    "failed to reach the relay at {url}: {e}"
+                )));
+            }
+        };
+        tokio_rustls::TlsConnector::from(route.machine_tls.clone())
+            .connect(
+                actp_proto::e2e::server_name(),
+                actp_proto::wsio::WsIo::new(ws),
+            )
+            .await
+            .map_err(|e| {
+                Error::Other(format!(
+                    "TLS to machine {} through the relay failed: {e}",
+                    route.machine
+                ))
+            })
     }
 }
+
+/// The relay's tunnel URL for `machine`: `wss://relay/relay/v1/tunnel/<machine>`.
+pub fn tunnel_url(relay: &str, machine: &str) -> Result<String, String> {
+    if !actp_proto::relay::valid_machine_name(machine) {
+        return Err(format!("{machine:?} is not a valid machine address"));
+    }
+    let relay = relay.strip_suffix('/').unwrap_or(relay);
+    let Some((scheme, rest)) = relay.split_once("://") else {
+        return Err("the relay URL needs a scheme (https://)".into());
+    };
+    if rest.contains(['/', '?', '#']) {
+        return Err("the relay URL is the relay's address only, with no path".into());
+    }
+    let scheme = match scheme.to_ascii_lowercase().as_str() {
+        "https" | "wss" => "wss",
+        other => return Err(format!("a relay is reached over https, not \"{other}\"")),
+    };
+    Ok(format!(
+        "{scheme}://{rest}{}{}",
+        actp_proto::relay::PATH_TUNNEL,
+        path_escape(machine)
+    ))
+}
+
+/// The base URL of the machine inside a tunnel: requests go to the machine
+/// over the end-to-end TLS, so the host is only a placeholder.
+const TUNNEL_BASE: &str = "http://machine.actp.invalid";
 
 /// Rewrites a cwd with `--cwd` (always) or the longest matching `--map`.
 pub fn map_cwd(cwd_override: &str, maps: &[Map], cwd: &str) -> String {

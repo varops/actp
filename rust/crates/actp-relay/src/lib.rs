@@ -152,6 +152,10 @@ struct Pending {
 
 struct Session {
     machine: String,
+    /// The caller, by the name in its certificate, and that certificate's
+    /// chain, checked again with the machines'.
+    caller: String,
+    caller_chain: Vec<CertificateDer<'static>>,
     cut: Cut,
 }
 
@@ -310,10 +314,39 @@ impl Relay {
             .is_some_and(|t| t.still_valid(chain))
     }
 
+    /// Whether a caller certificate chain is valid now.
+    pub(crate) fn caller_chain_valid(&self, chain: &[CertificateDer<'static>]) -> bool {
+        self.inner
+            .tls
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .is_some_and(|t| t.caller_valid(chain))
+    }
+
+    /// Whether `caller` is blocked in the configuration in force.
+    pub(crate) fn caller_blocked(&self, caller: &str) -> bool {
+        self.config().blocked_callers.iter().any(|b| b == caller)
+    }
+
     /// Cuts off every online machine that is blocked now, or whose device
     /// certificate is no longer valid (expired, revoked, new roots), with its
-    /// sessions. Returns how many machines.
+    /// sessions, and every session whose caller is blocked now or whose
+    /// caller certificate is no longer valid. Returns how many machines.
     fn recheck_machines(&self) -> usize {
+        let sessions: Vec<(Cut, String, Vec<CertificateDer<'static>>)> = self
+            .st()
+            .sessions
+            .values()
+            .map(|s| (s.cut.clone(), s.caller.clone(), s.caller_chain.clone()))
+            .collect();
+        for (cut, caller, chain) in sessions {
+            if self.caller_blocked(&caller) {
+                cut.cut("caller_blocked");
+            } else if !self.caller_chain_valid(&chain) {
+                cut.cut("caller_certificate_invalid");
+            }
+        }
         // Verify outside the state lock: checking thousands of chains
         // against a long revocation list takes a while.
         let cfg = self.config();
@@ -457,19 +490,30 @@ impl Relay {
                     }
                     Err(_) => return,
                 };
-                let which = relay.config().machine_name;
+                let cfg = relay.config();
                 let chain: Vec<CertificateDer<'static>> = tls
                     .get_ref()
                     .1
                     .peer_certificates()
                     .map(|c| c.iter().map(|c| c.clone().into_owned()).collect())
                     .unwrap_or_default();
-                let machine = chain.first().map(|c| tls::machine_name(c, which));
+                // Which kind of certificate this is, by the roots that sign
+                // it; the two sets share no root.
+                let machine = match relay.chain_valid(&chain) {
+                    true => chain
+                        .first()
+                        .map(|c| tls::machine_name(c, cfg.machine_name)),
+                    false => None,
+                };
+                let caller = match relay.caller_chain_valid(&chain) {
+                    true => chain.first().map(|c| tls::machine_name(c, cfg.caller_name)),
+                    false => None,
+                };
                 // A machine that proved itself does not count against the
                 // limits meant for anyone on the network; everyone else's
                 // connection keeps its place, upgrades included.
                 let held = match &machine {
-                    Some(Ok(_)) if relay.chain_valid(&chain) => None,
+                    Some(Ok(_)) => None,
                     _ => Some(Arc::new(held)),
                 };
                 http::serve_connection(
@@ -478,6 +522,7 @@ impl Relay {
                     http::Peer {
                         remote,
                         machine,
+                        caller,
                         chain,
                         held,
                     },
@@ -931,7 +976,12 @@ impl Relay {
 
     /// Registers a caller's session; `None` while the stop is on or the
     /// machine is gone.
-    fn session_started(&self, machine: &str) -> Result<(u64, Cut), Refusal> {
+    fn session_started(
+        &self,
+        machine: &str,
+        caller: &str,
+        caller_chain: &[CertificateDer<'static>],
+    ) -> Result<(u64, Cut), Refusal> {
         let mut st = self.st();
         if st.stop.stopped {
             return Err(Refusal::Stopped);
@@ -946,6 +996,8 @@ impl Relay {
             id,
             Session {
                 machine: machine.to_string(),
+                caller: caller.to_string(),
+                caller_chain: caller_chain.to_vec(),
                 cut: cut.clone(),
             },
         );

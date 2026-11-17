@@ -5,6 +5,7 @@
 
 pub mod api;
 pub mod conn;
+pub mod e2e;
 pub mod endpoint;
 pub mod frame;
 pub mod gojson;

@@ -27,6 +27,19 @@ pub struct Config {
     /// its certificate is revoked).
     #[serde(default)]
     pub blocked_machines: Vec<String>,
+    /// The roots that sign caller certificates (PEM): the IT client and
+    /// anything else allowed to open tunnels to machines. Must not share a
+    /// root with `device_ca`.
+    pub caller_ca: PathBuf,
+    /// Certificate revocation lists for caller certificates.
+    #[serde(default)]
+    pub caller_crls: Vec<PathBuf>,
+    /// Which name in a caller certificate names the caller (in the audit).
+    #[serde(default)]
+    pub caller_name: MachineName,
+    /// Callers refused even with a valid certificate.
+    #[serde(default)]
+    pub blocked_callers: Vec<String>,
     /// The org-wide stop and who was seen when.
     pub state_dir: PathBuf,
     /// `audit.jsonl` goes here.
@@ -89,19 +102,8 @@ fn default_max_streams() -> usize {
     32
 }
 
-/// Which certificate name identifies a machine.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MachineName {
-    /// The subject's common name (the default; MDM tools usually put the
-    /// serial number or the computer name here).
-    #[default]
-    Cn,
-    /// The one DNS name in the subject alternative names.
-    Dns,
-    /// The one URI in the subject alternative names.
-    Uri,
-}
+/// Which certificate name identifies a machine (and a caller).
+pub use actp_proto::e2e::MachineName;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -162,6 +164,11 @@ impl Config {
         if self.max_streams_per_machine == 0 {
             errs.push("max_streams_per_machine must be at least 1".into());
         }
+        for c in &self.blocked_callers {
+            if !actp_proto::relay::valid_machine_name(c) {
+                errs.push(format!("blocked caller {c:?} is not a valid caller name"));
+            }
+        }
         for m in &self.blocked_machines {
             if !actp_proto::relay::valid_machine_name(m) {
                 errs.push(format!(
@@ -208,8 +215,7 @@ pub fn generate_token() -> String {
 mod tests {
     use super::*;
 
-    const BASE: &str =
-        "tls_cert: r.pem\ntls_key: r.key\ndevice_ca: ca.pem\nstate_dir: s\nlog_dir: l\n";
+    const BASE: &str = "tls_cert: r.pem\ntls_key: r.key\ndevice_ca: ca.pem\ncaller_ca: callers.pem\nstate_dir: s\nlog_dir: l\n";
 
     #[test]
     fn defaults_and_strictness() {
@@ -220,6 +226,15 @@ mod tests {
         assert!(Config::parse(&format!("{BASE}lisen: x\n")).is_err());
         assert!(Config::parse(&format!("{BASE}machine_name: serial\n")).is_err());
         assert!(Config::parse("listen: x\n").is_err());
+        // Callers need their own roots.
+        assert!(Config::parse(&BASE.replace("caller_ca: callers.pem\n", "")).is_err());
+        assert!(Config::parse(&format!("{BASE}blocked_callers: [\"a/b\"]\n")).is_err());
+        assert_eq!(
+            Config::parse(&format!("{BASE}caller_name: uri\n"))
+                .unwrap()
+                .caller_name,
+            MachineName::Uri
+        );
         let t = generate_token();
         let ok = format!(
             "{BASE}admin_tokens:\n  - name: dave\n    hash: {}\n",

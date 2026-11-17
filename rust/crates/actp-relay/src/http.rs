@@ -5,12 +5,14 @@
 //! | `GET /health` | anyone | liveness |
 //! | `GET /relay/v1/connect` | a machine (device certificate) | the control WebSocket |
 //! | `GET /relay/v1/stream/<id>` | the machine asked for it | a caller's stream |
-//! | `* /m/<address>/<path>` | callers | forwarded to the machine as `<path>` |
+//! | `GET /relay/v1/tunnel/<address>` | a caller (caller certificate) | a byte tunnel to the machine, carrying the caller's TLS to it |
 //! | `GET /relay/v1/machines` | admin token | who is online, last seen |
 //! | `GET /relay/v1/stop` | admin token | the org-wide stop |
 //! | `POST /relay/v1/stop`, `POST /relay/v1/release` | admin token | press, release (`{"reason": …}`) |
 //!
-//! Caller and management routes are rate limited per IP address.
+//! Caller and management routes are rate limited per IP address. The relay
+//! never reads what a tunnel carries: the caller's TLS ends at the machine
+//! ([`actp_proto::e2e`]).
 
 use std::convert::Infallible;
 use std::io;
@@ -22,17 +24,16 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use actp_proto::api;
-use actp_proto::frame::{HEADER_CLIENT_NAME, HEADER_LINK_ID};
 use actp_proto::relay::{
-    Control, PATH_CONNECT, PATH_MACHINE, PATH_STREAM, PROTOCOL_CONTROL, PROTOCOL_STREAM,
-    valid_machine_name, valid_stream_id,
+    Control, PATH_CONNECT, PATH_STREAM, PATH_TUNNEL, PROTOCOL_CONTROL, PROTOCOL_STREAM,
+    PROTOCOL_TUNNEL, valid_machine_name, valid_stream_id,
 };
 use actp_proto::wsio::WsIo;
 use base64::Engine;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use http::header::{self, HeaderName, HeaderValue};
-use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
+use http::header::{self, HeaderValue};
+use http::{Method, Request, Response, StatusCode};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
@@ -60,6 +61,8 @@ pub(crate) struct Peer {
     pub remote: SocketAddr,
     /// The machine named by a verified device certificate; `None` without one.
     pub machine: Option<Result<String, String>>,
+    /// The caller named by a verified caller certificate; `None` without one.
+    pub caller: Option<Result<String, String>>,
     /// That certificate's chain, leaf first, checked again on every request.
     pub chain: Vec<rustls_pki_types::CertificateDer<'static>>,
     /// The connection's place under the connection limits, kept for as long
@@ -142,14 +145,13 @@ async fn handle(
         path.as_str(),
         "/relay/v1/machines" | "/relay/v1/stop" | "/relay/v1/release"
     );
-    if !admin_route && !path.starts_with(PATH_MACHINE) {
-        return error(StatusCode::NOT_FOUND, "not_found", "no such route");
-    }
     if admin_route {
         return admin(relay, peer, req, &path).await;
     }
-    let rest = path[PATH_MACHINE.len()..].to_string();
-    caller(relay, peer, req, &rest).await
+    match path.strip_prefix(PATH_TUNNEL) {
+        Some(machine) => tunnel(relay, peer, req, machine).await,
+        None => error(StatusCode::NOT_FOUND, "not_found", "no such route"),
+    }
 }
 
 // ---- machines ----
@@ -427,93 +429,202 @@ fn machine_stream(relay: &Relay, peer: &Peer, mut req: Request<Incoming>, id: St
 
 // ---- callers ----
 
-/// Splits `<address>/<path>` after `/m/`: the decoded address and the path
-/// to forward (with the query).
-fn split_target(rest: &str, uri: &Uri) -> Option<(String, String)> {
-    let (raw_machine, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
+/// The verified caller of a connection, or the response refusing it.
+fn caller_of(relay: &Relay, peer: &Peer) -> Result<String, Box<Resp>> {
+    let refuse = |status, code: &str, why: &str, caller: Option<&str>| {
+        relay.refusal(
+            "caller_refused",
+            [
+                ("caller", json!(caller)),
+                ("remote", json!(peer.remote.to_string())),
+                ("reason", json!(code)),
+            ],
+        );
+        Box::new(error(status, code, why))
     };
-    let machine = percent_encoding::percent_decode_str(raw_machine)
-        .decode_utf8()
-        .ok()?
-        .into_owned();
-    if !valid_machine_name(&machine) {
-        return None;
+    match &peer.caller {
+        None => Err(refuse(
+            StatusCode::UNAUTHORIZED,
+            "caller_certificate_required",
+            "a tunnel needs a caller certificate",
+            None,
+        )),
+        Some(Err(why)) => Err(refuse(
+            StatusCode::FORBIDDEN,
+            "bad_caller_certificate",
+            why,
+            None,
+        )),
+        Some(Ok(c)) if relay.caller_blocked(c) => Err(refuse(
+            StatusCode::FORBIDDEN,
+            "caller_blocked",
+            "this caller is blocked at the relay",
+            Some(c),
+        )),
+        // Checked again on every request: the certificate may have expired,
+        // or been revoked by a reload, since the handshake.
+        Some(Ok(c)) if !relay.caller_chain_valid(&peer.chain) => Err(refuse(
+            StatusCode::FORBIDDEN,
+            "bad_caller_certificate",
+            "the caller certificate is no longer valid",
+            Some(c),
+        )),
+        Some(Ok(c)) => Ok(c.clone()),
     }
-    let mut target = path.to_string();
-    if let Some(q) = uri.query() {
-        target.push('?');
-        target.push_str(q);
-    }
-    Some((machine, target))
 }
 
-/// Headers that belong to one hop and are not forwarded.
-const HOP: &[&str] = &[
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "proxy-connection",
-    "te",
-    "trailer",
-];
+/// Ends a session in the relay's table when dropped, however the tunnel ends.
+struct SessionEnd {
+    relay: Relay,
+    session: u64,
+}
 
-fn forwarded_headers(h: &HeaderMap, upgrade: bool) -> HeaderMap {
-    let mut out = HeaderMap::new();
-    for (k, v) in h {
-        let name = k.as_str();
-        if HOP.contains(&name) {
-            continue;
+impl Drop for SessionEnd {
+    fn drop(&mut self) {
+        self.relay.session_ended(self.session);
+    }
+}
+
+/// `GET /relay/v1/tunnel/<machine>`: a caller's byte tunnel to a machine.
+/// The relay checks the caller's certificate, routes by the address, asks
+/// the machine for a stream, and joins the two. What flows through is the
+/// caller's TLS to the machine, which the relay can neither read nor change
+/// without the connection failing.
+async fn tunnel(relay: &Relay, peer: &Peer, mut req: Request<Incoming>, raw_machine: &str) -> Resp {
+    let caller = match caller_of(relay, peer) {
+        Ok(c) => c,
+        Err(r) => return *r,
+    };
+    let machine = match percent_encoding::percent_decode_str(raw_machine).decode_utf8() {
+        Ok(m) if valid_machine_name(&m) => m.into_owned(),
+        _ => {
+            return error(
+                StatusCode::NOT_FOUND,
+                "unknown_machine",
+                "not a machine address",
+            );
         }
-        if !upgrade && (k == header::CONNECTION || k == header::UPGRADE) {
-            continue;
+    };
+    let resp = match ws_accept(&req, PROTOCOL_TUNNEL) {
+        Ok(r) => r,
+        Err(r) => return *r,
+    };
+    let remote = peer.remote.to_string();
+    let refuse = |reason: Refusal| {
+        let (status, code, msg) = match reason {
+            Refusal::Stopped => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "org_stopped",
+                "the organization-wide stop is on",
+            ),
+            Refusal::Offline => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "machine_offline",
+                "the machine is not connected to the relay",
+            ),
+            Refusal::Busy => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "machine_busy",
+                "too many callers are connected to this machine",
+            ),
+            Refusal::Timeout => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "machine_timeout",
+                "the machine did not answer in time",
+            ),
+        };
+        relay.refusal(
+            "caller_refused",
+            [
+                ("caller", json!(caller)),
+                ("machine", json!(machine)),
+                ("remote", json!(remote)),
+                ("reason", json!(code)),
+            ],
+        );
+        let mut r = error(status, code, msg);
+        if reason != Refusal::Timeout {
+            r.headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
         }
-        out.append(k.clone(), v.clone());
-    }
-    out
-}
-
-fn is_upgrade(h: &HeaderMap) -> bool {
-    h.get_all(header::CONNECTION)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
-}
-
-/// The forwarded path as the machine routes it: each segment
-/// percent-decoded, no query, at most 128 characters. For the audit.
-fn route_of(target: &str) -> String {
-    let path = target.split('?').next().unwrap_or("");
-    let decoded: Vec<String> = path
-        .split('/')
-        .map(|s| {
-            percent_encoding::percent_decode_str(s)
-                .decode_utf8_lossy()
-                .into_owned()
-        })
-        .collect();
-    decoded.join("/").chars().take(128).collect()
-}
-
-/// The agent id of an ACTP link route, for the audit.
-fn agent_of(route: &str) -> Option<String> {
-    let s: Vec<&str> = route.trim_start_matches('/').split('/').collect();
-    match s.as_slice() {
-        ["actp", "v1", "agents", id, "link"] => Some(id.chars().take(64).collect()),
-        _ => None,
-    }
-}
-
-fn short(s: &str) -> String {
-    s.chars().take(8).collect()
-}
-
-fn header_str(h: &HeaderMap, name: &str) -> Option<String> {
-    h.get(name)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.chars().take(128).collect())
+        r
+    };
+    // The session is registered, and the stop checked, before the machine
+    // is asked; a stop pressed while it answers cuts the session at once.
+    let (session, cut) = match relay.session_started(&machine, &caller, &peer.chain) {
+        Ok(s) => s,
+        Err(r) => return refuse(r),
+    };
+    let ended = SessionEnd {
+        relay: relay.clone(),
+        session,
+    };
+    // The 101 waits for the machine's stream, so a caller is told in plain
+    // HTTP why it cannot have a tunnel.
+    let (stream, slot) = match relay.open_stream(&machine).await {
+        Ok(s) => s,
+        Err(r) => return refuse(r),
+    };
+    relay.audit().event(
+        "session_open",
+        [
+            ("session", json!(session)),
+            ("machine", json!(machine)),
+            ("caller", json!(caller)),
+            ("remote", json!(remote)),
+        ],
+    );
+    let on_upgrade = hyper::upgrade::on(&mut req);
+    let relay = relay.clone();
+    let held = peer.held.clone();
+    tokio::spawn(async move {
+        let _held = held;
+        let _ended = ended;
+        let started = Instant::now();
+        let (to_machine, to_caller) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+        let reason = match on_upgrade.await {
+            Ok(up) => {
+                let ws = WebSocketStream::from_raw_socket(
+                    TokioIo::new(up),
+                    Role::Server,
+                    Some(ws_config(1 << 20)),
+                )
+                .await;
+                let mut a = Counting {
+                    io: WsIo::new(ws),
+                    read: to_machine.clone(),
+                };
+                let mut b = Counting {
+                    io: stream,
+                    read: to_caller.clone(),
+                };
+                tokio::select! {
+                    _ = cut.cancelled() => cut.why(),
+                    r = tokio::io::copy_bidirectional(&mut a, &mut b) => {
+                        if r.is_ok() { "closed" } else { "error" }
+                    }
+                }
+            }
+            Err(_) => "upgrade_failed",
+        };
+        drop(slot);
+        relay.audit().event(
+            "session_closed",
+            [
+                ("session", json!(session)),
+                ("machine", json!(machine)),
+                ("caller", json!(caller)),
+                ("seconds", json!(started.elapsed().as_secs())),
+                (
+                    "bytes_to_machine",
+                    json!(to_machine.load(Ordering::Relaxed)),
+                ),
+                ("bytes_to_caller", json!(to_caller.load(Ordering::Relaxed))),
+                ("reason", json!(reason)),
+            ],
+        );
+    });
+    resp
 }
 
 /// Counts the bytes read through it.
@@ -551,194 +662,6 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Counting<T> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.io).poll_shutdown(cx)
-    }
-}
-
-async fn caller(relay: &Relay, peer: &Peer, mut req: Request<Incoming>, rest: &str) -> Resp {
-    let Some((machine, target)) = split_target(rest, req.uri()) else {
-        return error(
-            StatusCode::NOT_FOUND,
-            "unknown_machine",
-            "not a machine address",
-        );
-    };
-    let remote = peer.remote.to_string();
-    let refuse = |reason: Refusal| {
-        let (status, code, msg) = match reason {
-            Refusal::Stopped => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "org_stopped",
-                "the organization-wide stop is on",
-            ),
-            Refusal::Offline => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "machine_offline",
-                "the machine is not connected to the relay",
-            ),
-            Refusal::Busy => (
-                StatusCode::TOO_MANY_REQUESTS,
-                "machine_busy",
-                "too many callers are connected to this machine",
-            ),
-            Refusal::Timeout => (
-                StatusCode::GATEWAY_TIMEOUT,
-                "machine_timeout",
-                "the machine did not answer in time",
-            ),
-        };
-        relay.refusal(
-            "caller_refused",
-            [
-                ("machine", json!(machine)),
-                ("remote", json!(remote)),
-                ("reason", json!(code)),
-            ],
-        );
-        let mut r = error(status, code, msg);
-        if reason != Refusal::Timeout {
-            r.headers_mut()
-                .insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
-        }
-        r
-    };
-    let (stream, slot) = match relay.open_stream(&machine).await {
-        Ok(s) => s,
-        Err(r) => return refuse(r),
-    };
-    let upgrade = is_upgrade(req.headers());
-    let caller_upgrade = upgrade.then(|| hyper::upgrade::on(&mut req));
-    let (parts, body) = req.into_parts();
-    let mut fwd = Request::new(body);
-    *fwd.method_mut() = parts.method.clone();
-    *fwd.uri_mut() = match target.parse() {
-        Ok(u) => u,
-        Err(_) => return error(StatusCode::BAD_REQUEST, "bad_request", "bad path"),
-    };
-    *fwd.headers_mut() = forwarded_headers(&parts.headers, upgrade);
-
-    let (mut sender, conn) = match hyper::client::conn::http1::handshake(TokioIo::new(stream)).await
-    {
-        Ok(x) => x,
-        Err(_) => return refuse(Refusal::Timeout),
-    };
-    tokio::spawn(async move {
-        let _ = conn.with_upgrades().await;
-    });
-    let timing = relay.timing().clone();
-    let mut resp =
-        match tokio::time::timeout(timing.response_timeout, sender.send_request(fwd)).await {
-            Ok(Ok(r)) => r,
-            _ => return refuse(Refusal::Timeout),
-        };
-    let status = resp.status();
-    let route = route_of(&target);
-    let agent = agent_of(&route);
-    let resumed = parts.headers.contains_key(HEADER_LINK_ID);
-    let link = header_str(resp.headers(), HEADER_LINK_ID).map(|l| short(&l));
-    let client_name = header_str(&parts.headers, HEADER_CLIENT_NAME);
-    if status != StatusCode::SWITCHING_PROTOCOLS || caller_upgrade.is_none() {
-        let fields = [
-            ("machine", json!(machine)),
-            ("remote", json!(remote)),
-            ("route", json!(route)),
-            ("status", json!(status.as_u16())),
-        ];
-        // Link requests are always recorded, refusals by the machine
-        // throttled like the relay's own (they cost a caller nothing).
-        // Other routes that worked (health, info) are not recorded.
-        if status.as_u16() >= 400 {
-            relay.refusal("caller_answered", fields);
-        } else if agent.is_some() {
-            relay.audit().event("caller_answered", fields);
-        }
-        if status == StatusCode::SWITCHING_PROTOCOLS {
-            // The caller asked for no upgrade: a machine has no business switching.
-            return error(
-                StatusCode::BAD_GATEWAY,
-                "bad_gateway",
-                "the machine switched protocols unasked",
-            );
-        }
-        // The slot is held until the answer has been sent.
-        let (rparts, rbody) = resp.into_parts();
-        let body = rbody.map_frame(move |f| {
-            let _ = &slot;
-            f
-        });
-        return Response::from_parts(rparts, body.boxed());
-    }
-
-    // A link: register the session (refused if the stop came meanwhile) and
-    // pipe the two upgraded connections into each other.
-    let (session, cut) = match relay.session_started(&machine) {
-        Ok(s) => s,
-        Err(r) => return refuse(r),
-    };
-    relay.audit().event(
-        "session_open",
-        [
-            ("session", json!(session)),
-            ("machine", json!(machine)),
-            ("remote", json!(remote)),
-            ("agent", json!(agent)),
-            ("link", json!(link)),
-            ("resumed", json!(resumed)),
-            ("client_name", json!(client_name)),
-        ],
-    );
-    let machine_upgrade = hyper::upgrade::on(&mut resp);
-    let (rparts, _) = resp.into_parts();
-    let mut out = Response::from_parts(rparts, full(Bytes::new()));
-    strip_hop(out.headers_mut());
-    let relay2 = relay.clone();
-    let caller_upgrade = caller_upgrade.expect("checked above");
-    let held = peer.held.clone();
-    tokio::spawn(async move {
-        let _held = held;
-        let started = Instant::now();
-        let (to_machine, to_caller) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
-        let reason = match (caller_upgrade.await, machine_upgrade.await) {
-            (Ok(a), Ok(b)) => {
-                let mut a = Counting {
-                    io: TokioIo::new(a),
-                    read: to_machine.clone(),
-                };
-                let mut b = Counting {
-                    io: TokioIo::new(b),
-                    read: to_caller.clone(),
-                };
-                tokio::select! {
-                    _ = cut.cancelled() => cut.why(),
-                    r = tokio::io::copy_bidirectional(&mut a, &mut b) => {
-                        if r.is_ok() { "closed" } else { "error" }
-                    }
-                }
-            }
-            _ => "upgrade_failed",
-        };
-        drop(slot);
-        relay2.session_ended(session);
-        relay2.audit().event(
-            "session_closed",
-            [
-                ("session", json!(session)),
-                ("machine", json!(machine)),
-                ("seconds", json!(started.elapsed().as_secs())),
-                (
-                    "bytes_to_machine",
-                    json!(to_machine.load(Ordering::Relaxed)),
-                ),
-                ("bytes_to_caller", json!(to_caller.load(Ordering::Relaxed))),
-                ("reason", json!(reason)),
-            ],
-        );
-    });
-    out
-}
-
-fn strip_hop(h: &mut HeaderMap) {
-    for name in HOP {
-        h.remove(HeaderName::from_static(name));
     }
 }
 
@@ -842,40 +765,5 @@ async fn admin(relay: &Relay, peer: &Peer, req: Request<Incoming>, path: &str) -
                 .insert(header::ALLOW, HeaderValue::from_static(allow));
             r
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn splits_caller_targets() {
-        let u: Uri = "/m/C02X/actp/v1/agents/a/link?x=1".parse().unwrap();
-        assert_eq!(
-            split_target("C02X/actp/v1/agents/a/link", &u),
-            Some(("C02X".into(), "/actp/v1/agents/a/link?x=1".into()))
-        );
-        let u: Uri = "/m/a%3Ab".parse().unwrap();
-        assert_eq!(split_target("a%3Ab", &u), Some(("a:b".into(), "/".into())));
-        let u: Uri = "/m/..".parse().unwrap();
-        assert_eq!(split_target("..", &u), None);
-        assert_eq!(split_target("a%2Fb/x", &u), None);
-        assert_eq!(split_target("%2e%2e/x", &u), None);
-        assert_eq!(split_target("", &u), None);
-    }
-
-    #[test]
-    fn audits_routes_as_the_machine_sees_them() {
-        assert_eq!(
-            agent_of(&route_of("/actp/v1/agents/claude/link?q")),
-            Some("claude".into())
-        );
-        assert_eq!(
-            agent_of(&route_of("/actp/v1/%61gents/cl%61ude/link")),
-            Some("claude".into())
-        );
-        assert_eq!(agent_of(&route_of("/api/v1/agents")), None);
-        assert_eq!(route_of("/api/v1/info?token=x"), "/api/v1/info");
     }
 }

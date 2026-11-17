@@ -32,6 +32,7 @@ dependencies = [
  "rustls-native-certs",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "tokio-util",
  "tracing",
@@ -43,12 +44,15 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "futures-util",
+ "rustls",
+ "rustls-webpki",
  "serde",
  "serde_json",
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
  "tracing",
+ "x509-parser",
 ]
 
 [[package]]

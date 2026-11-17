@@ -32,7 +32,7 @@ tokio-tungstenite.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-x509-parser = "0.18"
+x509-parser.workspace = true
 
 [dev-dependencies]
 actp-client.workspace = true

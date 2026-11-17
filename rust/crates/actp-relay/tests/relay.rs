@@ -79,9 +79,10 @@ async fn routes_callers_to_the_right_machine() {
         .unwrap();
     assert_eq!(a_row["sessions"], 1);
     assert!(a_row["last_seen"].is_string() && a_row["connected_since"].is_string());
+    // The relay knows who called which machine; what was asked of it is
+    // inside the caller's TLS.
     assert!(env.audit_has("session_open", |e| e["machine"] == "laptop-a"
-        && e["agent"] == "test"
-        && e["client_name"] == "relay-test"));
+        && e["caller"] == CALLER));
     assert!(env.audit_has("machine_online", |e| e["machine"] == "laptop-b"));
     // Never anything the session carried.
     let text = std::fs::read_to_string(env.dir.join("logs").join("audit.jsonl")).unwrap();
@@ -101,16 +102,13 @@ async fn routes_callers_to_the_right_machine() {
         (status, body["error"].as_str()),
         (503, Some("machine_offline"))
     );
-    let (status, _) = request(
-        &pki,
-        env.port,
-        "GET",
-        "/m/../relay/v1/machines",
-        ADMIN,
-        None,
-    )
-    .await;
-    assert_eq!(status, 404);
+    for bad in ["..", "a%2Fb", "%2e%2e", "Dana's%20Mac"] {
+        match open_tunnel(&pki.route("laptop-a"), env.port, bad).await {
+            Err(Refused::Relay(status, _)) => assert_eq!(status, 404, "{bad}"),
+            Err(other) => panic!("{bad}: {other:?}"),
+            Ok(_) => panic!("{bad}: a tunnel opened"),
+        }
+    }
     let (status, _) = request(&pki, env.port, "GET", "/relay/v1/machines", "", None).await;
     assert_eq!(status, 401);
 
@@ -474,9 +472,9 @@ async fn only_the_machine_asked_can_take_a_stream() {
     );
 
     let port = env.port;
-    let tls = pki.caller_tls();
+    let route = pki.route("laptop-a");
     let caller = tokio::spawn(async move {
-        request_with(tls, port, "GET", "/m/laptop-a/api/v1/info", TOKEN, None).await
+        tunnel_request(&route, port, "laptop-a", "GET", "/api/v1/info", TOKEN, None).await
     });
     let id = loop {
         if let Control::Open { stream } = next().await {
@@ -494,7 +492,21 @@ async fn only_the_machine_asked_can_take_a_stream() {
     let ws = dial_as(&pki, env.port, &a, &path, PROTOCOL_STREAM)
         .await
         .unwrap();
-    let mut io = actp_proto::wsio::WsIo::new(ws);
+    // What the relay forwards is the caller's TLS: recorded here exactly as
+    // the relay carried it, then answered with laptop-a's device certificate.
+    let carried = Recorder::new(actp_proto::wsio::WsIo::new(ws));
+    let seen = carried.seen.clone();
+    let e2e = actp_server::relay::stream_tls(&actp_server::config::Relay {
+        url: String::new(),
+        cert: a.0.to_string_lossy().into_owned(),
+        key: a.1.to_string_lossy().into_owned(),
+        ca: String::new(),
+    })
+    .unwrap();
+    let mut io = tokio_rustls::TlsAcceptor::from(e2e)
+        .accept(carried)
+        .await
+        .unwrap();
     let mut got = Vec::new();
     while !got.ends_with(b"\r\n\r\n") {
         got.push(io.read_u8().await.unwrap());
@@ -509,8 +521,13 @@ async fn only_the_machine_asked_can_take_a_stream() {
         .await
         .unwrap();
     io.flush().await.unwrap();
-    let (status, body) = caller.await.unwrap();
+    let (status, body) = caller.await.unwrap().unwrap();
     assert_eq!((status, body["name"].as_str()), (200, Some("fake")));
+    // The relay carried a TLS handshake and records, never the request.
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen[0], 0x16, "a TLS handshake record first");
+    assert!(!contains(&seen, TOKEN.as_bytes()));
+    assert!(!contains(&seen, b"/api/v1/info"));
     // The same stream id cannot be taken twice.
     assert_eq!(
         dial_as(&pki, env.port, &a, &path, PROTOCOL_STREAM)
@@ -1075,30 +1092,136 @@ async fn connections_per_address_are_capped_and_refusals_answered_are_throttled(
     .await;
     drop((_one, _two));
 
-    // A machine's refusals of callers are throttled in the audit.
-    let mut a = start_laptop(&pki, "laptop-a", env.port, pki.device("laptop-a", None)).await;
-    a.wait_connected().await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Callers the relay refuses are recorded, throttled: here, connections
+    // without a caller certificate asking for tunnels.
     for _ in 0..25 {
-        let (status, _) = request(
-            &pki,
-            env.port,
-            "GET",
-            "/m/laptop-a/api/v1/info",
-            "wrong",
-            None,
-        )
-        .await;
+        let (status, _) =
+            request(&pki, env.port, "GET", "/relay/v1/tunnel/laptop-a", "", None).await;
         assert_eq!(status, 401);
     }
-    let answered = env
+    let refused = env
         .audit()
         .iter()
-        .filter(|e| e["event"] == "caller_answered")
+        .filter(|e| e["event"] == "caller_refused")
         .count();
-    assert_eq!(answered, 20);
-    // Requests that worked on routes other than links are not recorded.
-    let (status, _) = request(&pki, env.port, "GET", "/m/laptop-a/health", "", None).await;
-    assert_eq!(status, 200);
-    assert!(!env.audit_has("caller_answered", |e| e["status"] == 200));
+    assert_eq!(refused, 20);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tunnels_need_a_caller_certificate_of_their_own_kind() {
+    let dir = scratch("callers");
+    let pki = Pki::new(&dir);
+    let env = start_relay_with(&pki, &dir, "blocked_callers: [lost-bridge]\n").await;
+    let laptop_a = pki.device("laptop-a", None);
+    let mut a = start_laptop(&pki, "laptop-a", env.port, laptop_a.clone()).await;
+    a.wait_connected().await;
+    let ask = |cert: &(PathBuf, PathBuf)| {
+        let route = pki.route_as(cert, "laptop-a");
+        let port = env.port;
+        async move { tunnel_request(&route, port, "laptop-a", "GET", "/api/v1/info", TOKEN, None).await }
+    };
+    // The org's caller certificate works.
+    let (status, body) = ask(&pki.caller("it-bridge-2", None)).await.unwrap();
+    assert_eq!((status, body["name"].as_str()), (200, Some("laptop-a")));
+    // No certificate at all.
+    let (status, body) =
+        request(&pki, env.port, "GET", "/relay/v1/tunnel/laptop-a", "", None).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (401, Some("caller_certificate_required"))
+    );
+    // A laptop's device certificate is not a caller certificate: a laptop
+    // cannot open tunnels to other laptops.
+    match ask(&pki.device("laptop-b", None)).await {
+        Err(Refused::Relay(401, body)) => assert_eq!(body["error"], "caller_certificate_required"),
+        other => panic!("{other:?}"),
+    }
+    // A certificate from some other CA does not get through the handshake.
+    let (rp, rk, _) = ca("rogue CA");
+    let rogue = rcgen::Issuer::new(rp, rk);
+    assert!(matches!(
+        ask(&pki.caller("rogue-bridge", Some(&rogue))).await,
+        Err(Refused::Tls(_))
+    ));
+    // A blocked caller.
+    match ask(&pki.caller("lost-bridge", None)).await {
+        Err(Refused::Relay(403, body)) => assert_eq!(body["error"], "caller_blocked"),
+        other => panic!("{other:?}"),
+    }
+    // A caller certificate does not log in as a machine.
+    let as_machine = pki.caller("laptop-c", None);
+    assert_eq!(
+        dial_as(
+            &pki,
+            env.port,
+            &as_machine,
+            "/relay/v1/connect",
+            actp_proto::relay::PROTOCOL_CONTROL
+        )
+        .await
+        .err(),
+        Some(401)
+    );
+    assert!(
+        env.audit_has("caller_refused", |e| e["reason"] == "caller_blocked"
+            && e["caller"] == "lost-bridge")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revoked_caller_is_cut_off_mid_session() {
+    let dir = scratch("caller-revoke");
+    let pki = Pki::new(&dir);
+    let empty = pki.caller_crl("callers-empty.crl", &[]);
+    let crl_yaml = |p: &std::path::Path| format!("caller_crls: [{}]\n", yaml_path(p));
+    let env = start_relay_with(&pki, &dir, &crl_yaml(&empty)).await;
+    let mut a = start_laptop(&pki, "laptop-a", env.port, pki.device("laptop-a", None)).await;
+    a.wait_connected().await;
+    let cert = pki.caller_with("it-bridge-3", None, |p| {
+        p.serial_number = Some(rcgen::SerialNumber::from(3003u64))
+    });
+    let mut caller = Caller::start_with(&pki, env.port, "laptop-a", |o| {
+        o.relay = Some(pki.route_as(&cert, "laptop-a"))
+    });
+    assert!(
+        caller
+            .call(1, "initialize", json!({"protocolVersion": 1}))
+            .await
+            .get("result")
+            .is_some()
+    );
+    let revoked = pki.caller_crl("callers-revoked.crl", &[3003]);
+    let yaml = relay_yaml(&pki, &dir, &crl_yaml(&revoked));
+    let cfg = actp_relay::config::Config::parse(&yaml).unwrap();
+    let tls = actp_relay::tls::server_config(&cfg).unwrap();
+    env.relay.reload(cfg, tls);
+    eventually("the caller's session cut", || {
+        env.audit_has("session_closed", |e| {
+            e["caller"] == "it-bridge-3" && e["reason"] == "caller_certificate_invalid"
+        })
+    })
+    .await;
+    // The machine stays online; only the caller is cut off.
+    assert!(
+        env.relay
+            .machines()
+            .iter()
+            .any(|m| m.machine == "laptop-a" && m.online)
+    );
+    drop(caller);
+}
+
+#[test]
+fn caller_and_device_roots_must_differ() {
+    let dir = scratch("shared-roots");
+    let pki = Pki::new(&dir);
+    let yaml = relay_yaml(&pki, &dir, "").replace(
+        &format!("caller_ca: {}", yaml_path(&pki.dir.join("caller-ca.pem"))),
+        &format!("caller_ca: {}", yaml_path(&pki.dir.join("device-ca.pem"))),
+    );
+    let cfg = actp_relay::config::Config::parse(&yaml).unwrap();
+    let Err(e) = actp_relay::tls::server_config(&cfg) else {
+        panic!("shared roots accepted");
+    };
+    assert!(e.to_string().contains("shares a root"), "{e}");
 }
