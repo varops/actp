@@ -147,7 +147,20 @@ async fn hostile_relay(pki: &Pki, mode: Mode) -> Hostile {
                         h.controls.get(&target).cloned()
                     };
                     let Some(control) = control else { return };
-                    let _ = control.send(Control::Open { stream: id }.encode());
+                    // It also lies about who opened the stream, in a shape
+                    // the machine does not record.
+                    let opened_by = Some(actp_proto::relay::OpenedBy {
+                        caller: "someone else".into(),
+                        caller_certificate: "0".repeat(64),
+                        on_behalf_of: None,
+                    });
+                    let _ = control.send(
+                        Control::Open {
+                            stream: id,
+                            opened_by,
+                        }
+                        .encode(),
+                    );
                     let Ok(Ok(machine)) = tokio::time::timeout(Duration::from_secs(5), rx).await
                     else {
                         return;
@@ -246,6 +259,18 @@ async fn a_relay_that_reads_sees_only_ciphertext() {
         .call(1, "initialize", json!({"protocolVersion": 1}))
         .await;
     assert!(init.get("result").is_some(), "{init}");
+    // A malformed account of who opened the stream is not recorded, but
+    // that the relay gave one is.
+    eventually("the link", || {
+        a.audit().iter().any(|e| e["event"] == "link_opened")
+    })
+    .await;
+    assert!(
+        a.audit()
+            .iter()
+            .filter(|e| e["event"] == "link_opened")
+            .all(|e| e["relay_report"] == "malformed" && e["relay_caller"] == "")
+    );
     let (status, body) = tunnel_request(
         &pki.route("laptop-a"),
         relay.port,

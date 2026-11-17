@@ -166,6 +166,8 @@ pub struct LinkRequest {
     pub client_name: Option<String>,
     pub link_id: Option<String>,
     pub last_seq: Option<i64>,
+    /// When a relay carried the stream: what it said about who opened it.
+    pub relayed: Option<crate::http::Relayed>,
 }
 
 /// A link that is ready to be served once the transport is up.
@@ -173,6 +175,7 @@ pub struct PendingLink {
     link: Arc<Link>,
     last_seq: i64,
     resumed: bool,
+    relayed: Option<crate::http::Relayed>,
 }
 
 impl PendingLink {
@@ -187,7 +190,9 @@ impl PendingLink {
 
     /// Runs the link over the connection until the socket ends.
     pub async fn serve(self, conn: FrameConn) {
-        self.link.serve(conn, self.last_seq).await;
+        self.link
+            .serve(conn, self.last_seq, self.relayed.as_ref(), self.resumed)
+            .await;
     }
 
     /// The transport did not come up. A new link ends; a resumed one is left alone.
@@ -662,6 +667,7 @@ impl Server {
                 link,
                 last_seq: req.last_seq.unwrap_or(0),
                 resumed: true,
+                relayed: req.relayed.clone(),
             });
         }
         let slot = match self.reserve_link(&agent.id, &tok.name, agent.max_links, tok.max_links) {
@@ -678,6 +684,7 @@ impl Server {
                 agent,
                 tok.clone(),
                 req.client_name.clone().unwrap_or_default(),
+                req.relayed.clone(),
                 slot,
             )
             .await
@@ -699,6 +706,7 @@ impl Server {
                     link,
                     last_seq: 0,
                     resumed: false,
+                    relayed: None,
                 })
             }
             Err(e) => Err(Rejection::new(503, "agent_unavailable", e)),
@@ -758,6 +766,7 @@ impl Server {
         agent: config::Agent,
         tok: Token,
         client_name: String,
+        relayed: Option<crate::http::Relayed>,
         slot: Slot,
     ) -> Result<Arc<Link>, String> {
         let cfg = self.config();
@@ -793,7 +802,18 @@ impl Server {
         let id = new_id();
         let mut wopts = self.inner.opts.wire.clone();
         wopts.spool_path = Some(self.spool_dir().join(format!("{id}.spool")));
-        let link = Link::new(self.clone(), id, agent, tok, client_name, proc, wopts);
+        let link = Link::new(
+            self.clone(),
+            id,
+            agent,
+            tok,
+            crate::link::Opener {
+                client_name,
+                relayed,
+            },
+            proc,
+            wopts,
+        );
         {
             // The link takes the slot's place in one step.
             let mut st = self.st();

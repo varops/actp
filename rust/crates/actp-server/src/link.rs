@@ -2,6 +2,7 @@
 //! states and timers (design 3.1), the rewrites (3.3) and the settle order
 //! when it ends (3.2). A port of Go's `internal/server/link.go`.
 
+use crate::http::Relayed;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -95,6 +96,8 @@ pub(crate) struct Link {
     pub agent: config::Agent,
     pub token: Token,
     client_name: String,
+    /// Who opened the link's first stream, when a relay carried it.
+    relayed: Option<Relayed>,
     proc: Arc<Process>,
     pub ep: Endpoint,
     st: Mutex<LinkState>,
@@ -111,13 +114,44 @@ fn sv(v: &str) -> GoValue {
     GoValue::Str(v.to_string())
 }
 
+/// Who opened a link: the client's name for itself, and, when a relay
+/// carried the stream, what the relay reported.
+pub(crate) struct Opener {
+    pub client_name: String,
+    pub relayed: Option<Relayed>,
+}
+
+/// The audit fields for a stream a relay carried, all as the relay
+/// reported them: whether it said who opened the stream (`given`, `none`,
+/// `malformed`), the caller and its certificate as the relay checked them,
+/// and whom the caller said it acts for. Empty strings where it said none.
+fn relayed_fields(r: Option<&Relayed>) -> Option<[(&'static str, GoValue); 4]> {
+    let r = r?;
+    let o = r.opened_by.as_ref();
+    Some([
+        ("relay_report", sv(r.report.as_str())),
+        ("relay_caller", sv(o.map_or("", |o| o.caller.as_str()))),
+        (
+            "relay_caller_certificate",
+            sv(o.map_or("", |o| o.caller_certificate.as_str())),
+        ),
+        (
+            "relay_on_behalf_of",
+            sv(o.and_then(|o| o.on_behalf_of.as_deref()).unwrap_or("")),
+        ),
+    ])
+}
+
 impl Link {
     pub(crate) fn new(
         srv: Server,
         id: String,
         agent: config::Agent,
         token: Token,
-        client_name: String,
+        Opener {
+            client_name,
+            relayed,
+        }: Opener,
         proc: Arc<Process>,
         wopts: actp_proto::Options,
     ) -> Arc<Link> {
@@ -142,6 +176,7 @@ impl Link {
                 agent,
                 token,
                 client_name,
+                relayed,
                 proc,
                 ep,
                 st: Mutex::new(LinkState {
@@ -173,15 +208,37 @@ impl Link {
 
     /// Records the new link and starts reading the agent and the timers.
     pub(crate) fn started(self: &Arc<Self>) {
-        self.srv.audit().event(
-            "link_opened",
-            [
-                ("link", sv(short(&self.id))),
-                ("agent", sv(&self.agent.id)),
-                ("token", sv(&self.token.name)),
-                ("client", sv(&self.client_name)),
-            ],
+        let (link, agent, token, client) = (
+            sv(short(&self.id)),
+            sv(&self.agent.id),
+            sv(&self.token.name),
+            sv(&self.client_name),
         );
+        let audit = self.srv.audit();
+        match relayed_fields(self.relayed.as_ref()) {
+            Some([report, by, cert, obo]) => audit.event(
+                "link_opened",
+                [
+                    ("link", link),
+                    ("agent", agent),
+                    ("token", token),
+                    ("client", client),
+                    report,
+                    by,
+                    cert,
+                    obo,
+                ],
+            ),
+            None => audit.event(
+                "link_opened",
+                [
+                    ("link", link),
+                    ("agent", agent),
+                    ("token", token),
+                    ("client", client),
+                ],
+            ),
+        }
         tokio::spawn(self.clone().read_agent());
         tokio::spawn(self.clone().supervise());
     }
@@ -198,28 +255,49 @@ impl Link {
         *self.ended.borrow()
     }
 
-    /// Attaches a socket and runs it until it ends.
-    pub(crate) async fn serve(self: &Arc<Self>, conn: FrameConn, last_seq: i64) {
+    /// Attaches a socket and runs it until it ends. `relayed`: what the
+    /// relay reported about the socket's stream, when one carried it;
+    /// `resumed`: the client took up an existing link.
+    pub(crate) async fn serve(
+        self: &Arc<Self>,
+        conn: FrameConn,
+        last_seq: i64,
+        relayed: Option<&Relayed>,
+        resumed: bool,
+    ) {
         let tomb = self.st().tomb.clone();
         if let Some(tomb) = tomb {
             // The link ended while the client was away: hand over what it missed, then say why.
-            self.srv.audit().event(
-                "link_resumed",
-                [
-                    ("link", sv(short(&self.id))),
-                    ("ended", GoValue::Bool(true)),
-                ],
-            );
+            let (link, ended) = (sv(short(&self.id)), GoValue::Bool(true));
+            match relayed_fields(relayed) {
+                Some([report, by, cert, obo]) => self.srv.audit().event(
+                    "link_resumed",
+                    [("link", link), ("ended", ended), report, by, cert, obo],
+                ),
+                None => self
+                    .srv
+                    .audit()
+                    .event("link_resumed", [("link", link), ("ended", ended)]),
+            }
             self.ep.send_control(tomb.frame());
             let _ = self.ep.serve(conn, last_seq).await;
             self.finalize_if_delivered();
             return;
         }
         self.set_state(STATE_ATTACHED);
-        if last_seq > 0 {
-            self.srv
-                .audit()
-                .event("link_resumed", [("link", sv(short(&self.id)))]);
+        // Any resume over a relay is recorded, from wherever it picks up:
+        // whoever takes up a link gets what it missed. (Directly, as in
+        // the Go server, only one that picks up past the start.)
+        let relayed_fields = relayed_fields(relayed).filter(|_| resumed);
+        if last_seq > 0 || relayed_fields.is_some() {
+            let link = sv(short(&self.id));
+            match relayed_fields {
+                Some([report, by, cert, obo]) => self
+                    .srv
+                    .audit()
+                    .event("link_resumed", [("link", link), report, by, cert, obo]),
+                None => self.srv.audit().event("link_resumed", [("link", link)]),
+            }
         }
         match self.ep.serve(conn, last_seq).await {
             ServeEnd::Replaced => {} // a newer socket owns the link now

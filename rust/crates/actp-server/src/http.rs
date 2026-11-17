@@ -40,8 +40,134 @@ type Resp = Response<Full<Bytes>>;
 pub trait Io: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Io for T {}
 
+/// A connection ready to be served, and, when a relay carried it, what
+/// the relay said about who opened it (recorded with the link, never
+/// trusted).
+pub struct Accepted {
+    pub io: Box<dyn Io>,
+    pub relayed: Option<Relayed>,
+}
+
+impl Accepted {
+    /// A connection no relay carried.
+    pub fn direct(io: impl Io) -> Accepted {
+        Accepted {
+            io: Box::new(io),
+            relayed: None,
+        }
+    }
+}
+
+/// A connection a relay carried, and what the relay reported about who
+/// opened it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Relayed {
+    pub opened_by: Option<actp_proto::relay::OpenedBy>,
+    pub report: RelayReport,
+}
+
+/// Whether the relay said who opened a stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayReport {
+    /// It did, in the shape the relay gives it.
+    Given,
+    /// It did not (an older relay, or one that left it out).
+    None,
+    /// It did, in a shape no relay gives: left out.
+    Malformed,
+}
+
+impl RelayReport {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RelayReport::Given => "given",
+            RelayReport::None => "none",
+            RelayReport::Malformed => "malformed",
+        }
+    }
+}
+
+impl Relayed {
+    /// From what the relay sent with the stream.
+    pub fn from_report(opened_by: Option<actp_proto::relay::OpenedBy>) -> Relayed {
+        match opened_by {
+            None => Relayed {
+                opened_by: None,
+                report: RelayReport::None,
+            },
+            Some(o) if o.valid() => Relayed {
+                opened_by: Some(o),
+                report: RelayReport::Given,
+            },
+            // The caller and its certificate in good shape: kept, and only
+            // whom it acts for left out (an older relay may pass on names
+            // this version refuses).
+            Some(o)
+                if actp_proto::relay::OpenedBy {
+                    on_behalf_of: None,
+                    ..o.clone()
+                }
+                .valid() =>
+            {
+                Relayed {
+                    opened_by: Some(actp_proto::relay::OpenedBy {
+                        on_behalf_of: None,
+                        ..o
+                    }),
+                    report: RelayReport::Malformed,
+                }
+            }
+            Some(_) => Relayed {
+                opened_by: None,
+                report: RelayReport::Malformed,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod relayed_tests {
+    use super::*;
+    use actp_proto::relay::OpenedBy;
+
+    #[test]
+    fn what_the_relay_reported_is_kept_only_in_shape() {
+        let good = OpenedBy {
+            caller: "it-bridge".into(),
+            caller_certificate: "0f".repeat(32),
+            on_behalf_of: Some("carol@acme.com".into()),
+        };
+        let r = Relayed::from_report(Some(good.clone()));
+        assert_eq!(
+            (r.report, r.opened_by),
+            (RelayReport::Given, Some(good.clone()))
+        );
+        let r = Relayed::from_report(None);
+        assert_eq!((r.report, r.opened_by), (RelayReport::None, None));
+        // Only the name is bad: the caller and certificate are kept.
+        let r = Relayed::from_report(Some(OpenedBy {
+            on_behalf_of: Some("carol\u{202e}x".into()),
+            ..good.clone()
+        }));
+        assert_eq!(r.report, RelayReport::Malformed);
+        assert_eq!(
+            r.opened_by,
+            Some(OpenedBy {
+                on_behalf_of: None,
+                ..good.clone()
+            })
+        );
+        // The caller is bad: nothing is kept.
+        let r = Relayed::from_report(Some(OpenedBy {
+            caller: "a b".into(),
+            ..good
+        }));
+        assert_eq!((r.report, r.opened_by), (RelayReport::Malformed, None));
+    }
+}
+
 /// A stream being set up (for example a TLS handshake), run off the accept loop.
-pub type Connecting = Pin<Box<dyn Future<Output = io::Result<Box<dyn Io>>> + Send>>;
+pub type Connecting = Pin<Box<dyn Future<Output = io::Result<Accepted>> + Send>>;
 
 /// Where connections come from. Listening on TCP is one implementation; a
 /// relay client that dials out and receives streams is another.
@@ -57,7 +183,7 @@ impl Acceptor for TcpAcceptor {
         Box::pin(async move {
             let (tcp, _) = self.0.accept().await?;
             let _ = tcp.set_nodelay(true);
-            Ok(Box::pin(async move { Ok(Box::new(tcp) as Box<dyn Io>) }) as Connecting)
+            Ok(Box::pin(async move { Ok(Accepted::direct(tcp)) }) as Connecting)
         })
     }
 }
@@ -78,7 +204,7 @@ impl Acceptor for TlsAcceptor {
                 let s = tokio::time::timeout(Duration::from_secs(10), tls.accept(tcp))
                     .await
                     .map_err(|_| io::Error::other("TLS handshake timed out"))??;
-                Ok(Box::new(s) as Box<dyn Io>)
+                Ok(Accepted::direct(s))
             }) as Connecting)
         })
     }
@@ -119,8 +245,8 @@ pub async fn serve(
             Ok(c) => {
                 let server = server.clone();
                 tokio::spawn(async move {
-                    if let Ok(io) = c.await {
-                        serve_connection(server, io).await;
+                    if let Ok(a) = c.await {
+                        serve_relayed_connection(server, a.io, a.relayed).await;
                     }
                 });
             }
@@ -137,8 +263,21 @@ pub async fn serve_connection(
     server: Server,
     io: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
 ) {
-    let svc = hyper::service::service_fn(move |req| {
+    serve_relayed_connection(server, io, None).await;
+}
+
+/// [`serve_connection`] for a stream a relay carried (`relayed`): every
+/// link opened or resumed on it records what the relay reported.
+pub async fn serve_relayed_connection(
+    server: Server,
+    io: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    relayed: Option<Relayed>,
+) {
+    let svc = hyper::service::service_fn(move |mut req: Request<Body>| {
         let server = server.clone();
+        if let Some(r) = &relayed {
+            req.extensions_mut().insert(r.clone());
+        }
         async move { Ok::<_, Infallible>(handle(&server, req).await) }
     });
     let conn = hyper::server::conn::http1::Builder::new()
@@ -415,6 +554,7 @@ async fn open_link(
         client_name,
         link_id,
         last_seq,
+        relayed: req.extensions().get::<Relayed>().cloned(),
     };
     let pending = match server.open_link(&tok, &lreq).await {
         Ok(p) => p,
