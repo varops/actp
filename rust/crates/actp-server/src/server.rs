@@ -47,6 +47,8 @@ pub struct Options {
     /// Checks callers' papers against their issuer in org mode
     /// (`server.org`). Org mode needs one; nobody gets in without it.
     pub papers_verifier: Option<Arc<dyn crate::org::PapersVerifier>>,
+    /// How long the papers verifier may take (10 s).
+    pub verify_timeout: Duration,
 }
 
 impl Default for Options {
@@ -64,6 +66,7 @@ impl Default for Options {
             max_held_bytes: 8 << 20,
             authenticator: Arc::new(ConfigTokens),
             papers_verifier: None,
+            verify_timeout: crate::org::VERIFY_TIMEOUT,
         }
     }
 }
@@ -104,6 +107,8 @@ pub(crate) struct Inner {
     org_stopped: AtomicBool,
     /// Org mode: when each (person, refusal) was last written, and repeats since.
     refusals: Mutex<RefusalLog>,
+    /// Relay mode: the address the relay knows this machine by.
+    relay_machine: Mutex<Option<String>>,
 }
 
 /// A running server. Cheap to clone.
@@ -251,6 +256,7 @@ impl Server {
                 pids_closed: Mutex::new(false),
                 org_stopped: AtomicBool::new(false),
                 refusals: Mutex::new(HashMap::new()),
+                relay_machine: Mutex::new(None),
                 opts,
             }),
         };
@@ -335,9 +341,24 @@ impl Server {
     pub async fn authenticate(&self, presented: &str) -> Result<Token, crate::auth::Refused> {
         let cfg = self.config();
         let res = match &cfg.org {
+            // The relay knows this machine by another name than the papers
+            // must carry: a misconfigured machine (a copied config, say)
+            // would otherwise take papers meant for another one.
+            Some(org)
+                if lock(&self.inner.relay_machine)
+                    .as_deref()
+                    .is_some_and(|m| m != org.machine) =>
+            {
+                Err(crate::auth::Refused::new("org_machine_mismatch"))
+            }
             Some(org) => {
-                crate::org::authenticate(self.inner.opts.papers_verifier.as_deref(), org, presented)
-                    .await
+                crate::org::authenticate(
+                    self.inner.opts.papers_verifier.as_deref(),
+                    org,
+                    presented,
+                    self.inner.opts.verify_timeout,
+                )
+                .await
             }
             None => {
                 self.inner
@@ -352,7 +373,13 @@ impl Server {
             // audited: they name a person. Junk costs a caller nothing, so
             // it is not written, like an unknown token. A person's refusals
             // are written once a minute per reason, with a count of repeats.
-            if let Some(principal) = &r.principal {
+            // A principal unfit for the log (from a custom authenticator) is
+            // treated as no principal.
+            let principal = r
+                .principal
+                .as_ref()
+                .filter(|p| crate::org::valid_caller_id(p));
+            if let Some(principal) = principal {
                 if let Some(repeats) = self.refusal_due(principal, r.code) {
                     tracing::info!(reason = r.code, principal = %principal, "papers refused");
                     self.inner.audit.event(
@@ -366,6 +393,13 @@ impl Server {
                             ("repeats", actp_proto::gojson::GoValue::Int(repeats as i64)),
                         ],
                     );
+                }
+            } else if r.temporary || r.code == "org_machine_mismatch" {
+                // An identity service that cannot be asked, or a machine
+                // that is misconfigured, refuses everyone: say so, once a
+                // minute.
+                if let Some(repeats) = self.refusal_due("", r.code) {
+                    tracing::warn!(reason = r.code, repeats, "callers cannot be checked");
                 }
             } else if r.code != crate::auth::INVALID_TOKEN {
                 tracing::debug!(reason = r.code, "credentials refused");
@@ -458,6 +492,12 @@ impl Server {
             self.end_all_links("the organization-wide stop is on").await;
         }
         true
+    }
+
+    /// Relay mode: records the address the relay knows this machine by. In
+    /// org mode, papers are refused while it differs from `org.machine`.
+    pub fn set_relay_machine(&self, machine: &str) {
+        *lock(&self.inner.relay_machine) = Some(machine.to_string());
     }
 
     /// Whether the org-wide stop is on.

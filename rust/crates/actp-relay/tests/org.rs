@@ -241,6 +241,22 @@ async fn wrong_expired_and_ungranted_papers_are_refused() {
             assert_eq!((last.0.as_str(), last.1.as_str()), (*want, *who), "{what}");
         }
     }
+    // The same person refused for the same reason again: written once a minute.
+    let other = papers(&v, "dave", "laptop-b");
+    let before = refusals(&a).len();
+    for _ in 0..3 {
+        let (status, _) = request(
+            &pki,
+            env.port,
+            "GET",
+            "/m/laptop-a/api/v1/info",
+            &other,
+            None,
+        )
+        .await;
+        assert_eq!(status, 401);
+    }
+    assert_eq!(refusals(&a).len(), before);
     // Nothing unverified is recorded as a person.
     assert!(refusals(&a).iter().all(|(_, p)| p != "mallory"));
 
@@ -271,6 +287,37 @@ async fn wrong_expired_and_ungranted_papers_are_refused() {
     assert_eq!(status, 503);
     // An issuer that cannot be asked vouches for nobody: not audited either.
     assert_eq!(refusals(&a).len(), before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_machine_configured_for_another_name_takes_no_papers() {
+    let dir = scratch("org-mismatch");
+    let pki = Pki::new(&dir);
+    let env = start_relay(&pki, &dir).await;
+    let v = Arc::new(SharedSecret::new(b"org secret"));
+    // laptop-a's certificate, but a config copied from laptop-x.
+    let mut a = start_laptop_verified(
+        &pki,
+        "laptop-a",
+        env.port,
+        pki.device("laptop-a", None),
+        &org_block("laptop-x"),
+        Some(v.clone()),
+    )
+    .await;
+    a.wait_connected().await;
+    for machine in ["laptop-x", "laptop-a"] {
+        let (status, _) = request(
+            &pki,
+            env.port,
+            "GET",
+            "/m/laptop-a/api/v1/info",
+            &papers(&v, "dave", machine),
+            None,
+        )
+        .await;
+        assert_eq!(status, 401, "papers for {machine}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

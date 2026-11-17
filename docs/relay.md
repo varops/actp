@@ -197,13 +197,15 @@ server:
 
 There are no `tokens` in org mode (a config with both is refused), and no tunnel. A program that runs the server with an `org` section and no verifier fails to start; a reload that would turn org mode on without one is refused and the old config kept.
 
-A verifier has 10 s. If it times out, or says the issuer cannot be asked just now, the caller gets `503 auth_unavailable` with `Retry-After`, not a refusal, so a bridge keeps trying and its session survives a short outage of the identity service.
+A verifier has 10 s. If it times out, or says the issuer cannot be asked just now, the caller gets `503 auth_unavailable` with `Retry-After` on any route, not a refusal. A bridge reconnecting to an open session keeps trying, so the session survives a short outage of the identity service; a bridge that is just starting reports the error. The server logs these at `warn`, once a minute. A verifier must not block (the time limit covers its future only), and one that asks its issuer online should cache or limit, since anyone who can reach the machine can present papers.
+
+In relay mode the machine also compares `org.machine` with the address the relay knows it by. While they differ, every caller is refused (`org_machine_mismatch`, logged at `warn`): a config copied from another machine must not accept papers meant for that machine.
 
 A caller id must be 1 to 256 characters of letters, digits and `.`, `_`, `-`, `@`, `+`, `:`, `=`; papers naming anything else are refused.
 
 A caller sends its papers as the bearer token (`Authorization: Bearer <papers>`), in whatever encoding the verifier reads; papers over 32 KB are refused. The caller then gets `access`, under the name `papers:<caller id>`. Only the same person can resume a link, and link limits count per person. Papers are checked on every request, so a dropped connection is resumed with fresh papers: the bridge library takes a `token_source` that fetches them before each connection. As with revoked tokens, a connection already open runs until it closes. Revoking someone stops their new connections and resumes as soon as the verifier sees it: at once if it asks the issuer each time, when the papers expire if it only checks signatures.
 
-Links belong to a person, but the agent's sessions do not: everyone who gets in with the same `access` can list, load, continue or delete the sessions on that machine, as with a shared token. Give each group of callers that must not see each other's work its own machine or workspace.
+Links belong to a person, but the agent's sessions do not: everyone who gets in with the same `access` can list, load, continue or delete the sessions on that machine, as with a shared token. Callers who must not see each other's work need separate machines.
 
 The machine's audit log records `auth_refused` with the reason and the caller for papers that are genuine but do not let the caller in: `papers_other_machine`, `papers_no_grant`, or a verifier's own code when it names the caller (the test verifier's `papers_expired`). Papers nobody vouches for (`papers_malformed`, a bad signature, an issuer that cannot be asked, `no_papers_verifier`) are refused without an audit line, as unknown tokens are, so they cannot fill the log. The same person refused for the same reason is written once a minute, with `repeats` counting the ones left out. `link_opened` names the caller as `papers:<caller id>`. Token names starting with `papers:` are reserved, and an empty `org:` section is an error, not a quiet return to tokens.
 

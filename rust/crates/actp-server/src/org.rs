@@ -41,6 +41,11 @@ pub type VerifyFuture<'a> = Pin<Box<dyn Future<Output = Result<Caller, Refused>>
 /// Checks papers against their issuer. `machine` is this machine's address;
 /// a verifier for an issuer that binds papers to a machine checks it too.
 ///
+/// `verify` must return its future at once and do the work inside it, without
+/// blocking: the time limit covers the future only. A verifier that asks its
+/// issuer online should cache answers or limit its requests, since anyone who
+/// can reach the machine can present papers.
+///
 /// Refuse on anything doubtful: a bad signature, expired papers, an issuer
 /// that cannot be asked whether the papers still hold. Refusal codes are
 /// written to the audit log, so they must not carry the papers themselves.
@@ -75,6 +80,7 @@ pub async fn authenticate(
     verifier: Option<&dyn PapersVerifier>,
     org: &Org,
     papers: &str,
+    timeout: std::time::Duration,
 ) -> Result<Token, Refused> {
     let Some(verifier) = verifier else {
         return Err(Refused::new("no_papers_verifier"));
@@ -87,18 +93,17 @@ pub async fn authenticate(
     if papers.is_empty() || papers.len() > MAX_PAPERS {
         return Err(Refused::new("papers_malformed"));
     }
-    let caller =
-        match tokio::time::timeout(VERIFY_TIMEOUT, verifier.verify(papers, &org.machine)).await {
-            Err(_) => return Err(Refused::temporary("verifier_timeout")),
-            Ok(Err(mut r)) => {
-                // The verifier's word about who it was, only if fit to log.
-                if r.principal.as_deref().is_some_and(|p| !valid_caller_id(p)) {
-                    r.principal = None;
-                }
-                return Err(r);
+    let caller = match tokio::time::timeout(timeout, verifier.verify(papers, &org.machine)).await {
+        Err(_) => return Err(Refused::temporary("verifier_timeout")),
+        Ok(Err(mut r)) => {
+            // The verifier's word about who it was, only if fit to log.
+            if r.principal.as_deref().is_some_and(|p| !valid_caller_id(p)) {
+                r.principal = None;
             }
-            Ok(Ok(c)) => c,
-        };
+            return Err(r);
+        }
+        Ok(Ok(c)) => c,
+    };
     if !valid_caller_id(&caller.id) {
         return Err(Refused::new("papers_malformed"));
     }
@@ -255,6 +260,8 @@ mod tests {
 
     use serde_json::json;
 
+    use std::sync::Arc;
+
     use super::testing::SharedSecret;
     use super::*;
 
@@ -271,7 +278,83 @@ mod tests {
     }
 
     async fn check(v: &SharedSecret, papers: &str) -> Result<Token, Refused> {
-        authenticate(Some(v), &org(), papers).await
+        authenticate(Some(v), &org(), papers, VERIFY_TIMEOUT).await
+    }
+
+    fn org_config(dir: &std::path::Path) -> crate::config::Server {
+        let yaml = format!(
+            "server:\n  log_dir: '{d}/logs'\n  state_dir: '{d}/state'\n  tokens_file: '{d}/tokens.yaml'\n  workspaces:\n    - name: it\n      path: '{d}'\n  agents:\n    - id: a\n      command: x\n  org:\n    machine: laptop-a\n    require_grant: machines.operate\n    access:\n      agents: [a]\n",
+            d = dir.display()
+        );
+        let c = crate::config::Config::parse(&yaml).unwrap();
+        c.validate().unwrap();
+        c.server.unwrap()
+    }
+
+    #[tokio::test]
+    async fn org_mode_needs_a_verifier_at_start_and_on_reload() {
+        let dir = std::env::temp_dir().join(format!("actp-org-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let opts = || crate::Options {
+            base_env: Some(Vec::new()),
+            read_only: true,
+            ..Default::default()
+        };
+        let sc = org_config(&dir);
+        assert!(crate::Server::new(sc.clone(), opts()).await.is_err());
+
+        // A server in token mode, reloaded into org mode without a verifier,
+        // keeps its old config.
+        let mut tokens = sc.clone();
+        tokens.org = None;
+        let srv = crate::Server::new(tokens, opts()).await.unwrap();
+        srv.reload(sc.clone());
+        assert!(srv.config().org.is_none());
+
+        // With a verifier it starts, and refuses papers while the relay
+        // knows it by another name.
+        let v = Arc::new(SharedSecret::new(b"k"));
+        let srv = crate::Server::new(
+            sc,
+            crate::Options {
+                papers_verifier: Some(v.clone()),
+                ..opts()
+            },
+        )
+        .await
+        .unwrap();
+        let p = v.issue(
+            "dave",
+            "laptop-a",
+            json!({"machines.operate": true}),
+            Duration::from_secs(60),
+        );
+        assert!(srv.authenticate(&p).await.is_ok());
+        srv.set_relay_machine("laptop-b");
+        assert_eq!(
+            srv.authenticate(&p).await.unwrap_err().code,
+            "org_machine_mismatch"
+        );
+        srv.set_relay_machine("laptop-a");
+        assert!(srv.authenticate(&p).await.is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A verifier that never answers.
+    struct Hangs;
+
+    impl PapersVerifier for Hangs {
+        fn verify<'a>(&'a self, _: &'a str, _: &'a str) -> VerifyFuture<'a> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_verifier_that_hangs_is_a_temporary_refusal() {
+        let r = authenticate(Some(&Hangs), &org(), "papers", Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert_eq!((r.code, r.temporary), ("verifier_timeout", true));
     }
 
     #[tokio::test]
@@ -377,7 +460,10 @@ mod tests {
         let r = check(&v, &ok).await.unwrap_err();
         assert_eq!((r.code, r.temporary), ("issuer_unavailable", true));
         assert_eq!(
-            authenticate(None, &org(), &ok).await.unwrap_err().code,
+            authenticate(None, &org(), &ok, VERIFY_TIMEOUT)
+                .await
+                .unwrap_err()
+                .code,
             "no_papers_verifier"
         );
     }
