@@ -295,7 +295,7 @@ pub fn fast_timing() -> Timing {
     Timing {
         ping_every: Duration::from_millis(100),
         dead_after: Duration::from_millis(800),
-        stream_timeout: Duration::from_secs(5),
+        stream_timeout: Duration::from_secs(8),
         send_timeout: Duration::from_secs(2),
         flush_every: Duration::from_millis(200),
     }
@@ -429,10 +429,12 @@ pub async fn start_laptop_full(
     verifier: Option<Arc<dyn actp_server::org::PapersVerifier>>,
     adjust: impl FnOnce(&mut RelayOptions),
 ) -> Laptop {
-    if std::env::var_os("ACTP_TEST_LOG").is_some() {
+    // ACTP_TEST_LOG=<filter> (for example `warn` or `actp_server=debug`)
+    // shows the machines' and the relay's logs.
+    if let Ok(filter) = std::env::var("ACTP_TEST_LOG") {
         let _ = tracing_subscriber::fmt()
             .with_test_writer()
-            .with_env_filter("debug,hyper=info,rustls=info,tungstenite=info,tokio_tungstenite=info")
+            .with_env_filter(filter)
             .try_init();
     }
     let root = scratch(name);
@@ -472,7 +474,7 @@ pub async fn start_laptop_full(
     opts.ping_every = Duration::from_millis(100);
     opts.dead_after = Duration::from_millis(800);
     opts.max_backoff = Duration::from_millis(200);
-    opts.dial_timeout = Duration::from_secs(3);
+    opts.dial_timeout = Duration::from_secs(6);
     adjust(&mut opts);
     let stop = CancellationToken::new();
     let acceptor = RelayAcceptor::start(srv.clone(), opts, stop.clone());

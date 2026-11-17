@@ -841,7 +841,7 @@ async fn busy_timed_out_replaced_and_offline_machines() {
         (status, body["error"].as_str()),
         (504, Some("machine_timeout"))
     );
-    assert!(started.elapsed() >= Duration::from_secs(4));
+    assert!(started.elapsed() >= Duration::from_secs(7));
 
     // The same machine connects again: the older connection is closed.
     let second = dial_as(&pki, env.port, &c, "/relay/v1/connect", PROTOCOL_CONTROL)
@@ -1417,7 +1417,7 @@ async fn a_stop_while_a_tunnel_waits_answers_at_once() {
         Err(Refused::Relay(503, body)) => assert_eq!(body["error"], "org_stopped"),
         other => panic!("{other:?}"),
     }
-    // Long before the 5 s a machine has to open a stream.
+    // Long before the 8 s a machine has to open a stream.
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "{:?}",
