@@ -137,9 +137,18 @@ impl Acceptor for RelayAcceptor {
 /// TLS for the relay from the config: the device certificate as the client
 /// certificate, and the configured roots (or the OS store) for the relay.
 pub fn client_tls(relay: &config::Relay) -> io::Result<Arc<rustls::ClientConfig>> {
+    let (certs, key) = device_chain(relay)?;
+    client_tls_with(relay, certs, key)
+}
+
+/// [`client_tls`] with a device certificate chain and key already read.
+pub(crate) fn client_tls_with(
+    relay: &config::Relay,
+    certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
+) -> io::Result<Arc<rustls::ClientConfig>> {
     use rustls::pki_types::CertificateDer;
     use rustls::pki_types::pem::PemObject;
-    let (certs, key) = device_chain(relay)?;
     let mut roots = rustls::RootCertStore::empty();
     if relay.ca.is_empty() {
         for c in rustls_native_certs::load_native_certs().certs {
@@ -262,23 +271,30 @@ async fn control_loop(
             tls: opts.tls.clone(),
             e2e: opts.e2e.clone(),
         }));
-    let reconnect = Arc::new(tokio::sync::Notify::new());
+    let generation: crate::continuity::Generation = Arc::new(watch::channel(0u64).0);
+    let mut generations = generation.subscribe();
     if let Some(files) = opts.continuity.clone() {
         tokio::spawn(crate::continuity::run(
             files,
             identity.clone(),
+            generation.clone(),
             status.subscribe(),
-            reconnect.clone(),
             opts.continuity_every,
             shutdown.clone(),
         ));
     }
+    // A `.next` pair being tried after the relay refused the current key:
+    // the relay may have moved the pin already (a lost answer, files that
+    // could not be put in place, an admin re-pin to the new key).
+    let mut trial: Option<(crate::continuity::Pair, crate::continuity::Identity)> = None;
+    let mut last_trial: Option<Instant> = None;
     loop {
         {
             let id = identity.read().unwrap_or_else(|p| p.into_inner());
             opts.tls = id.tls.clone();
             opts.e2e = id.e2e.clone();
         }
+        let dialed_generation = *generations.borrow_and_update();
         let _ = status.send(Status::Connecting);
         let started = Instant::now();
         let dialed = tokio::select! {
@@ -288,9 +304,15 @@ async fn control_loop(
         let error = match dialed {
             Ok(ws) => {
                 tracing::info!(relay = %opts.url, "connected to the relay");
+                if let (Some((pair, _)), Some(files)) = (trial.take(), &opts.continuity) {
+                    tracing::info!(
+                        "the relay took the next device certificate; putting it in place"
+                    );
+                    crate::continuity::install(files, &pair);
+                }
                 let e = tokio::select! {
                     e = run_control(&server, &opts, ws, &tx, &status, &streams, &shutdown) => e,
-                    _ = reconnect.notified() => {
+                    _ = changed_from(&mut generations, dialed_generation) => {
                         // A new device key: reconnect with it at once.
                         backoff = Duration::from_millis(100);
                         let _ = status.send(Status::Disconnected {
@@ -307,7 +329,36 @@ async fn control_loop(
                 }
                 e
             }
-            Err(e) => e,
+            Err(e) => {
+                if let Some((_, before)) = trial.take() {
+                    // The relay did not take the next pair either: back to
+                    // the current one.
+                    *identity.write().unwrap_or_else(|p| p.into_inner()) = before;
+                } else if e.starts_with("HTTP 403")
+                    && last_trial.is_none_or(|t| t.elapsed() > Duration::from_secs(600))
+                    && let Some(files) = &opts.continuity
+                    && let Some(pair) = crate::continuity::next_pair(files)
+                {
+                    match pair.identity(files) {
+                        Ok(next) => {
+                            tracing::info!(
+                                "the relay refused the current device key; trying the next one"
+                            );
+                            let before = std::mem::replace(
+                                &mut *identity.write().unwrap_or_else(|p| p.into_inner()),
+                                next,
+                            );
+                            trial = Some((pair, before));
+                            last_trial = Some(Instant::now());
+                            continue;
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "the next device certificate cannot be used")
+                        }
+                    }
+                }
+                e
+            }
         };
         tracing::warn!(relay = %opts.url, error = %error, retry_in = ?backoff, "relay connection down");
         let _ = status.send(Status::Disconnected { error });
@@ -316,6 +367,18 @@ async fn control_loop(
         tokio::select! {
             _ = shutdown.cancelled() => return,
             _ = tokio::time::sleep(wait) => {}
+        }
+    }
+}
+
+/// Returns once the identity generation is other than `dialed`.
+async fn changed_from(rx: &mut watch::Receiver<u64>, dialed: u64) {
+    loop {
+        if rx.changed().await.is_err() {
+            return std::future::pending().await;
+        }
+        if *rx.borrow_and_update() != dialed {
+            return;
         }
     }
 }

@@ -1201,19 +1201,41 @@ impl Relay {
         if !actp_proto::relay::rekey_verify(old_leaf.as_ref(), ask.scheme, &message, &signature) {
             return Err("rekey_signature_invalid");
         }
-        let offline = {
+        // Saved before it is answered: a relay that restarted on the old pin
+        // would lock out a machine that has moved to its new key.
+        let _w = self.inner.writing.lock().unwrap_or_else(|p| p.into_inner());
+        let (seen, before) = {
             let mut st = self.st();
             let m = st.machines.entry(machine.to_string()).or_default();
             // The pin may have moved since this connection was checked.
             if m.seen.key.as_deref() != Some(old.key.as_str()) {
                 return Err("rekey_not_pinned");
             }
+            let before = (m.seen.key_since, m.seen.key_until);
             m.seen.key = Some(new.key.clone());
             m.seen.key_since = new.not_before;
             m.seen.key_until = new.not_after;
-            take_offline(&mut st, machine)
+            let seen: BTreeMap<String, Seen> = st
+                .machines
+                .iter()
+                .map(|(k, m)| (k.clone(), m.seen.clone()))
+                .collect();
+            (seen, before)
         };
-        self.inner.seen_dirty.store(true, Ordering::SeqCst);
+        if let Err(e) = self.inner.store.save_seen(&seen) {
+            tracing::error!(error = %e, machine, "cannot save a moved pin: keeping the old one");
+            let mut st = self.st();
+            if let Some(m) = st.machines.get_mut(machine)
+                && m.seen.key.as_deref() == Some(new.key.as_str())
+            {
+                m.seen.key = Some(old.key.clone());
+                (m.seen.key_since, m.seen.key_until) = before;
+            }
+            return Err("rekey_not_saved");
+        }
+        self.forget_nonces(machine);
+        // The machine reconnects on its new key by itself; a connection
+        // left on the old one is cut by the next recheck (`key_changed`).
         self.inner.audit.event(
             "machine_key_continued",
             [
@@ -1222,10 +1244,16 @@ impl Relay {
                 ("new_key", json!(new.key)),
             ],
         );
-        if let Some(o) = offline {
-            self.went_offline(machine, o, "key_continued");
-        }
         Ok(new.key)
+    }
+
+    /// Forgets `machine`'s open continuity nonces (its pin moved).
+    fn forget_nonces(&self, machine: &str) {
+        self.inner
+            .rekey_nonces
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|_, (n, _)| n != machine);
     }
 
     /// Re-pins `machine`: to `key` (the SHA-256 of the public key, as
@@ -1246,6 +1274,7 @@ impl Relay {
             (had, take_offline(&mut st, machine))
         };
         self.inner.seen_dirty.store(true, Ordering::SeqCst);
+        self.forget_nonces(machine);
         self.inner.audit.event(
             "machine_repinned",
             [

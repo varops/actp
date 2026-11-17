@@ -222,6 +222,11 @@ async fn rekey(relay: &Relay, peer: &Peer, req: Request<Incoming>, path: &str) -
             StatusCode::OK,
             json!({ "machine": machine, "key": new_key }).to_string(),
         ),
+        Err("rekey_not_saved") => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "rekey_not_saved",
+            "the relay could not record the new key: the old one stays pinned, try again later",
+        ),
         Err(why) => {
             relay.refusal(
                 "machine_refused",

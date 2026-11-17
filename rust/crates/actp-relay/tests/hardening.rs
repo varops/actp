@@ -600,6 +600,9 @@ async fn a_machine_moves_to_its_next_key_with_the_old_keys_proof() {
     let env = start_relay(&pki, &dir).await;
     let (cert, key) = device_for_days(&pki, "laptop-a", "current", 365);
     let old_key = key_of(&cert);
+    let old_pair = (dir.join("old-copy.pem"), dir.join("old-copy.key"));
+    std::fs::copy(&cert, &old_pair.0).unwrap();
+    std::fs::copy(&key, &old_pair.1).unwrap();
     let files = actp_server::config::Relay {
         url: format!("wss://localhost:{}", env.port),
         cert: cert.to_string_lossy().into_owned(),
@@ -644,16 +647,27 @@ async fn a_machine_moves_to_its_next_key_with_the_old_keys_proof() {
         })
     })
     .await;
-    assert!(
-        env.audit_has("machine_offline", |e| e["machine"] == "laptop-a"
-            && e["reason"] == "key_continued")
-    );
     eventually("installed", || key_of(&cert) == new_key).await;
-    assert_eq!(
-        key_of(std::path::Path::new(&format!("{}.prev", cert.display()))),
-        old_key
-    );
-    assert!(!std::path::Path::new(&format!("{}.next", cert.display())).exists());
+    // The exact files proved, the .next pair gone, nothing staged left,
+    // the old key not kept, the key readable by its owner only.
+    for gone in [".next", ".staged", ".prev"] {
+        assert!(
+            !std::path::Path::new(&format!("{}{gone}", cert.display())).exists(),
+            "{gone}"
+        );
+        assert!(
+            !std::path::Path::new(&format!("{}{gone}", key.display())).exists(),
+            "{gone}"
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
     laptop.wait_connected().await;
     eventually("reconnected", || {
         env.relay.machines().iter().any(|m| {
@@ -673,17 +687,98 @@ async fn a_machine_moves_to_its_next_key_with_the_old_keys_proof() {
     .await;
     assert_eq!((status, body["name"].as_str()), (200, Some("laptop-a")));
     assert!(is(
-        &as_machine(
-            &pki,
-            env.port,
-            &(
-                PathBuf::from(format!("{}.prev", cert.display())),
-                PathBuf::from(format!("{}.prev", key.display()))
-            )
-        )
-        .await,
+        &as_machine(&pki, env.port, &old_pair).await,
         KEY_CHANGED
     ));
+    drop(laptop);
+}
+
+/// A laptop on `cert` with continuity on, looking every `every`.
+async fn continuity_laptop(
+    pki: &Pki,
+    env: &RelayEnv,
+    cert: &(PathBuf, PathBuf),
+    every: Duration,
+) -> Laptop {
+    let files = actp_server::config::Relay {
+        url: format!("wss://localhost:{}", env.port),
+        cert: cert.0.to_string_lossy().into_owned(),
+        key: cert.1.to_string_lossy().into_owned(),
+        ca: pki.dir.join("relay-ca.pem").to_string_lossy().into_owned(),
+    };
+    start_laptop_full(pki, "laptop-a", env.port, cert.clone(), "", None, |o| {
+        o.continuity = Some(files.clone());
+        o.continuity_every = every;
+    })
+    .await
+}
+
+/// Puts `pair` as `cert`'s `.next` pair.
+fn put_next(cert: &(PathBuf, PathBuf), pair: &(PathBuf, PathBuf)) {
+    std::fs::copy(&pair.0, format!("{}.next", cert.0.display())).unwrap();
+    std::fs::copy(&pair.1, format!("{}.next", cert.1.display())).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_machine_that_cannot_put_the_files_in_place_asks_nothing() {
+    let dir = scratch("continuity-stage");
+    let pki = Pki::new(&dir);
+    let env = start_relay(&pki, &dir).await;
+    let cert = device_for_days(&pki, "laptop-a", "current", 365);
+    let mut laptop = continuity_laptop(&pki, &env, &cert, Duration::from_millis(200)).await;
+    laptop.wait_connected().await;
+    // Something in the way of the staged key: staging fails.
+    std::fs::create_dir(format!("{}.staged", cert.1.display())).unwrap();
+    std::fs::create_dir(format!("{}.staged/x", cert.1.display())).unwrap();
+    let next = device_for_days(&pki, "laptop-a", "renewed", 365);
+    put_next(&cert, &next);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    // No nonce asked for, nothing moved, still connected on the old key.
+    assert!(!env.audit_has("machine_key_continued", |_| true));
+    assert_eq!(
+        env.relay.machines()[0].key.as_deref(),
+        Some(key_of(&cert.0).as_str())
+    );
+    assert!(env.relay.machines()[0].online);
+    drop(laptop);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_machine_takes_up_its_next_key_when_the_relay_already_moved_the_pin() {
+    let dir = scratch("continuity-fallback");
+    let pki = Pki::new(&dir);
+    let env = start_relay(&pki, &dir).await;
+    let cert = device_for_days(&pki, "laptop-a", "current", 365);
+    // It would not look for the next pair itself for an hour.
+    let mut laptop = continuity_laptop(&pki, &env, &cert, Duration::from_secs(3600)).await;
+    laptop.wait_connected().await;
+    let next = device_for_days(&pki, "laptop-a", "renewed", 365);
+    let new_key = key_of(&next.0);
+    put_next(&cert, &next);
+    // The pin moves without the machine taking part: an admin re-pins it
+    // to the new key (as when the relay's answer to it was lost).
+    let (status, _) = request(
+        &pki,
+        env.port,
+        "POST",
+        "/relay/v1/repin",
+        ADMIN,
+        Some(json!({"machine": "laptop-a", "reason": "renewed", "key": new_key})),
+    )
+    .await;
+    assert_eq!(status, 200);
+    // Refused on the old key, the machine tries the next pair, is taken,
+    // and puts it in place.
+    eventually("back on the new key", || {
+        env.relay
+            .machines()
+            .iter()
+            .any(|m| m.machine == "laptop-a" && m.online)
+    })
+    .await;
+    eventually("installed", || key_of(&cert.0) == new_key).await;
+    assert!(!std::path::Path::new(&format!("{}.next", cert.0.display())).exists());
+    assert!(is(&as_machine(&pki, env.port, &next).await, ACCEPTED));
     drop(laptop);
 }
 
@@ -691,7 +786,12 @@ async fn a_machine_moves_to_its_next_key_with_the_old_keys_proof() {
 async fn continuity_proofs_are_checked() {
     let dir = scratch("continuity-proofs");
     let pki = Pki::new(&dir);
-    let env = start_relay(&pki, &dir).await;
+    // No timed writes of machines.json: only what the relay saves at once.
+    let timing = Timing {
+        flush_every: Duration::from_secs(3600),
+        ..fast_timing()
+    };
+    let env = start_relay_timed(&pki, &dir, "", timing).await;
     // Off by default: no window.
     let cfg = actp_relay::config::Config::parse(&relay_yaml(&pki, &dir, "")).unwrap();
     assert_eq!(cfg.machine_key_renewal_days, 0);
@@ -836,6 +936,9 @@ async fn continuity_proofs_are_checked() {
     let good = proof(&next, &old, "laptop-a", &n, &n);
     let (s, b) = post_as(&pki, env.port, &old, rekey, good.clone()).await;
     assert_eq!(s, 200, "{b}");
+    // Saved before it was answered.
+    let saved = std::fs::read_to_string(dir.join("state").join("machines.json")).unwrap();
+    assert!(saved.contains(&key_of(&next.0)), "{saved}");
     assert_eq!(b["key"], key_of(&next.0).as_str());
     assert!(
         env.audit_has("machine_key_continued", |e| e["machine"] == "laptop-a"
@@ -844,6 +947,13 @@ async fn continuity_proofs_are_checked() {
     );
     let (s, b) = post_as(&pki, env.port, &old, rekey, good).await;
     assert_eq!((s, b["error"].as_str()), (403, Some("machine_key_changed")));
+    assert!(is(&as_machine(&pki, env.port, &next).await, ACCEPTED));
+    assert!(is(&as_machine(&pki, env.port, &old).await, KEY_CHANGED));
+
+    // The move was saved before it was answered: a restart keeps it.
+    drop(env);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let env = start_relay(&pki, &dir).await;
     assert!(is(&as_machine(&pki, env.port, &next).await, ACCEPTED));
     assert!(is(&as_machine(&pki, env.port, &old).await, KEY_CHANGED));
 
@@ -861,9 +971,23 @@ async fn continuity_proofs_are_checked() {
         .0;
     }
     assert_eq!(last, 429);
-    // GET is not a way in.
+    // A malformed request, and GET.
     let (s, _) = post_as(&pki, env.port, &next, "/relay/v1/rekey", json!({"x": 1})).await;
     assert_eq!(s, 400);
+    let tls = device_tls(&pki, env.port, &next).await;
+    let (mut sender, conn) =
+        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tls))
+            .await
+            .unwrap();
+    tokio::spawn(conn);
+    let req = http::Request::get("/relay/v1/rekey/challenge")
+        .header("host", "localhost")
+        .body(http_body_util::Empty::<bytes::Bytes>::new())
+        .unwrap();
+    assert_eq!(
+        sender.send_request(req).await.unwrap().status().as_u16(),
+        405
+    );
 }
 
 #[test]
@@ -881,13 +1005,21 @@ fn continuity_proofs_work_for_each_key_type_and_only_as_signed() {
             .to_vec()
     };
     let other = cert_for(&KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap());
-    for alg in [
-        &PKCS_ED25519,
-        &PKCS_ECDSA_P256_SHA256,
-        &PKCS_ECDSA_P384_SHA384,
-    ] {
-        let key = KeyPair::generate_for(alg).unwrap();
-        let cert = cert_for(&key);
+    // RSA keys cannot be generated with ring: a fixed test key, used only here.
+    let rsa = KeyPair::from_pem_and_sign_algo(
+        include_str!("fixtures/rsa-2048-test.key"),
+        &rcgen::PKCS_RSA_SHA256,
+    )
+    .unwrap();
+    let keys = [
+        KeyPair::generate_for(&PKCS_ED25519).unwrap(),
+        KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap(),
+        KeyPair::generate_for(&PKCS_ECDSA_P384_SHA384).unwrap(),
+        rsa,
+    ];
+    for key in &keys {
+        let alg = key.algorithm();
+        let cert = cert_for(key);
         let der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
         let msg = actp_proto::relay::rekey_message("laptop-a", &"ab".repeat(32), b"next leaf");
         let (scheme, sig) = actp_proto::relay::rekey_sign(&der, &msg).unwrap();

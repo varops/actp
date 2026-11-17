@@ -122,9 +122,9 @@ Any certificate under `device_ca` counts as a machine, so use roots that sign on
 
 The first device certificate the relay sees for a machine name pins the name to that certificate's public key (its SubjectPublicKeyInfo, by SHA-256), kept in `state_dir/machines.json` with the certificate's validity. A certificate for the same name with the same key, re-issued or renewed, is taken as before. A certificate with another key, though the org's CA signed it, is refused: its connection counts as anyone's, its requests get `403 machine_key_changed`, and `machine_key_refused` records both keys, once a minute per machine with a count of the rest.
 
-A machine moves its name to a new key by **key continuity**, with the old key's proof. The MDM puts the renewed certificate and its key next to the current ones, as `<cert>.next` and `<key>.next` (the paths in the machine's `relay:` section, plus `.next`). The machine checks for them every minute while connected. When it finds them:
+A machine moves its name to a new key by **key continuity**, with the old key's proof. The MDM puts the renewed certificate and its key next to the current ones, as `<cert>.next` and `<key>.next` (the paths in the machine's `relay:` section, plus `.next`). The machine checks for them every minute while connected. When it finds them, it reads the pair once and checks that the key is the certificate's. It then writes the pair's exact bytes beside the current files as `.staged`: the key readable by its owner only, both synced. If that cannot be done (a folder it may not write, a full disk), it asks nothing. Then:
 
-1. It asks the relay for a nonce: `POST /relay/v1/rekey/challenge`, on its current, pinned certificate. The answer is `{"nonce": "<64 hex>"}`. A nonce is good once, for this machine, for 60 seconds, and at most four are open per machine.
+1. It asks the relay for a nonce: `POST /relay/v1/rekey/challenge`, on its current, pinned certificate. The answer is `{"nonce": "<64 hex>"}`. A nonce is good once, for this machine, for 60 seconds. At most four are open per machine (`429 too_many_challenges`), and 10 000 in all.
 2. It signs, with the current key, `actp-relay-rekey-v1\n<address>\n<nonce>\n` followed by the new leaf certificate's DER. It posts `{"certificates": [<base64 DER>, …], "nonce", "scheme", "signature"}` to `POST /relay/v1/rekey`. `scheme` is the TLS signature scheme number: Ed25519, ECDSA P-256 or P-384, or RSA-PSS SHA-256.
 3. The relay moves the pin only when every check holds:
    - the nonce is fresh, and was given to this machine;
@@ -132,13 +132,21 @@ A machine moves its name to a new key by **key continuity**, with the old key's 
    - the signature verifies with the pinned key.
 
    The nonce is used up whatever the outcome, so a proof cannot be replayed.
-4. The pin moves to the new key. `machine_key_continued` records both keys, and the machine's connection on the old key is cut with its sessions (`machine_offline`, reason `key_continued`). The machine keeps its old files as `<cert>.prev` and `<key>.prev`, moves the next ones into place, and reconnects with them.
+4. The pin moves to the new key. It is saved to `machines.json` before the relay answers; if it cannot be saved, the old pin stays and the answer is `503 rekey_not_saved`. `machine_key_continued` records both keys, and the machine's open nonces are dropped.
+5. The machine switches to the new identity in memory, for both its TLS to the relay and the end-to-end TLS to callers, and reconnects with it. Only then does it put the staged files in place over the current ones (key, then certificate). It removes the `.next` pair if it still holds what was proved. The old key is not kept. If the machine does not reconnect, the relay cuts its connection on the old key within ten seconds (`machine_offline`, reason `key_changed`).
 
-A refusal answers `403` with its reason (`rekey_nonce_unknown`, `rekey_certificate_invalid`, `rekey_other_machine`, `rekey_same_key`, `rekey_signature_invalid`, `rekey_not_pinned`), and is recorded as `machine_refused` with that reason. The machine tries again a minute later. A certificate for the name with a new key and no such proof, from the org's own CA included, is never taken: it cannot even ask for a nonce.
+If something goes wrong after the relay moved the pin (its answer was lost, the files could not be put in place, the machine restarted), the relay refuses the old key at the next connection. The machine then tries its `.next` pair, and keeps it, putting it in place, if the relay takes it. The same path takes up a key an admin re-pinned the machine to, as long as the `.next` pair is there.
+
+A refusal answers with its reason, recorded as `machine_refused`:
+- `403` with `rekey_nonce_unknown`, `rekey_certificate_invalid`, `rekey_other_machine`, `rekey_same_key`, `rekey_signature_invalid` or `rekey_not_pinned`;
+- `400` for a malformed request, `405` for anything but `POST`;
+- the routes' own `403 machine_key_changed`, `machine_blocked` or `bad_device_certificate` when the connection's certificate is not the machine's pinned one.
+
+The machine tries again a minute later. A certificate for the name with a new key and no such proof, from the org's own CA included, is never taken: it cannot even ask for a nonce.
 
 **Renewal window, off by default.** An operator may set `machine_key_renewal_days` (at most 90). A certificate with another key is then also taken without the proof when all of these hold: the pinned certificate expires within that many days (or has expired); the new certificate was issued after the pinned one; and it expires after it. `machine_key_renewed` records it, and the old key's connection is cut (`key_renewed`). The relay warns at start and on reload while the window is above 0. Inside the window, the relay cannot tell a renewal from a second certificate issued at the same time by mistake or by someone who reached the MDM; the real laptop would then be cut off and refused. Use it only for machines that cannot do key continuity.
 
-When a machine cannot prove its new key (it was offline past its certificate's expiry, was reinstalled, or lost its key), an admin re-pins it, best to the new key itself (the SHA-256 of its public key, as lowercase hex):
+When a machine cannot prove its new key (it was offline past its certificate's expiry, was reinstalled, or lost its key), an admin re-pins it. With the new certificate in the machine's `.next` files, the machine takes it up by itself once re-pinned; otherwise the new certificate goes in place of the old on the machine. Best, re-pin it to the new key itself (the SHA-256 of its public key, as lowercase hex):
 
 ```bash
 curl -X POST -H "Authorization: Bearer $ADMIN" -d '{"machine": "C02XK1ABJG5H", "reason": "reinstalled, ticket 4411", "key": "9f86d0…"}' https://relay.example.com/relay/v1/repin
@@ -255,7 +263,7 @@ Keep `state_dir` with the relay: a relay that starts without its `stop.json` kno
 | --- | --- |
 | `machine_online` | `machine`, `remote` |
 | `machine_replaced` | `machine`, `remote`, `old_certificate`, `new_certificate` (SHA-256 fingerprints) |
-| `machine_offline` | `machine`, `seconds`, `reason` (`closed`, `silent`, `blocked`, `certificate_invalid`, `key_changed`, `key_continued`, `key_renewed`, `repinned`, `relay stopping`, …) |
+| `machine_offline` | `machine`, `seconds`, `reason` (`closed`, `silent`, `blocked`, `certificate_invalid`, `key_changed`, `key_renewed`, `repinned`, `relay stopping`, …) |
 | `machine_refused` | `remote`, `route`, `reason`, and `machine` when the certificate named one |
 | `session_open` | `session`, `machine`, `caller`, `caller_certificate` (SHA-256), `on_behalf_of` (when the caller named one), `remote` |
 | `session_closed` | `session`, `machine`, `caller`, `seconds`, `bytes_to_machine`, `bytes_to_caller`, `reason` (`closed`, `idle`, `org_stop`, `machine_offline`, `blocked`, `certificate_invalid`, `caller_blocked`, `caller_certificate_invalid`, `relay_stopping`, `error`, `upgrade_failed`) |
