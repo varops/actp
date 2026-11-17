@@ -565,6 +565,7 @@ async fn callers_are_rate_limited_and_floods_do_not_flood_the_audit() {
     let dir = scratch("rate");
     let pki = Pki::new(&dir);
     let env = start_relay_with(&pki, &dir, "caller_rate: {per_second: 1, burst: 30}\n").await;
+    let started = std::time::Instant::now();
     let mut statuses = Vec::new();
     for _ in 0..40 {
         statuses.push(
@@ -573,9 +574,14 @@ async fn callers_are_rate_limited_and_floods_do_not_flood_the_audit() {
                 .0,
         );
     }
-    assert_eq!(statuses.iter().filter(|s| **s == 503).count(), 30);
-    assert_eq!(statuses.iter().filter(|s| **s == 429).count(), 10);
-    // 30 refusals, 20 written, the rest counted.
+    // The burst of 30, plus one a second refilled while the test ran.
+    let refill = started.elapsed().as_secs() as usize + 1;
+    let through = statuses.iter().filter(|s| **s == 503).count();
+    let limited = statuses.iter().filter(|s| **s == 429).count();
+    assert!((30..=30 + refill).contains(&through), "{statuses:?}");
+    assert_eq!(through + limited, 40);
+    assert!(limited >= 10 - refill.min(10), "{statuses:?}");
+    // Of the refusals, 20 written, the rest counted.
     let refused = || {
         env.audit()
             .iter()
@@ -583,10 +589,15 @@ async fn callers_are_rate_limited_and_floods_do_not_flood_the_audit() {
             .count()
     };
     assert_eq!(refused(), 20);
+    let left_out = (through - 20) as u64;
+    // Counted per flush, so possibly over several lines.
     eventually("the count of refusals left out", || {
-        env.audit_has("refusals_not_logged", |e| {
-            e["kind"] == "caller_refused" && e["count"] == 10
-        })
+        env.audit()
+            .iter()
+            .filter(|e| e["event"] == "refusals_not_logged" && e["kind"] == "caller_refused")
+            .map(|e| e["count"].as_u64().unwrap_or(0))
+            .sum::<u64>()
+            == left_out
     })
     .await;
 }
