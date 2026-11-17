@@ -10,6 +10,7 @@
 //! | `GET /relay/v1/machines` | admin token | who is online, last seen |
 //! | `GET /relay/v1/stop` | admin token | the org-wide stop |
 //! | `POST /relay/v1/stop`, `POST /relay/v1/release` | admin token | press, release (`{"reason": …}`) |
+//! | `POST /relay/v1/repin` | admin token | forget or set a machine's pinned key (`{"machine": …, "reason": …, "key"?: …}`) |
 //!
 //! Caller and management routes are rate limited per IP address. The relay
 //! never reads what a tunnel carries: the caller's TLS ends at the machine
@@ -220,6 +221,12 @@ fn machine_of(relay: &Relay, peer: &Peer, route: &str) -> Result<String, Box<Res
         }
         Some(Ok(m)) => match relay.check_key(m, &peer.chain[0]) {
             Ok(()) => Ok(m.clone()),
+            // Recorded by check_key, once a minute per machine.
+            Err("key_changed") => Err(Box::new(error(
+                StatusCode::FORBIDDEN,
+                "machine_key_changed",
+                "this machine's certificate has a key the relay has not seen for it: an admin must re-pin it",
+            ))),
             Err(why) => {
                 relay.refusal(
                     "machine_refused",
@@ -232,8 +239,8 @@ fn machine_of(relay: &Relay, peer: &Peer, route: &str) -> Result<String, Box<Res
                 );
                 Err(Box::new(error(
                     StatusCode::FORBIDDEN,
-                    "machine_key_changed",
-                    "this machine's certificate has a key the relay has not seen for it: an admin must re-pin it",
+                    "bad_device_certificate",
+                    "the relay cannot read this device certificate's key",
                 )))
             }
         },
@@ -887,7 +894,27 @@ async fn admin(relay: &Relay, peer: &Peer, req: Request<Incoming>, path: &str) -
                     "say which machine and why: {\"machine\": \"…\", \"reason\": \"…\"}",
                 );
             }
-            let was = relay.repin(&by, &machine, &reason);
+            // Optionally the new key itself, so nothing else can be pinned
+            // first: the SHA-256 of its public key, as lowercase hex.
+            let key = match v.get("key") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(k) => match k.as_str() {
+                    Some(k)
+                        if k.len() == 64
+                            && k.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) =>
+                    {
+                        Some(k.to_string())
+                    }
+                    _ => {
+                        return error(
+                            StatusCode::BAD_REQUEST,
+                            "bad_key",
+                            "key is the SHA-256 of the certificate's public key, 64 lowercase hex characters",
+                        );
+                    }
+                },
+            };
+            let was = relay.repin(&by, &machine, key.as_deref(), &reason);
             json_resp(
                 StatusCode::OK,
                 json!({ "machine": machine, "was_pinned": was }).to_string(),

@@ -75,10 +75,16 @@ fn is(got: &(u16, String), want: (u16, &str)) -> bool {
     got.0 == want.0 && got.1 == want.1
 }
 
-/// A device certificate for `cn` with a fresh key, valid for `days` more.
+/// A device certificate for `cn` with a fresh key, valid for `days` more,
+/// issued a day ago.
 fn device_for_days(pki: &Pki, cn: &str, file: &str, days: i64) -> (PathBuf, PathBuf) {
+    device_issued(pki, cn, file, 24, days)
+}
+
+/// [`device_for_days`], issued `hours_ago`.
+fn device_issued(pki: &Pki, cn: &str, file: &str, hours_ago: i64, days: i64) -> (PathBuf, PathBuf) {
     let (c, k) = pki.device_with(cn, None, |p| {
-        p.not_before = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+        p.not_before = time::OffsetDateTime::now_utc() - time::Duration::hours(hours_ago);
         p.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(days);
     });
     let (c2, k2) = (
@@ -108,10 +114,26 @@ async fn a_machine_name_keeps_its_first_key_until_an_admin_repins_it() {
     // though the org's CA signed it, while the pinned one is far from expiry.
     let got = as_machine(&pki, env.port, &second).await;
     assert!(is(&got, KEY_CHANGED), "{got:?}");
+    let pinned_key = key_of(&first.0);
     assert!(
-        env.audit_has("machine_refused", |e| e["machine"] == "laptop-a"
-            && e["reason"] == "key_changed")
+        env.audit_has("machine_key_refused", |e| e["machine"] == "laptop-a"
+            && e["pinned_key"] == pinned_key
+            && e["presented_key"] == key_of(&second.0)
+            && e["repeats"] == 0)
     );
+    // Its own record, once a minute per machine, whatever else is refused.
+    assert!(is(&as_machine(&pki, env.port, &second).await, KEY_CHANGED));
+    let refused = |env: &RelayEnv| {
+        env.audit()
+            .iter()
+            .filter(|e| e["event"] == "machine_key_refused")
+            .count()
+    };
+    assert_eq!(refused(&env), 1);
+    // The listing shows the pin.
+    let (_, list) = request(&pki, env.port, "GET", "/relay/v1/machines", ADMIN, None).await;
+    assert_eq!(list["machines"][0]["key"], pinned_key.as_str());
+    assert!(list["machines"][0]["key_until"].is_string());
     // A real machine with it never connects.
     let mut laptop = start_laptop(&pki, "laptop-a", env.port, second.clone()).await;
     laptop
@@ -166,6 +188,7 @@ async fn a_machine_name_keeps_its_first_key_until_an_admin_repins_it() {
         env.audit_has("machine_repinned", |e| e["machine"] == "laptop-a"
             && e["by"] == "dave"
             && e["reason"] == "new disk"
+            && e["key"].is_null()
             && e["was_pinned"] == true)
     );
 
@@ -177,6 +200,42 @@ async fn a_machine_name_keeps_its_first_key_until_an_admin_repins_it() {
         !env.audit_has("machine_key_renewed", |_| true),
         "a re-pin pins afresh: it is not a renewal"
     );
+
+    // Re-pinning to a given key cuts the machine off at once, and only that
+    // key is taken next: neither the old one, however quick, nor any other.
+    let third = device_for_days(&pki, "laptop-a", "third", 365);
+    for bad in [json!("AB".repeat(32)), json!("ab"), json!(7)] {
+        let (status, b) = request(
+            &pki,
+            env.port,
+            "POST",
+            "/relay/v1/repin",
+            ADMIN,
+            Some(json!({"machine": "laptop-a", "reason": "x", "key": bad})),
+        )
+        .await;
+        assert_eq!((status, b["error"].as_str()), (400, Some("bad_key")));
+    }
+    let (status, _) = request(
+        &pki,
+        env.port,
+        "POST",
+        "/relay/v1/repin",
+        ADMIN,
+        Some(json!({"machine": "laptop-a", "reason": "laptop replaced", "key": key_of(&third.0)})),
+    )
+    .await;
+    assert_eq!(status, 200);
+    laptop
+        .wait_status(|s| matches!(s, Status::Disconnected { .. }))
+        .await;
+    assert!(
+        env.audit_has("machine_offline", |e| e["machine"] == "laptop-a"
+            && e["reason"] == "repinned")
+    );
+    assert!(is(&as_machine(&pki, env.port, &second).await, KEY_CHANGED));
+    assert!(is(&as_machine(&pki, env.port, &first).await, KEY_CHANGED));
+    assert!(is(&as_machine(&pki, env.port, &third).await, ACCEPTED));
     drop(laptop);
 
     // Re-pinning a name never seen says so.
@@ -199,12 +258,27 @@ async fn a_new_key_is_taken_as_a_renewal_only_near_the_pinned_expiry() {
     let env = start_relay(&pki, &dir).await;
 
     // Pinned to a certificate with 10 days left: within the 30-day window,
-    // so a certificate with a new key is its renewal.
-    let old = device_for_days(&pki, "laptop-a", "old", 10);
-    let renewed = device_for_days(&pki, "laptop-a", "renewed", 365);
-    let later = device_for_days(&pki, "laptop-a", "later", 365);
-    assert!(is(&as_machine(&pki, env.port, &old).await, ACCEPTED));
+    // so a newer certificate with a new key that outlasts it is its renewal.
+    let old = device_issued(&pki, "laptop-a", "old", 48, 10);
+    let older = device_issued(&pki, "laptop-a", "older", 72, 365);
+    let shorter = device_issued(&pki, "laptop-a", "shorter", 24, 5);
+    let renewed = device_issued(&pki, "laptop-a", "renewed", 24, 365);
+    let later = device_issued(&pki, "laptop-a", "later", 1, 365);
+    let mut laptop = start_laptop(&pki, "laptop-a", env.port, old.clone()).await;
+    laptop.wait_connected().await;
+    // Issued before the pinned certificate, or ending before it: refused.
+    assert!(is(&as_machine(&pki, env.port, &older).await, KEY_CHANGED));
+    assert!(is(&as_machine(&pki, env.port, &shorter).await, KEY_CHANGED));
     assert!(is(&as_machine(&pki, env.port, &renewed).await, ACCEPTED));
+    // The machine on the old key is cut off at once, and cannot come back.
+    assert!(
+        env.audit_has("machine_offline", |e| e["machine"] == "laptop-a"
+            && e["reason"] == "key_renewed")
+    );
+    laptop
+        .wait_status(|s| matches!(s, Status::Disconnected { error } if error.contains("403")))
+        .await;
+    drop(laptop);
     assert!(
         env.audit_has("machine_key_renewed", |e| e["machine"] == "laptop-a"
             && e["old_key"] != e["new_key"]
@@ -224,6 +298,94 @@ async fn a_new_key_is_taken_as_a_renewal_only_near_the_pinned_expiry() {
     let renewed = device_for_days(&pki, "laptop-b", "renewed", 365);
     assert!(is(&as_machine(&pki, env.port, &old).await, ACCEPTED));
     assert!(is(&as_machine(&pki, env.port, &renewed).await, KEY_CHANGED));
+
+    // More than 90 days would leave a name open most of the time.
+    let bad = relay_yaml(&pki, &dir, "machine_key_renewal_days: 91\n");
+    assert!(actp_relay::config::Config::parse(&bad).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pins_that_cannot_be_read_stop_the_relay_from_starting() {
+    let dir = scratch("pins-damaged");
+    let pki = Pki::new(&dir);
+    let env = start_relay(&pki, &dir).await;
+    let a = pki.device("laptop-a", None);
+    assert!(is(&as_machine(&pki, env.port, &a).await, ACCEPTED));
+    drop(env);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let path = dir.join("state").join("machines.json");
+    assert!(std::fs::read_to_string(&path).unwrap().contains("laptop-a"));
+
+    // Damaged: no start, and the file is left as it was.
+    std::fs::write(&path, b"{\"laptop-a\": {\"first_seen\": 1, \"la").unwrap();
+    let cfg = actp_relay::config::Config::parse(&relay_yaml(&pki, &dir, "")).unwrap();
+    let err = actp_relay::Relay::with_timing(cfg, fast_timing())
+        .err()
+        .expect("refused");
+    assert!(err.to_string().contains("pinned key"), "{err}");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"{\"laptop-a\": {\"first_seen\": 1, \"la"
+    );
+    // Moved aside, the relay starts and pins afresh.
+    std::fs::rename(&path, path.with_extension("bad")).unwrap();
+    let env = start_relay(&pki, &dir).await;
+    assert!(is(&as_machine(&pki, env.port, &a).await, ACCEPTED));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn another_key_cannot_take_a_machines_places_nor_a_machine_anyones() {
+    let dir = scratch("wrong-key-cap");
+    let pki = Pki::new(&dir);
+    let env = start_relay_with(
+        &pki,
+        &dir,
+        "max_connections_per_machine: 2\nmax_connections_per_ip: 3\n",
+    )
+    .await;
+    let real = device_for_days(&pki, "laptop-a", "real", 365);
+    let rogue = device_for_days(&pki, "laptop-a", "rogue", 365);
+    assert!(is(&as_machine(&pki, env.port, &real).await, ACCEPTED));
+
+    // Two connections with another key for the name, kept busy: they count
+    // as anyone's, so the real machine still gets in.
+    let _r1 = device_tls(&pki, env.port, &rogue).await;
+    let _r2 = device_tls(&pki, env.port, &rogue).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // (Held, they would last until the relay's 10 s header timeout: the
+    // real machine must get in well before that, and never be refused.)
+    let mut laptop = start_laptop(&pki, "laptop-a", env.port, real.clone()).await;
+    tokio::time::timeout(Duration::from_secs(3), laptop.wait_connected())
+        .await
+        .expect("the real machine connects at once");
+    assert!(is(&as_machine(&pki, env.port, &real).await, ACCEPTED));
+    assert!(!env.audit_has("connection_refused", |e| e["machine"] == "laptop-a"));
+    drop((_r1, _r2, laptop));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // And a machine's own connections do not count against its address:
+    // three held, and a caller from the same address still gets through.
+    let b = pki.device("laptop-b", None);
+    let c = pki.device("laptop-c", None);
+    let _h = [
+        device_tls(&pki, env.port, &b).await,
+        device_tls(&pki, env.port, &b).await,
+        device_tls(&pki, env.port, &c).await,
+    ];
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (status, _) = request(&pki, env.port, "GET", "/relay/v1/machines", ADMIN, None).await;
+    assert_eq!(status, 200);
+}
+
+/// The SHA-256 of the public key in the certificate at `pem`, as hex.
+fn key_of(pem: &std::path::Path) -> String {
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
+    use sha2::Digest;
+    use x509_parser::prelude::{FromDer, X509Certificate};
+    let der = CertificateDer::from_pem_file(pem).unwrap();
+    let (_, x) = X509Certificate::from_der(der.as_ref()).unwrap();
+    hex::encode(sha2::Sha256::digest(x.public_key().raw))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

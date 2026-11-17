@@ -252,6 +252,10 @@ impl Config {
                 "max_streams_per_machine and max_streams_per_caller must be at least 1".into(),
             );
         }
+        // Longer would leave a name open to a new key most of the time.
+        if self.machine_key_renewal_days > 90 {
+            errs.push("machine_key_renewal_days must be at most 90".into());
+        }
         if self.max_connections_per_machine == 0 {
             errs.push("max_connections_per_machine must be at least 1".into());
         }
