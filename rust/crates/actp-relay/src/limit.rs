@@ -7,7 +7,22 @@ use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// A token bucket per caller IP address.
+/// The address limits count by: IPv4 addresses as they are, IPv6 by their
+/// /64 network (one host usually has a whole /64).
+pub fn ip_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let s = v6.segments();
+                IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+            }
+        },
+    }
+}
+
+/// A token bucket per caller IP address (see [`ip_key`]).
 pub struct RateLimiter {
     inner: Mutex<Buckets>,
 }
@@ -39,6 +54,7 @@ impl RateLimiter {
 
     /// Takes one request from `ip`'s allowance.
     pub fn allow(&self, ip: IpAddr) -> bool {
+        let ip = ip_key(ip);
         let mut b = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
         let (rate, burst) = (b.per_second, b.burst);
@@ -125,6 +141,10 @@ mod tests {
         assert!(r.allow(ip) && r.allow(ip) && r.allow(ip));
         assert!(!r.allow(ip));
         assert!(r.allow(other));
+        let a: IpAddr = "2001:db8:1:2:aaaa::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2:bbbb::2".parse().unwrap();
+        assert_eq!(ip_key(a), ip_key(b));
+        assert_eq!(ip_key("::ffff:192.0.2.1".parse().unwrap()), ip);
 
         let t = Throttle::new(2, Duration::from_secs(60));
         assert!(t.allow("a") && t.allow("a"));

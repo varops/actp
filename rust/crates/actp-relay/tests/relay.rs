@@ -675,9 +675,17 @@ async fn revoked_and_expired_certificates_are_refused_and_cut_off() {
     .await;
     a.wait_connected().await;
     b.wait_connected().await;
+    let mut caller = Caller::start(&pki, env.port, "laptop-a");
+    assert!(
+        caller
+            .call(1, "initialize", json!({"protocolVersion": 1}))
+            .await
+            .get("result")
+            .is_some()
+    );
 
-    // laptop-a's certificate is revoked: a reload cuts it off and it cannot
-    // come back; laptop-b stays.
+    // laptop-a's certificate is revoked: a reload cuts it off, with its
+    // session, and it cannot come back; laptop-b stays.
     let revoked = pki.crl("revoked.crl", &[1001], false);
     let yaml = relay_yaml(&pki, &dir, &crls(&[&revoked]));
     let cfg = actp_relay::config::Config::parse(&yaml).unwrap();
@@ -685,10 +693,15 @@ async fn revoked_and_expired_certificates_are_refused_and_cut_off() {
     env.relay.reload(cfg, tls);
     a.wait_status(|s| !matches!(s, Status::Connected { .. }))
         .await;
-    assert!(
-        env.audit_has("machine_offline", |e| e["machine"] == "laptop-a"
-            && e["reason"] == "certificate_invalid")
-    );
+    eventually("laptop-a cut off with its session", || {
+        env.audit_has("machine_offline", |e| {
+            e["machine"] == "laptop-a" && e["reason"] == "certificate_invalid"
+        }) && env.audit_has("session_closed", |e| {
+            e["machine"] == "laptop-a" && e["reason"] == "certificate_invalid"
+        })
+    })
+    .await;
+    drop(caller);
     tokio::time::sleep(Duration::from_millis(600)).await;
     let online: Vec<String> = env
         .relay
@@ -1000,4 +1013,81 @@ async fn the_machine_checks_what_the_relay_says() {
         .cloned()
         .collect();
     assert_eq!(streams, [format!("/relay/v1/stream/{}", "01".repeat(32))]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tls_sessions_are_never_resumed() {
+    let dir = scratch("resume-tls");
+    let pki = Pki::new(&dir);
+    let env = start_relay(&pki, &dir).await;
+    // One client config, so a resumable session would be reused.
+    let tls = pki.caller_tls();
+    for _ in 0..2 {
+        let tcp = TcpStream::connect(("127.0.0.1", env.port)).await.unwrap();
+        let mut s = tokio_rustls::TlsConnector::from(tls.clone())
+            .connect("localhost".try_into().unwrap(), tcp)
+            .await
+            .unwrap();
+        s.write_all(b"GET /health HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        let _ = tokio::io::AsyncReadExt::read_to_end(&mut s, &mut out).await;
+        assert_eq!(
+            s.get_ref().1.handshake_kind(),
+            Some(rustls::HandshakeKind::Full)
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connections_per_address_are_capped_and_refusals_answered_are_throttled() {
+    let dir = scratch("caps");
+    let pki = Pki::new(&dir);
+    let env = start_relay_with(&pki, &dir, "max_connections_per_ip: 2\n").await;
+    // Two connections held (no TLS yet); the third is closed at once.
+    let _one = TcpStream::connect(("127.0.0.1", env.port)).await.unwrap();
+    let _two = TcpStream::connect(("127.0.0.1", env.port)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut three = TcpStream::connect(("127.0.0.1", env.port)).await.unwrap();
+    let mut buf = [0u8; 1];
+    let n = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::io::AsyncReadExt::read(&mut three, &mut buf),
+    )
+    .await
+    .expect("closed by the relay");
+    assert!(matches!(n, Ok(0) | Err(_)));
+    eventually("the refusal recorded", || {
+        env.audit_has("connection_refused", |e| e["remote"] == "127.0.0.1")
+    })
+    .await;
+    drop((_one, _two));
+
+    // A machine's refusals of callers are throttled in the audit.
+    let mut a = start_laptop(&pki, "laptop-a", env.port, pki.device("laptop-a", None)).await;
+    a.wait_connected().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for _ in 0..25 {
+        let (status, _) = request(
+            &pki,
+            env.port,
+            "GET",
+            "/m/laptop-a/api/v1/info",
+            "wrong",
+            None,
+        )
+        .await;
+        assert_eq!(status, 401);
+    }
+    let answered = env
+        .audit()
+        .iter()
+        .filter(|e| e["event"] == "caller_answered")
+        .count();
+    assert_eq!(answered, 20);
+    // Requests that worked on routes other than links are not recorded.
+    let (status, _) = request(&pki, env.port, "GET", "/m/laptop-a/health", "", None).await;
+    assert_eq!(status, 200);
+    assert!(!env.audit_has("caller_answered", |e| e["status"] == 200));
 }

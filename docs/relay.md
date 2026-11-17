@@ -66,8 +66,8 @@ state_dir: /var/lib/actp-relay            # stop.json, machines.json
 log_dir: /var/log/actp-relay              # audit.jsonl
 max_streams_per_machine: 32
 caller_rate: {per_second: 20, burst: 60}  # per caller IP, for /m/… and the management API
-max_connections: 20000                    # connections held at once
-max_connections_per_ip: 1000              # per IP address: an office behind one NAT address counts as one
+max_connections: 20000                    # connections held at once by anyone but machines
+max_connections_per_ip: 1000              # the same per IP address (IPv6: per /64)
 audit_max_mb: 100                         # audit.jsonl is rotated at this size; ten old files are kept
 admin_tokens:
   - name: dave                            # recorded with every stop and release
@@ -80,9 +80,11 @@ actp-relay serve --config /etc/actp-relay/actp-relay.yaml
 
 The relay must terminate TLS itself: a TLS proxy in front of it would hide the device certificates. It serves from the root path only.
 
-`SIGHUP` reloads the blocked machines, the admin tokens, the rate limits, the device roots and the revocation lists. The listen address, the folders, `audit_max_mb` and the connection limits need a restart.
+`SIGHUP` reloads the blocked machines, the admin tokens, the rate limits, `max_connections_per_ip`, the device roots and the revocation lists. The listen address, the folders, `audit_max_mb` and `max_connections` need a restart.
 
-Device certificates are checked again, not only when a machine connects. The relay checks a machine's certificate against the roots and revocation lists in force on every request it makes, on every reload, and every ten seconds. A machine that is now blocked, or whose certificate has expired or been revoked, is cut off at once with its sessions, and cannot come back. TLS sessions are never resumed, so a reconnect always presents the certificate again.
+The connection limits count every connection from the moment it is accepted, before the TLS handshake (which may take 5 s), and for as long as it lives, sessions included. A connection that proves itself a machine with a valid device certificate stops counting, so callers filling the limits do not keep laptops from reconnecting once their handshake is through. A refused connection is closed at once and recorded as `connection_refused` (throttled).
+
+Device certificates are checked again, not only when a machine connects. The relay checks a machine's certificate against the roots and revocation lists in force on every request it makes, on every reload, and every ten seconds. A machine that is now blocked, or whose certificate has expired or been revoked, is taken off the list at once and cut off with its sessions (links), and cannot come back. A plain request already being answered, such as a listing of agents, finishes. TLS sessions are never resumed, so a reconnect always presents the certificate again.
 
 With `machine_name: uri`, only URIs without a path work as addresses (`urn:device:1234`, not `spiffe://acme/dev/1`), because an address cannot contain `/`.
 
@@ -106,7 +108,7 @@ actp claude@https://relay.example.com/m/C02XK1ABJG5H --token-env ACTP_TOKEN
 | `504 machine_timeout` | The machine did not open a stream or answer in time. |
 | `429 rate_limited` | Too many requests from this IP address (`caller_rate`). |
 
-The relay itself asks callers for nothing; the machine checks them. So anyone who can reach the relay can learn whether a machine of a given address is online, and can make machines do the work of opening a stream for each request, within `caller_rate`. `caller_rate` and `max_connections_per_ip` count per IP address, so callers behind one NAT address share them. Keep the relay off the open internet where the org can.
+The relay itself asks callers for nothing; the machine checks them. So anyone who can reach the relay can learn whether a machine of a given address is online, and can make machines do the work of opening a stream for each request, within `caller_rate`. `caller_rate` and `max_connections_per_ip` count per IP address (per /64 for IPv6), so callers behind one NAT address share them. The rate limit covers every route except the machines' own: `/health` and unknown paths too. Keep the relay off the open internet where the org can.
 
 A session ends at the relay when either side closes, when its machine's control connection is lost (the machine is offline), when the machine is blocked or its certificate stops being valid, or on the org-wide stop. Idle TCP connections are probed with keepalives, so a laptop that vanishes mid-session is noticed within a few minutes.
 
@@ -153,7 +155,8 @@ Keep `state_dir` with the relay: a relay that starts without its `stop.json` kno
 | `machine_refused` | `remote`, `route`, `reason`, and `machine` when the certificate named one |
 | `session_open` | `session`, `machine`, `remote`, `agent`, `link` (first 8 characters), `resumed`, `client_name` |
 | `session_closed` | `session`, `machine`, `seconds`, `bytes_to_machine`, `bytes_to_caller`, `reason` (`closed`, `org_stop`, `machine_offline`, `blocked`, `certificate_invalid`, `relay_stopping`, `error`, `upgrade_failed`) |
-| `caller_answered` | `machine`, `remote`, `route` (the path as the machine routes it, without the query), `status`: every forwarded request that did not become a session (throttled like a refusal when the machine refused it) |
+| `caller_answered` | `machine`, `remote`, `route` (the path as the machine routes it, without the query), `status`: every link request that did not become a session, and every request the machine refused (throttled like a refusal) |
+| `connection_refused` | `remote` (the address, or the IPv6 /64, at its limit) |
 | `caller_refused` | `machine`, `remote`, `reason` |
 | `caller_rate_limited` | `remote` |
 | `org_stop` | `by`, `reason`, `sessions_dropped` |
@@ -163,7 +166,7 @@ Keep `state_dir` with the relay: a relay that starts without its `stop.json` kno
 | `config_reloaded` | `blocked_machines`, `machines_cut` |
 | `refusals_not_logged` | `kind`, `count` |
 
-Of each refusal kind (`caller_refused`, `caller_rate_limited`, `machine_refused`, `admin_refused`, and `caller_answered` with a status of 400 or more), at most 20 a minute are written; the rest are counted in `refusals_not_logged`.
+Of each refusal kind (`caller_refused`, `caller_rate_limited`, `connection_refused`, `machine_refused`, `admin_refused`, and `caller_answered` with a status of 400 or more), at most 20 a minute are written, across all callers; the rest are counted in `refusals_not_logged`. A flood of refusals therefore leaves only a count of everyone's refusals for that minute; sessions, machines and the stop are always recorded.
 
 The stop's own events (`org_stop`, `org_release`, `org_stop_not_saved`, `org_stop_saved`) are also written to `log_dir/org_stops.jsonl`, which is never rotated, so no flood of other events can push them out.
 

@@ -62,6 +62,10 @@ pub(crate) struct Peer {
     pub machine: Option<Result<String, String>>,
     /// That certificate's chain, leaf first, checked again on every request.
     pub chain: Vec<rustls_pki_types::CertificateDer<'static>>,
+    /// The connection's place under the connection limits, kept for as long
+    /// as the connection (or a session it became) lives. `None` for a
+    /// machine that proved itself.
+    pub held: Option<Arc<crate::Held>>,
 }
 
 pub(crate) async fn serve_connection<S>(
@@ -110,22 +114,13 @@ async fn handle(
     shutdown: CancellationToken,
 ) -> Resp {
     let path = req.uri().path().to_string();
-    if path == "/health" {
-        return json_resp(StatusCode::OK, api::health());
-    }
     if path == PATH_CONNECT {
         return machine_control(relay, peer, req, shutdown);
     }
     if let Some(id) = path.strip_prefix(PATH_STREAM) {
         return machine_stream(relay, peer, req, id.to_string());
     }
-    let admin_route = matches!(
-        path.as_str(),
-        "/relay/v1/machines" | "/relay/v1/stop" | "/relay/v1/release"
-    );
-    if !admin_route && !path.starts_with(PATH_MACHINE) {
-        return error(StatusCode::NOT_FOUND, "not_found", "no such route");
-    }
+    // Everything else is open to anyone on the network: rate limited.
     if !relay.callers().allow(peer.remote.ip()) {
         relay.refusal(
             "caller_rate_limited",
@@ -139,6 +134,16 @@ async fn handle(
         r.headers_mut()
             .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
         return r;
+    }
+    if path == "/health" {
+        return json_resp(StatusCode::OK, api::health());
+    }
+    let admin_route = matches!(
+        path.as_str(),
+        "/relay/v1/machines" | "/relay/v1/stop" | "/relay/v1/release"
+    );
+    if !admin_route && !path.starts_with(PATH_MACHINE) {
+        return error(StatusCode::NOT_FOUND, "not_found", "no such route");
     }
     if admin_route {
         return admin(relay, peer, req, &path).await;
@@ -638,11 +643,12 @@ async fn caller(relay: &Relay, peer: &Peer, mut req: Request<Incoming>, rest: &s
             ("route", json!(route)),
             ("status", json!(status.as_u16())),
         ];
-        // Refusals by the machine cost a caller nothing, so they are
-        // throttled like the relay's own.
+        // Link requests are always recorded, refusals by the machine
+        // throttled like the relay's own (they cost a caller nothing).
+        // Other routes that worked (health, info) are not recorded.
         if status.as_u16() >= 400 {
             relay.refusal("caller_answered", fields);
-        } else {
+        } else if agent.is_some() {
             relay.audit().event("caller_answered", fields);
         }
         if status == StatusCode::SWITCHING_PROTOCOLS {
@@ -686,7 +692,9 @@ async fn caller(relay: &Relay, peer: &Peer, mut req: Request<Incoming>, rest: &s
     strip_hop(out.headers_mut());
     let relay2 = relay.clone();
     let caller_upgrade = caller_upgrade.expect("checked above");
+    let held = peer.held.clone();
     tokio::spawn(async move {
+        let _held = held;
         let started = Instant::now();
         let (to_machine, to_caller) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
         let reason = match (caller_upgrade.await, machine_upgrade.await) {

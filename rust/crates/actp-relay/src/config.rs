@@ -124,7 +124,12 @@ impl Config {
     }
 
     pub fn parse(text: &str) -> Result<Config, String> {
-        let cfg: Config = serde_norway::from_str(text).map_err(|e| e.to_string())?;
+        let mut cfg: Config = serde_norway::from_str(text).map_err(|e| e.to_string())?;
+        // hash_token writes lowercase hex; tools such as Get-FileHash write
+        // uppercase. Both mean the same token.
+        for t in &mut cfg.admin_tokens {
+            t.hash = t.hash.to_ascii_lowercase();
+        }
         cfg.validate()?;
         Ok(cfg)
     }

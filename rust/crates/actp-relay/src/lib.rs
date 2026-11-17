@@ -283,15 +283,21 @@ impl Relay {
             .set_rate(cfg.caller_rate.per_second, cfg.caller_rate.burst);
         *self.inner.cfg.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(cfg);
         *self.inner.tls.write().unwrap_or_else(|p| p.into_inner()) = Some(tls);
-        let cut = self.recheck_machines();
-        self.inner.audit.event(
-            "config_reloaded",
-            [
-                ("blocked_machines", json!(blocked)),
-                ("machines_cut", json!(cut)),
-            ],
-        );
+        self.inner
+            .audit
+            .event("config_reloaded", [("blocked_machines", json!(blocked))]);
         tracing::info!("configuration reloaded");
+        // Machines now blocked, or with certificates no longer valid, are cut
+        // off; off the async workers, as checking can take a while.
+        let relay = self.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(h) => {
+                h.spawn_blocking(move || relay.recheck_machines());
+            }
+            Err(_) => {
+                relay.recheck_machines();
+            }
+        }
     }
 
     /// Whether a device certificate chain is valid now, by the TLS setup in force.
@@ -308,34 +314,75 @@ impl Relay {
     /// certificate is no longer valid (expired, revoked, new roots), with its
     /// sessions. Returns how many machines.
     fn recheck_machines(&self) -> usize {
+        // Verify outside the state lock: checking thousands of chains
+        // against a long revocation list takes a while.
         let cfg = self.config();
-        let mut cut: Vec<(Cut, &'static str)> = Vec::new();
-        let mut machines = 0;
-        {
+        let online: Vec<(String, u64, Vec<CertificateDer<'static>>)> = {
             let st = self.st();
-            for (name, m) in &st.machines {
-                let Some(c) = m.conn.as_ref() else { continue };
-                let why = if cfg.blocked_machines.contains(name) {
-                    "blocked"
-                } else if !self.chain_valid(&c.chain) {
-                    "certificate_invalid"
+            st.machines
+                .iter()
+                .filter_map(|(n, m)| m.conn.as_ref().map(|c| (n.clone(), c.id, c.chain.clone())))
+                .collect()
+        };
+        let failing: Vec<(String, u64, &'static str)> = online
+            .into_iter()
+            .filter_map(|(name, id, chain)| {
+                if cfg.blocked_machines.contains(&name) {
+                    Some((name, id, "blocked"))
+                } else if !self.chain_valid(&chain) {
+                    Some((name, id, "certificate_invalid"))
                 } else {
+                    None
+                }
+            })
+            .collect();
+        let mut cut: Vec<(Cut, &'static str)> = Vec::new();
+        let mut gone: Vec<(String, SystemTime, &'static str)> = Vec::new();
+        {
+            let mut st = self.st();
+            for (name, id, why) in &failing {
+                let Some(m) = st.machines.get_mut(name) else {
                     continue;
                 };
-                machines += 1;
-                cut.push((c.cut.clone(), why));
+                if m.conn.as_ref().map(|c| c.id) != Some(*id) {
+                    continue; // reconnected meanwhile, and checked then
+                }
+                // Out of the table at once: no caller is routed to it while
+                // its connection winds down.
+                let c = m.conn.take().expect("checked");
+                m.seen.last_seen = unix(SystemTime::now());
+                cut.push((c.cut, why));
+                gone.push((name.clone(), c.since, why));
+            }
+            for (name, _, why) in &gone {
                 cut.extend(
                     st.sessions
                         .values()
                         .filter(|s| &s.machine == name)
-                        .map(|s| (s.cut.clone(), why)),
+                        .map(|s| (s.cut.clone(), *why)),
                 );
             }
         }
         for (c, why) in cut {
             c.cut(why);
         }
-        machines
+        for (name, since, why) in &gone {
+            self.inner.audit.event(
+                "machine_offline",
+                [
+                    ("machine", json!(name)),
+                    (
+                        "seconds",
+                        json!(since.elapsed().unwrap_or_default().as_secs()),
+                    ),
+                    ("reason", json!(why)),
+                ],
+            );
+        }
+        if !gone.is_empty() {
+            self.inner.seen_dirty.store(true, Ordering::SeqCst);
+        }
+        gone.len()
     }
 
     /// Serves machines and callers on `listener` until `shutdown` is cancelled.
@@ -375,6 +422,10 @@ impl Relay {
             // work is done for them.
             let Some(held) = self.hold_connection(remote.ip()) else {
                 drop(tcp);
+                self.refusal(
+                    "connection_refused",
+                    [("remote", json!(limit::ip_key(remote.ip()).to_string()))],
+                );
                 continue;
             };
             let _ = tcp.set_nodelay(true);
@@ -396,8 +447,7 @@ impl Relay {
             let relay = self.clone();
             let shutdown = shutdown.clone();
             tokio::spawn(async move {
-                let _held = held;
-                let tls = match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(tcp))
+                let tls = match tokio::time::timeout(Duration::from_secs(5), acceptor.accept(tcp))
                     .await
                 {
                     Ok(Ok(s)) => s,
@@ -415,6 +465,13 @@ impl Relay {
                     .map(|c| c.iter().map(|c| c.clone().into_owned()).collect())
                     .unwrap_or_default();
                 let machine = chain.first().map(|c| tls::machine_name(c, which));
+                // A machine that proved itself does not count against the
+                // limits meant for anyone on the network; everyone else's
+                // connection keeps its place, upgrades included.
+                let held = match &machine {
+                    Some(Ok(_)) if relay.chain_valid(&chain) => None,
+                    _ => Some(Arc::new(held)),
+                };
                 http::serve_connection(
                     relay,
                     tls,
@@ -422,6 +479,7 @@ impl Relay {
                         remote,
                         machine,
                         chain,
+                        held,
                     },
                     shutdown,
                 )
@@ -443,6 +501,7 @@ impl Relay {
     fn hold_connection(&self, ip: std::net::IpAddr) -> Option<Held> {
         let permit = self.inner.connections.clone().try_acquire_owned().ok()?;
         let max = self.config().max_connections_per_ip;
+        let ip = limit::ip_key(ip);
         let mut m = self.inner.per_ip.lock().unwrap_or_else(|p| p.into_inner());
         let n = m.entry(ip).or_default();
         if *n >= max {
@@ -480,7 +539,8 @@ impl Relay {
     async fn flush(&self) {
         // Certificates expire and revocation lists go stale while machines
         // stay connected.
-        self.recheck_machines();
+        let relay = self.clone();
+        let _ = tokio::task::spawn_blocking(move || relay.recheck_machines()).await;
         let relay = self.clone();
         let _ = tokio::task::spawn_blocking(move || {
             let _w = relay
@@ -580,9 +640,8 @@ impl Relay {
     /// told, and no caller gets through until [`Relay::release`]. Pressing it
     /// again while it is on keeps the first record.
     pub fn stop(&self, by: &str, reason: &str) -> Stopped {
-        // The writer lock first, as in release: the record saved below is
-        // the one set here, whatever else happens meanwhile.
-        let writing = self.inner.writing.lock().unwrap_or_else(|p| p.into_inner());
+        // Everything is cut before anything is written: a slow disk must not
+        // delay the stop.
         let (stop, sessions, conns, fresh) = {
             let mut st = self.st();
             let fresh = !st.stop.stopped;
@@ -625,9 +684,15 @@ impl Relay {
             tracing::warn!(by, reason, "org-wide stop pressed");
         }
         let saved = {
-            let _w = writing;
-            if fresh || self.inner.stop_unsaved.load(Ordering::SeqCst) {
-                match self.inner.store.save_stop(&stop) {
+            let _w = self.inner.writing.lock().unwrap_or_else(|p| p.into_inner());
+            // What is saved is the stop as it is now, under the writer lock:
+            // a release in between changes it only while holding that lock,
+            // so file and memory agree.
+            let now = self.st().stop.clone();
+            if !now.stopped {
+                true // released meanwhile, and the release was recorded
+            } else if fresh || self.inner.stop_unsaved.load(Ordering::SeqCst) {
+                match self.inner.store.save_stop(&now) {
                     Ok(()) => {
                         self.inner.stop_unsaved.store(false, Ordering::SeqCst);
                         true
@@ -954,7 +1019,7 @@ impl Drop for StreamSlot {
 }
 
 /// A connection's place under the connection limits.
-struct Held {
+pub(crate) struct Held {
     relay: Relay,
     ip: std::net::IpAddr,
     _permit: tokio::sync::OwnedSemaphorePermit,
