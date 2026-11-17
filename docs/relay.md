@@ -41,7 +41,7 @@ Keep the device roots and the caller roots apart, protect the caller certificate
 
 Two things the whole design rests on:
 
-- **Machine names nobody can change.** A caller knows it reached the machine because the certificate names it. Use an identifier fixed by the hardware or the MDM (the serial number, the hardware UUID), never a computer name a user can edit: a laptop renamed after another, with a certificate re-issued to match, would pass as it. The relay records both certificates' fingerprints in `machine_replaced` when a second certificate claims a live machine's name.
+- **Machine names nobody can change.** A caller knows it reached the machine because the certificate names it. Use an identifier fixed by the hardware or the MDM (the serial number, the hardware UUID), never a computer name a user can edit: a laptop renamed after another, with a certificate re-issued to match, would pass as it. The relay pins each name to the key it was first seen with (below), so a second certificate for a name with another key is refused, and it records both certificates' fingerprints in `machine_replaced` when a second certificate claims a live machine's name.
 - **Separate certificate hierarchies.** `device_ca` and `caller_ca` must be separate hierarchies, neither above the other. The relay refuses to start when they share a root (compared by subject and key, so a re-issued root counts) or one root is issued by the other, and refuses at every connection a certificate that is valid as both kinds (nesting deeper than the roots show). Callers check machines against the device roots only, so they rely on this too.
 
 ## The machine
@@ -89,6 +89,9 @@ max_streams_per_caller: 8                 # streams one caller may have to one m
 caller_rate: {per_second: 20, burst: 60}  # per caller IP, for tunnels and the management API
 max_connections: 20000                    # connections held at once by anyone but machines
 max_connections_per_ip: 1000              # the same per IP address (IPv6: per /64)
+max_connections_per_machine: 64           # connections one machine may hold at once
+machine_key_renewal_days: 30              # a new key is taken as a renewal this close to the pinned certificate's expiry; 0: never
+tunnel_idle_seconds: 600                  # a tunnel that carries nothing either way for this long is cut (at least 60)
 audit_max_mb: 100                         # audit.jsonl is rotated at this size; ten old files are kept
 admin_tokens:
   - name: dave                            # recorded with every stop and release
@@ -103,15 +106,29 @@ The relay must terminate TLS itself: a TLS proxy in front of it would hide the d
 
 A caller's name follows the same rules as a machine address (below); a caller certificate whose name does not is refused. `blocked_machines` and `blocked_callers` are compared exactly, case included.
 
-`SIGHUP` reloads the blocked machines and callers, the `issuer` section, the admin tokens, the rate limits, `max_connections_per_ip`, the device and caller roots and the revocation lists. The listen address, the folders, `audit_max_mb` and `max_connections` need a restart.
+`SIGHUP` reloads the blocked machines and callers, the `issuer` section, the admin tokens, the rate limits, `max_connections_per_ip`, `max_connections_per_machine`, `machine_key_renewal_days`, `tunnel_idle_seconds` (for new tunnels), the device and caller roots and the revocation lists. The listen address, the folders, `audit_max_mb` and `max_connections` need a restart.
 
-The connection limits count every connection from the moment it is accepted, before the TLS handshake (which may take 5 s), and for as long as it lives, sessions included. A connection that proves itself a machine with a valid device certificate stops counting, so callers filling the limits do not keep laptops from reconnecting once their handshake is through. A refused connection is closed at once and recorded as `connection_refused` (throttled).
+The connection limits count every connection from the moment it is accepted, before the TLS handshake (which may take 5 s), and for as long as it lives, sessions included. A connection that proves itself a machine with a valid device certificate stops counting, so callers filling the limits do not keep laptops from reconnecting once their handshake is through; it counts against `max_connections_per_machine` instead, so one machine (or a stolen device certificate) cannot hold thousands of connections. A refused connection is closed at once and recorded as `connection_refused` (throttled), with the machine when it was the machine's limit.
+
+A tunnel that carries no bytes either way for `tunnel_idle_seconds` is cut (`session_closed` with reason `idle`): a caller or machine gone quiet without closing does not hold one of the machine's streams for ever. Live sessions are not affected: ACP links send heartbeats every 10 s, and the machine closes an HTTP connection that sends nothing for 10 s itself.
 
 Device certificates are checked again, not only when a machine connects. The relay checks a machine's certificate against the roots and revocation lists in force on every request it makes, on every reload, and every ten seconds. A machine that is now blocked, or whose certificate has expired or been revoked, is taken off the list at once and cut off with its sessions (links), and cannot come back. A plain request already being answered, such as a listing of agents, finishes. TLS sessions are never resumed, so a reconnect always presents the certificate again.
 
 With `machine_name: uri`, only URIs without a path work as addresses (`urn:device:1234`, not `spiffe://acme/dev/1`), because an address cannot contain `/`.
 
 Any certificate under `device_ca` counts as a machine, so use roots that sign only device certificates, not ones that also sign user or Wi-Fi certificates. Revocation lists are checked for the device certificate itself, not its issuers, and a list past its next-update time no longer counts: every machine is then refused and cut off until a fresh list is in place and the relay reloads.
+
+#### Key pinning
+
+The first device certificate the relay sees for a machine name pins the name to that certificate's public key (its SubjectPublicKeyInfo, by SHA-256), kept in `state_dir/machines.json`. A certificate for the same name with the same key, re-issued or renewed, is taken as before. A certificate with another key is refused (`403 machine_key_changed`, and `machine_refused` with reason `key_changed`), even though the org's CA signed it, unless the pinned certificate expires within `machine_key_renewal_days`: then the new key is taken as its renewal, and recorded as `machine_key_renewed` with both keys. With `machine_key_renewal_days: 0` a new key is never taken by itself.
+
+So a second certificate for a laptop's name, issued by mistake or by someone who reached the MDM, cannot take over its name while the laptop's own certificate has time left. When a machine legitimately gets a new key early (a reinstall, a new disk, a lost key), an admin re-pins it:
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN" -d '{"machine": "C02XK1ABJG5H", "reason": "reinstalled, ticket 4411"}' https://relay.example.com/relay/v1/repin
+```
+
+The answer says whether the name was pinned (`{"machine": …, "was_pinned": true}`), and `machine_repinned` records who and why. The next certificate seen for the name is pinned, whoever presents it, so revoke the old certificate first when the old key may be in someone else's hands, and re-pin when the machine is about to reconnect. Pinning is trust on first use: it protects a name from the moment the relay first sees it, not before.
 
 A machine address has 1 to 253 characters: letters, digits and `.`, `-`, `_`, `@`, `:`, `+`, `~`. A certificate whose name does not fit, or that carries more than one name of the chosen kind, is refused. Addresses are compared exactly.
 
@@ -180,7 +197,7 @@ A reload replaces the section and reads `file:` secrets again, so a secret can b
 
 ### Management
 
-All three need an admin token (`Authorization: Bearer …`).
+All three need an admin token (`Authorization: Bearer …`), as does re-pinning (under Key pinning, above).
 
 ```bash
 curl -H "Authorization: Bearer $ADMIN" https://relay.example.com/relay/v1/machines
@@ -219,8 +236,10 @@ Keep `state_dir` with the relay: a relay that starts without its `stop.json` kno
 | `machine_offline` | `machine`, `seconds`, `reason` (`closed`, `silent`, `blocked`, `certificate_invalid`, `relay stopping`, …) |
 | `machine_refused` | `remote`, `route`, `reason`, and `machine` when the certificate named one |
 | `session_open` | `session`, `machine`, `caller`, `remote` |
-| `session_closed` | `session`, `machine`, `caller`, `seconds`, `bytes_to_machine`, `bytes_to_caller`, `reason` (`closed`, `org_stop`, `machine_offline`, `blocked`, `certificate_invalid`, `caller_blocked`, `caller_certificate_invalid`, `relay_stopping`, `error`, `upgrade_failed`) |
-| `connection_refused` | `remote` (the address, or the IPv6 /64, at its limit) |
+| `session_closed` | `session`, `machine`, `caller`, `seconds`, `bytes_to_machine`, `bytes_to_caller`, `reason` (`closed`, `idle`, `org_stop`, `machine_offline`, `blocked`, `certificate_invalid`, `caller_blocked`, `caller_certificate_invalid`, `relay_stopping`, `error`, `upgrade_failed`) |
+| `connection_refused` | `remote` (the address, or the IPv6 /64, at its limit), and `machine` when it was the machine's limit |
+| `machine_key_renewed` | `machine`, `old_key`, `new_key` (SHA-256 of the public keys) |
+| `machine_repinned` | `machine`, `by`, `reason`, `was_pinned` |
 | `caller_refused` | `caller` (when its certificate named one), `machine` (when one was reached), `remote`, `reason` |
 | `caller_rate_limited` | `remote` |
 | `issuer_asked` | `machine`, `path`, `status` |

@@ -22,11 +22,20 @@ pub struct Stop {
     pub at: String,
 }
 
-/// When a machine was seen, in Unix seconds.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// When a machine was seen, in Unix seconds, and the key its name is
+/// pinned to.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Seen {
     pub first_seen: u64,
     pub last_seen: u64,
+    /// SHA-256 of the public key (SubjectPublicKeyInfo) of the device
+    /// certificate this name was first seen with, as hex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// When that certificate expires (Unix seconds): near it, a renewal
+    /// with a new key is taken.
+    #[serde(default)]
+    pub key_until: u64,
 }
 
 pub fn create_private_dir(dir: &Path) -> io::Result<()> {

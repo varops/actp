@@ -67,6 +67,20 @@ pub struct Config {
     pub max_connections: usize,
     #[serde(default = "default_max_connections_per_ip")]
     pub max_connections_per_ip: usize,
+    /// How close to its expiry (days) a machine's pinned certificate must be
+    /// for a certificate with a new key to be taken as its renewal (30).
+    /// Earlier, or with 0, a new key is refused until an admin re-pins.
+    #[serde(default = "default_key_renewal_days")]
+    pub machine_key_renewal_days: u64,
+    /// Device connections held at once per machine, before any becomes a
+    /// stream (64).
+    #[serde(default = "default_max_connections_per_machine")]
+    pub max_connections_per_machine: usize,
+    /// A tunnel that carries nothing either way for this long is cut (600 s,
+    /// at least 60): a peer gone quiet without closing. Live sessions
+    /// carry heartbeats, and the machine closes idle HTTP connections itself.
+    #[serde(default = "default_tunnel_idle_seconds")]
+    pub tunnel_idle_seconds: u64,
     /// The issuer pass-through: questions machines may ask the identity
     /// service through the relay. Off when absent.
     #[serde(default)]
@@ -108,6 +122,18 @@ impl std::fmt::Debug for Issuer {
             .field("timeout_seconds", &self.timeout_seconds)
             .finish()
     }
+}
+
+fn default_key_renewal_days() -> u64 {
+    30
+}
+
+fn default_max_connections_per_machine() -> usize {
+    64
+}
+
+fn default_tunnel_idle_seconds() -> u64 {
+    600
 }
 
 fn default_issuer_rate() -> Rate {
@@ -225,6 +251,13 @@ impl Config {
             errs.push(
                 "max_streams_per_machine and max_streams_per_caller must be at least 1".into(),
             );
+        }
+        if self.max_connections_per_machine == 0 {
+            errs.push("max_connections_per_machine must be at least 1".into());
+        }
+        // Below a minute, a session between heartbeats could be cut.
+        if self.tunnel_idle_seconds < 60 {
+            errs.push("tunnel_idle_seconds must be at least 60".into());
         }
         if let Some(i) = &self.issuer {
             if i.paths.is_empty() {
