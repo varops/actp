@@ -1,16 +1,54 @@
-//! Who a bearer token belongs to. Pluggable, so a later build can accept
-//! tokens signed by another authority (for example an organization's
-//! identity service) next to, or instead of, actp's own hashed tokens.
+//! Who a bearer token belongs to. Pluggable, so other token formats can be
+//! accepted next to, or instead of, actp's own hashed tokens. Org mode
+//! ([`crate::org`]) accepts signed caller papers instead of tokens.
+
+use std::future::Future;
+use std::pin::Pin;
 
 use crate::config::{self, Token};
 
+/// A refused credential: a stable code for the audit log and, when the
+/// credential was genuine enough to say, whose it was.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refused {
+    pub code: &'static str,
+    pub principal: Option<String>,
+    /// The credential could not be checked just now (an issuer that cannot
+    /// be reached, a timeout). The caller is told to try again (503) rather
+    /// than that it was refused (401), so a bridge keeps its session.
+    pub temporary: bool,
+}
+
+impl Refused {
+    pub fn new(code: &'static str) -> Self {
+        Refused {
+            code,
+            principal: None,
+            temporary: false,
+        }
+    }
+
+    /// A refusal that may go away on its own; see [`Refused::temporary`].
+    pub fn temporary(code: &'static str) -> Self {
+        Refused {
+            temporary: true,
+            ..Refused::new(code)
+        }
+    }
+}
+
+/// The code for an unknown actp token. Not audited, like the Go server.
+pub const INVALID_TOKEN: &str = "invalid_token";
+
+pub type AuthFuture<'a> = Pin<Box<dyn Future<Output = Result<Token, Refused>> + Send + 'a>>;
+
 /// Maps a presented bearer token to the token policy it stands for: the agents,
-/// workspaces, limits and rewrites that apply. `None` refuses the request (401).
+/// workspaces, limits and rewrites that apply. An error refuses the request (401).
 ///
 /// The returned token's `name` identifies the holder: a link can only be
 /// resumed by a request that authenticates to the same name.
 pub trait Authenticator: Send + Sync + 'static {
-    fn authenticate(&self, cfg: &config::Server, presented: &str) -> Option<Token>;
+    fn authenticate<'a>(&'a self, cfg: &'a config::Server, presented: &'a str) -> AuthFuture<'a>;
 }
 
 /// actp's own tokens: SHA-256 hashes in the config and the tokens file,
@@ -19,8 +57,9 @@ pub trait Authenticator: Send + Sync + 'static {
 pub struct ConfigTokens;
 
 impl Authenticator for ConfigTokens {
-    fn authenticate(&self, cfg: &config::Server, presented: &str) -> Option<Token> {
-        find_token(cfg, presented).cloned()
+    fn authenticate<'a>(&'a self, cfg: &'a config::Server, presented: &'a str) -> AuthFuture<'a> {
+        let found = find_token(cfg, presented).cloned();
+        Box::pin(async move { found.ok_or(Refused::new(INVALID_TOKEN)) })
     }
 }
 

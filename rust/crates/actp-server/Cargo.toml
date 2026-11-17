@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# The shared-secret papers verifier, for tests (`actp_server::org::testing`).
+testing = []
+
 [dependencies]
 actp-proto.workspace = true
 base64.workspace = true

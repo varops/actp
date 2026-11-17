@@ -322,22 +322,36 @@ pub async fn start_laptop_with(
     cert: (PathBuf, PathBuf),
     auth: &str,
 ) -> Laptop {
-    start_laptop_full(pki, name, relay_port, cert, auth, |_| {}).await
+    start_laptop_full(pki, name, relay_port, cert, auth, None, |_| {}).await
 }
 
-/// [`start_laptop_with`], with `adjust` changing the relay options.
+/// [`start_laptop_with`], with a papers verifier for org mode.
+pub async fn start_laptop_verified(
+    pki: &Pki,
+    name: &str,
+    relay_port: u16,
+    cert: (PathBuf, PathBuf),
+    auth: &str,
+    verifier: Option<Arc<dyn actp_server::org::PapersVerifier>>,
+) -> Laptop {
+    start_laptop_full(pki, name, relay_port, cert, auth, verifier, |_| {}).await
+}
+
+/// [`start_laptop_with`], with a papers verifier and `adjust` changing the
+/// relay options.
 pub async fn start_laptop_full(
     pki: &Pki,
     name: &str,
     relay_port: u16,
     cert: (PathBuf, PathBuf),
     auth: &str,
+    verifier: Option<Arc<dyn actp_server::org::PapersVerifier>>,
     adjust: impl FnOnce(&mut RelayOptions),
 ) -> Laptop {
     let root = scratch(name);
     std::fs::create_dir_all(root.join("site")).unwrap();
     let yaml = format!(
-        "server:\n  name: {name}\n  idle_close: 1s\n  log_dir: {}\n  state_dir: {}\n  tokens_file: {}\n  relay:\n    url: wss://localhost:{relay_port}\n    cert: {}\n    key: {}\n    ca: {}\n  workspaces:\n    - name: site\n      path: {}\n  agents:\n    - id: test\n      command: {}\n      env:\n        ACTP_TESTAGENT_STORE: {}\n{auth}",
+        "server:\n  name: {name}\n  idle_close: 5s\n  log_dir: {}\n  state_dir: {}\n  tokens_file: {}\n  relay:\n    url: wss://localhost:{relay_port}\n    cert: {}\n    key: {}\n    ca: {}\n  workspaces:\n    - name: site\n      path: {}\n  agents:\n    - id: test\n      command: {}\n      env:\n        ACTP_TESTAGENT_STORE: {}\n{auth}",
         yaml_path(&root.join("logs")),
         yaml_path(&root.join("state")),
         yaml_path(&root.join("tokens.yaml")),
@@ -357,6 +371,7 @@ pub async fn start_laptop_full(
         actp_server::Options {
             version: "test".into(),
             base_env: Some(actp_server::agentproc::os_environ()),
+            papers_verifier: verifier,
             ..Default::default()
         },
     )

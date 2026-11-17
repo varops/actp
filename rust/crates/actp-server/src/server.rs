@@ -42,7 +42,13 @@ pub struct Options {
     pub max_held_messages: usize,
     pub max_held_bytes: usize,
     /// Who a bearer token belongs to (default: the config's hashed tokens).
+    /// Not used in org mode, where callers present signed papers.
     pub authenticator: Arc<dyn Authenticator>,
+    /// Checks callers' papers against their issuer in org mode
+    /// (`server.org`). Org mode needs one; nobody gets in without it.
+    pub papers_verifier: Option<Arc<dyn crate::org::PapersVerifier>>,
+    /// How long the papers verifier may take (10 s).
+    pub verify_timeout: Duration,
 }
 
 impl Default for Options {
@@ -59,6 +65,8 @@ impl Default for Options {
             max_held_messages: 256,
             max_held_bytes: 8 << 20,
             authenticator: Arc::new(ConfigTokens),
+            papers_verifier: None,
+            verify_timeout: crate::org::VERIFY_TIMEOUT,
         }
     }
 }
@@ -83,6 +91,9 @@ pub(crate) struct State {
     pub next_slot: u64,
 }
 
+/// (person, refusal code) → (last written, repeats since).
+type RefusalLog = HashMap<(String, &'static str), (Instant, u64)>;
+
 pub(crate) struct Inner {
     cfg: RwLock<Arc<config::Server>>,
     pub opts: Options,
@@ -94,6 +105,10 @@ pub(crate) struct Inner {
     pids_closed: Mutex<bool>,
     /// Relay mode: the relay's org-wide stop is on.
     org_stopped: AtomicBool,
+    /// Org mode: when each (person, refusal) was last written, and repeats since.
+    refusals: Mutex<RefusalLog>,
+    /// Relay mode: the address the relay knows this machine by.
+    relay_machine: Mutex<Option<String>>,
 }
 
 /// A running server. Cheap to clone.
@@ -192,6 +207,11 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 impl Server {
     /// Builds a server for a validated config.
     pub async fn new(cfg: config::Server, opts: Options) -> std::io::Result<Server> {
+        if cfg.org.is_some() && opts.papers_verifier.is_none() {
+            return Err(std::io::Error::other(
+                "org mode needs a papers verifier, supplied by the program that runs the server",
+            ));
+        }
         let base_env = match &opts.base_env {
             Some(env) => env.clone(),
             None if cfg.shell_env.unwrap_or(true) => agentproc::login_shell_env().await,
@@ -235,6 +255,8 @@ impl Server {
                 }),
                 pids_closed: Mutex::new(false),
                 org_stopped: AtomicBool::new(false),
+                refusals: Mutex::new(HashMap::new()),
+                relay_machine: Mutex::new(None),
                 opts,
             }),
         };
@@ -276,6 +298,12 @@ impl Server {
     /// open links keep running with the settings they started with. A revoked
     /// token cannot open or resume links any more.
     pub fn reload(&self, cfg: config::Server) {
+        if cfg.org.is_some() && self.inner.opts.papers_verifier.is_none() {
+            tracing::error!(
+                "config reload refused: org mode needs a papers verifier, and this server has none; keeping the old config"
+            );
+            return;
+        }
         {
             let mut st = self.st();
             for a in &cfg.agents {
@@ -308,12 +336,102 @@ impl Server {
         lock(&self.inner.public_url).clone()
     }
 
-    /// Authenticates a bearer token against the current configuration.
-    pub fn authenticate(&self, presented: &str) -> Option<Token> {
-        self.inner
-            .opts
-            .authenticator
-            .authenticate(&self.config(), presented)
+    /// Authenticates a bearer token against the current configuration: an
+    /// actp token, or in org mode signed papers. Refused papers are audited.
+    pub async fn authenticate(&self, presented: &str) -> Result<Token, crate::auth::Refused> {
+        let cfg = self.config();
+        let res = match &cfg.org {
+            // The relay knows this machine by another name than the papers
+            // must carry: a misconfigured machine (a copied config, say)
+            // would otherwise take papers meant for another one.
+            Some(org)
+                if lock(&self.inner.relay_machine)
+                    .as_deref()
+                    .is_some_and(|m| m != org.machine) =>
+            {
+                Err(crate::auth::Refused::new("org_machine_mismatch"))
+            }
+            Some(org) => {
+                crate::org::authenticate(
+                    self.inner.opts.papers_verifier.as_deref(),
+                    org,
+                    presented,
+                    self.inner.opts.verify_timeout,
+                )
+                .await
+            }
+            None => {
+                self.inner
+                    .opts
+                    .authenticator
+                    .authenticate(&cfg, presented)
+                    .await
+            }
+        };
+        if let Err(r) = &res {
+            // Only refusals of papers the verifier found genuine are
+            // audited: they name a person. Junk costs a caller nothing, so
+            // it is not written, like an unknown token. A person's refusals
+            // are written once a minute per reason, with a count of repeats.
+            // A principal unfit for the log (from a custom authenticator) is
+            // treated as no principal.
+            let principal = r
+                .principal
+                .as_ref()
+                .filter(|p| crate::org::valid_caller_id(p));
+            if let Some(principal) = principal {
+                if let Some(repeats) = self.refusal_due(principal, r.code) {
+                    tracing::info!(reason = r.code, principal = %principal, "papers refused");
+                    self.inner.audit.event(
+                        "auth_refused",
+                        [
+                            ("reason", actp_proto::gojson::GoValue::Str(r.code.into())),
+                            (
+                                "principal",
+                                actp_proto::gojson::GoValue::Str(principal.clone()),
+                            ),
+                            ("repeats", actp_proto::gojson::GoValue::Int(repeats as i64)),
+                        ],
+                    );
+                }
+            } else if r.temporary || r.code == "org_machine_mismatch" {
+                // An identity service that cannot be asked, or a machine
+                // that is misconfigured, refuses everyone: say so, once a
+                // minute.
+                if let Some(repeats) = self.refusal_due("", r.code) {
+                    tracing::warn!(reason = r.code, repeats, "callers cannot be checked");
+                }
+            } else if r.code != crate::auth::INVALID_TOKEN {
+                tracing::debug!(reason = r.code, "credentials refused");
+            }
+        }
+        res
+    }
+
+    /// Whether to write a refusal for (`principal`, `code`) now: once a
+    /// minute, with how many were left out since.
+    fn refusal_due(&self, principal: &str, code: &'static str) -> Option<u64> {
+        let mut m = lock(&self.inner.refusals);
+        let now = Instant::now();
+        if m.len() > 10_000 {
+            m.retain(|_, (t, _)| now.duration_since(*t) < Duration::from_secs(60));
+        }
+        match m.get_mut(&(principal.to_string(), code)) {
+            Some((t, n)) if now.duration_since(*t) < Duration::from_secs(60) => {
+                *n += 1;
+                None
+            }
+            Some((t, n)) => {
+                let repeats = *n;
+                *t = now;
+                *n = 0;
+                Some(repeats)
+            }
+            None => {
+                m.insert((principal.to_string(), code), (now, 0));
+                Some(0)
+            }
+        }
     }
 
     /// Ends every link, settling its agent, after waiting up to `grace` for running turns.
@@ -374,6 +492,12 @@ impl Server {
             self.end_all_links("the organization-wide stop is on").await;
         }
         true
+    }
+
+    /// Relay mode: records the address the relay knows this machine by. In
+    /// org mode, papers are refused while it differs from `org.machine`.
+    pub fn set_relay_machine(&self, machine: &str) {
+        *lock(&self.inner.relay_machine) = Some(machine.to_string());
     }
 
     /// Whether the org-wide stop is on.

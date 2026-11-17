@@ -1,6 +1,6 @@
-# Relay mode
+# Relay mode and org mode
 
-**Rust only.** Relay mode and the relay (`actp-relay`) exist only in the Rust build (`rust/`). The Go `actp serve` does not read the `relay` section and refuses a config file that has one.
+**Rust only.** Relay mode, org mode and the relay (`actp-relay`) exist only in the Rust build (`rust/`). The Go `actp serve` does not read the `relay` or `org` sections and refuses a config file that has one.
 
 In relay mode, a machine does not listen for connections. It connects out to one relay over WSS on port 443, and callers reach it through that relay. This suits a fleet of laptops: nothing listens on a laptop, so there are no firewall rules, no Wi-Fi isolation problems and no VPN, and only one server (the relay) faces callers.
 
@@ -171,6 +171,43 @@ Of each refusal kind (`caller_refused`, `caller_rate_limited`, `connection_refus
 The stop's own events (`org_stop`, `org_release`, `org_stop_not_saved`, `org_stop_saved`) are also written to `log_dir/org_stops.jsonl`, which is never rotated, so no flood of other events can push them out.
 
 `client_name` is what the caller says about itself; the relay does not check it. The machine's own audit log records who the machine authenticated.
+
+## Org mode
+
+In org mode a machine accepts signed papers from the organization's identity service instead of actp tokens. Nobody on the way vouches for a caller, the relay included: the machine checks the papers itself. Org mode is Rust only, like relay mode, and the two are meant to be used together.
+
+Checking papers is split in two:
+
+- **A papers verifier** knows the issuer. It checks the signature, freshness and whatever else the issuer requires (for example that the person is still who the papers say), and answers with who the caller is, which machine the papers are for, and what they grant. It is supplied by the program that embeds `actp-server`, as an `actp_server::org::PapersVerifier`. actp ships no verifier for a real identity service; `actp_server::org::testing::SharedSecret`, behind the crate's `testing` feature, is for tests. `actp serve` has no verifier, so it refuses a config with an `org` section, and so does a config reload.
+- **actp** then checks, whatever the verifier said: that the papers name this machine, and that they carry the required grant as exactly `true`.
+
+```yaml
+server:
+  relay: …
+  org:
+    machine: C02XK1ABJG5H                 # this machine's address: the name in its device certificate
+    require_grant: machines.operate       # the grant papers must carry, as true
+    access:                               # what a caller with good papers may use here
+      agents: [it-agent]
+      workspaces: [it]
+      default_workspace: it
+  agents: …
+  workspaces: …
+```
+
+There are no `tokens` in org mode (a config with both is refused), and no tunnel. A program that runs the server with an `org` section and no verifier fails to start; a reload that would turn org mode on without one is refused and the old config kept.
+
+A verifier has 10 s. If it times out, or says the issuer cannot be asked just now, the caller gets `503 auth_unavailable` with `Retry-After` on any route, not a refusal. A bridge reconnecting to an open session keeps trying, so the session survives a short outage of the identity service; a bridge that is just starting reports the error. The server logs these at `warn`, once a minute. A verifier must not block (the time limit covers its future only), and one that asks its issuer online should cache or limit, since anyone who can reach the machine can present papers.
+
+In relay mode the machine also compares `org.machine` with the address the relay knows it by. While they differ, every caller is refused (`org_machine_mismatch`, logged at `warn`): a config copied from another machine must not accept papers meant for that machine.
+
+A caller id must be 1 to 256 characters of letters, digits and `.`, `_`, `-`, `@`, `+`, `:`, `=`; papers naming anything else are refused.
+
+A caller sends its papers as the bearer token (`Authorization: Bearer <papers>`), in whatever encoding the verifier reads; papers over 32 KB are refused. The caller then gets `access`, under the name `papers:<caller id>`. Only the same person can resume a link, and link limits count per person. Papers are checked on every request, so a dropped connection is resumed with fresh papers: the bridge library takes a `token_source` that fetches them before each connection. As with revoked tokens, a connection already open runs until it closes. Revoking someone stops their new connections and resumes as soon as the verifier sees it: at once if it asks the issuer each time, when the papers expire if it only checks signatures.
+
+Links belong to a person, but the agent's sessions do not: everyone who gets in with the same `access` can list, load, continue or delete the sessions on that machine, as with a shared token. Callers who must not see each other's work need separate machines.
+
+The machine's audit log records `auth_refused` with the reason and the caller for papers that are genuine but do not let the caller in: `papers_other_machine`, `papers_no_grant`, or a verifier's own code when it names the caller (the test verifier's `papers_expired`). Papers nobody vouches for (`papers_malformed`, a bad signature, an issuer that cannot be asked, `no_papers_verifier`) are refused without an audit line, as unknown tokens are, so they cannot fill the log. The same person refused for the same reason is written once a minute, with `repeats` counting the ones left out. `link_opened` names the caller as `papers:<caller id>`. Token names starting with `papers:` are reserved, and an empty `org:` section is an error, not a quiet return to tokens.
 
 ## Protocol
 

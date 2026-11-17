@@ -412,6 +412,11 @@ async fn cmd_serve(args: &[String]) -> Result<(), Exit> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .try_init();
+    if sc.org.is_some() {
+        return Err(fail(
+            "org mode needs a papers verifier for the organization's identity service; `actp serve` has none, so org mode runs only inside a program that supplies one",
+        ));
+    }
     if sc.relay.is_none() {
         check_listen(&sc)?;
     }
