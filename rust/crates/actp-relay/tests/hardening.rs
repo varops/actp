@@ -478,9 +478,10 @@ async fn health(
 async fn a_tunnel_that_carries_nothing_is_cut() {
     let dir = scratch("idle");
     let pki = Pki::new(&dir);
-    // The configured limit is a minute at least; the test cuts at 2 s.
+    // The configured limit is a minute at least; the test cuts at 4 s
+    // (long enough for one slow answer on a busy CI machine).
     let timing = Timing {
-        tunnel_idle: Some(Duration::from_secs(2)),
+        tunnel_idle: Some(Duration::from_secs(4)),
         ..fast_timing()
     };
     let env = start_relay_timed(&pki, &dir, "", timing).await;
@@ -488,13 +489,13 @@ async fn a_tunnel_that_carries_nothing_is_cut() {
     laptop.wait_connected().await;
 
     let mut quiet = held_tunnel(&pki, env.port, "laptop-a").await;
-    let mut busy = held_tunnel(&pki, env.port, "laptop-a").await;
     assert_eq!(health(&mut quiet).await, Some(200));
+    let mut busy = held_tunnel(&pki, env.port, "laptop-a").await;
     // The busy tunnel carries something twice a second; the quiet one
     // carries nothing after its first request. (The machine itself closes
     // a connection idle for 10 s, so the test stays well under that.)
     let started = std::time::Instant::now();
-    while started.elapsed() < Duration::from_secs(5) {
+    while started.elapsed() < Duration::from_secs(8) {
         assert_eq!(
             health(&mut busy).await,
             Some(200),
