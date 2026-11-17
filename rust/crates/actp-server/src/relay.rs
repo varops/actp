@@ -355,7 +355,9 @@ async fn control_loop(
                     // the current one.
                     *identity.write().unwrap_or_else(|p| p.into_inner()) = before;
                 } else if e.starts_with("HTTP 403")
-                    && e.contains("(machine_key_changed)")
+                    // The code, or none at all (a proxy may hold back the
+                    // body): either way the key may be what was refused.
+                    && (e.contains("(machine_key_changed)") || !e.contains('('))
                     && last_trial.is_none_or(|t| t.elapsed() > Duration::from_secs(600))
                     && let Some(files) = &opts.continuity
                     && let Some(pair) = crate::continuity::next_pair(files)

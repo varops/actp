@@ -177,16 +177,43 @@ pub(crate) fn install(relay: &config::Relay, pair: &Pair) {
     }
 }
 
-/// At start, before the device certificate is used: if the current pair
-/// does not read or check (a swap cut short) and the `.next` pair does,
-/// puts the `.next` pair in place, so the machine starts and the relay can
-/// take it.
+/// At start, before the device certificate is used: repairs the one state
+/// a swap cut short leaves (the `.next` key in place, the old certificate
+/// not yet replaced) by putting the `.next` certificate in place too. In any
+/// other state the files are left alone, so the old key, the only one that
+/// can prove a move, is never lost to a file that was only unreadable.
 pub fn repair(relay: &config::Relay) {
-    if let Err(e) = Pair::read(relay)
-        && let Some(next) = next_pair(relay)
-    {
-        tracing::warn!(error = %e, "the device certificate cannot be used; putting the next one in place");
-        install(relay, &next);
+    if Pair::read(relay).is_ok() {
+        return;
+    }
+    let next = next_files(relay);
+    let (Ok(key), Ok(next_key), Ok(next_cert)) = (
+        std::fs::read(&relay.key),
+        std::fs::read(&next.key),
+        std::fs::read(&next.cert),
+    ) else {
+        return;
+    };
+    if key != next_key || std::fs::read(&relay.cert).ok().as_deref() == Some(&next_cert[..]) {
+        return;
+    }
+    let Some(pair) = next_pair(relay) else {
+        return;
+    };
+    tracing::warn!(
+        "a device certificate swap was cut short; putting the next certificate in place"
+    );
+    let done = write_synced(&format!("{}.staged", relay.cert), &pair.cert_pem, false)
+        .and_then(|()| std::fs::rename(format!("{}.staged", relay.cert), &relay.cert));
+    match done {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&next.key);
+            let _ = std::fs::remove_file(&next.cert);
+        }
+        Err(e) => {
+            unstage(relay);
+            tracing::error!(error = %e, "{NOT_IN_PLACE}");
+        }
     }
 }
 

@@ -737,6 +737,24 @@ fn a_swap_cut_short_is_repaired_at_start_and_a_key_never_lands_without_its_certi
     actp_server::continuity::repair(&f);
     assert_eq!(std::fs::read(&f.key).unwrap(), before);
 
+    // A current pair that only fails to read (here a garbled certificate),
+    // with no swap begun: left alone, so the old key is never lost.
+    let cert = device_for_days(&pki, "laptop-c", "current-c", 365);
+    let next = device_for_days(&pki, "laptop-c", "renewed-c", 365);
+    let f = files(&cert);
+    let old_key = std::fs::read(&f.key).unwrap();
+    std::fs::write(&f.cert, b"not a certificate").unwrap();
+    std::fs::copy(&next.0, format!("{}.next", f.cert)).unwrap();
+    std::fs::copy(&next.1, format!("{}.next", f.key)).unwrap();
+    actp_server::continuity::repair(&f);
+    assert_eq!(
+        std::fs::read(&f.key).unwrap(),
+        old_key,
+        "the old key is kept"
+    );
+    assert_eq!(std::fs::read(&f.cert).unwrap(), b"not a certificate");
+    assert!(std::path::Path::new(&format!("{}.next", f.key)).exists());
+
     // If the certificate cannot follow the key, the old key goes back.
     let cert = device_for_days(&pki, "laptop-b", "current-b", 365);
     let next = device_for_days(&pki, "laptop-b", "renewed-b", 365);

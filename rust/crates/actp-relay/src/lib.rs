@@ -1231,9 +1231,19 @@ impl Relay {
         {
             let mut st = self.st();
             let m = st.machines.entry(machine.to_string()).or_default();
-            // Re-pinned meanwhile: the admin's pin stands (and is saved by
-            // the next write, which it asked for).
+            // Re-pinned meanwhile: the admin's pin stands, and is saved now
+            // over the one just written.
             if m.seen.key.as_deref() != Some(old.key.as_str()) {
+                let seen: BTreeMap<String, Seen> = st
+                    .machines
+                    .iter()
+                    .map(|(k, m)| (k.clone(), m.seen.clone()))
+                    .collect();
+                drop(st);
+                if let Err(e) = self.inner.store.save_seen(&seen) {
+                    tracing::error!(error = %e, "could not save machines.json");
+                    self.inner.seen_dirty.store(true, Ordering::SeqCst);
+                }
                 return Err("rekey_not_pinned");
             }
             m.seen.key = Some(new.key.clone());
