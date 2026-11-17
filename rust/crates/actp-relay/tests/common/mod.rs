@@ -429,6 +429,12 @@ pub async fn start_laptop_full(
     verifier: Option<Arc<dyn actp_server::org::PapersVerifier>>,
     adjust: impl FnOnce(&mut RelayOptions),
 ) -> Laptop {
+    if std::env::var_os("ACTP_TEST_LOG").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_env_filter("debug,hyper=info,rustls=info,tungstenite=info,tokio_tungstenite=info")
+            .try_init();
+    }
     let root = scratch(name);
     std::fs::create_dir_all(root.join("site")).unwrap();
     let yaml = format!(

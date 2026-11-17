@@ -1091,6 +1091,8 @@ async fn connections_per_address_are_capped_and_refusals_answered_are_throttled(
     })
     .await;
     drop((_one, _two));
+    // The relay lets go of the two held connections once it sees them close.
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Callers the relay refuses are recorded, throttled: here, connections
     // without a caller certificate asking for tunnels.
