@@ -987,7 +987,10 @@ impl Relay {
         let Some((key, until)) = public_key_of(leaf) else {
             return Err("certificate_unreadable");
         };
-        let window = self.config().machine_key_renewal_days.saturating_mul(86_400);
+        let window = self
+            .config()
+            .machine_key_renewal_days
+            .saturating_mul(86_400);
         let now = unix(SystemTime::now());
         let renewed = {
             let mut st = self.st();

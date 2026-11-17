@@ -865,7 +865,11 @@ async fn admin(relay: &Relay, peer: &Peer, req: Request<Incoming>, path: &str) -
             let body = match Limited::new(req.into_body(), 16 << 10).collect().await {
                 Ok(b) => b.to_bytes(),
                 Err(_) => {
-                    return error(StatusCode::BAD_REQUEST, "bad_request", "the body is too large");
+                    return error(
+                        StatusCode::BAD_REQUEST,
+                        "bad_request",
+                        "the body is too large",
+                    );
                 }
             };
             let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();

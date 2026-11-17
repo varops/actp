@@ -63,9 +63,8 @@ async fn as_machine(pki: &Pki, port: u16, cert: &(PathBuf, PathBuf)) -> (u16, St
     let resp = sender.send_request(req).await.unwrap();
     let status = resp.status().as_u16();
     use http_body_util::BodyExt;
-    let body: Value =
-        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes())
-            .unwrap_or(Value::Null);
+    let body: Value = serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes())
+        .unwrap_or(Value::Null);
     (status, body["error"].as_str().unwrap_or("").to_string())
 }
 
@@ -82,7 +81,10 @@ fn device_for_days(pki: &Pki, cn: &str, file: &str, days: i64) -> (PathBuf, Path
         p.not_before = time::OffsetDateTime::now_utc() - time::Duration::days(1);
         p.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(days);
     });
-    let (c2, k2) = (pki.dir.join(format!("{file}.pem")), pki.dir.join(format!("{file}.key")));
+    let (c2, k2) = (
+        pki.dir.join(format!("{file}.pem")),
+        pki.dir.join(format!("{file}.key")),
+    );
     std::fs::rename(&c, &c2).unwrap();
     std::fs::rename(&k, &k2).unwrap();
     (c2, k2)
@@ -106,8 +108,10 @@ async fn a_machine_name_keeps_its_first_key_until_an_admin_repins_it() {
     // though the org's CA signed it, while the pinned one is far from expiry.
     let got = as_machine(&pki, env.port, &second).await;
     assert!(is(&got, KEY_CHANGED), "{got:?}");
-    assert!(env.audit_has("machine_refused", |e| e["machine"] == "laptop-a"
-        && e["reason"] == "key_changed"));
+    assert!(
+        env.audit_has("machine_refused", |e| e["machine"] == "laptop-a"
+            && e["reason"] == "key_changed")
+    );
     // A real machine with it never connects.
     let mut laptop = start_laptop(&pki, "laptop-a", env.port, second.clone()).await;
     laptop
@@ -139,9 +143,12 @@ async fn a_machine_name_keeps_its_first_key_until_an_admin_repins_it() {
         json!({"machine": "odd name", "reason": "x"}),
         json!({"reason": "x"}),
     ] {
-        let (status, b) = request(&pki, env.port, "POST", "/relay/v1/repin", ADMIN, Some(body))
-            .await;
-        assert_eq!((status, b["error"].as_str()), (400, Some("machine_and_reason_required")));
+        let (status, b) =
+            request(&pki, env.port, "POST", "/relay/v1/repin", ADMIN, Some(body)).await;
+        assert_eq!(
+            (status, b["error"].as_str()),
+            (400, Some("machine_and_reason_required"))
+        );
     }
     let (status, _) = request(&pki, env.port, "GET", "/relay/v1/repin", ADMIN, None).await;
     assert_eq!(status, 405);
@@ -155,10 +162,12 @@ async fn a_machine_name_keeps_its_first_key_until_an_admin_repins_it() {
     )
     .await;
     assert_eq!((status, &b["was_pinned"]), (200, &json!(true)));
-    assert!(env.audit_has("machine_repinned", |e| e["machine"] == "laptop-a"
-        && e["by"] == "dave"
-        && e["reason"] == "new disk"
-        && e["was_pinned"] == true));
+    assert!(
+        env.audit_has("machine_repinned", |e| e["machine"] == "laptop-a"
+            && e["by"] == "dave"
+            && e["reason"] == "new disk"
+            && e["was_pinned"] == true)
+    );
 
     // The next key seen is pinned, and the old one is now the stranger.
     let mut laptop = start_laptop(&pki, "laptop-a", env.port, second.clone()).await;
@@ -196,9 +205,11 @@ async fn a_new_key_is_taken_as_a_renewal_only_near_the_pinned_expiry() {
     let later = device_for_days(&pki, "laptop-a", "later", 365);
     assert!(is(&as_machine(&pki, env.port, &old).await, ACCEPTED));
     assert!(is(&as_machine(&pki, env.port, &renewed).await, ACCEPTED));
-    assert!(env.audit_has("machine_key_renewed", |e| e["machine"] == "laptop-a"
-        && e["old_key"] != e["new_key"]
-        && e["new_key"].as_str().is_some_and(|k| k.len() == 64)));
+    assert!(
+        env.audit_has("machine_key_renewed", |e| e["machine"] == "laptop-a"
+            && e["old_key"] != e["new_key"]
+            && e["new_key"].as_str().is_some_and(|k| k.len() == 64))
+    );
     // The renewal is now the pin: the old key is refused, and so is a third
     // key while the renewal is far from expiry.
     assert!(is(&as_machine(&pki, env.port, &old).await, KEY_CHANGED));
@@ -262,10 +273,9 @@ async fn held_tunnel(
     let tls = open_tunnel(&pki.route(machine), port, machine)
         .await
         .unwrap();
-    let (sender, conn) =
-        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tls))
-            .await
-            .unwrap();
+    let (sender, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tls))
+        .await
+        .unwrap();
     tokio::spawn(conn);
     sender
 }
@@ -310,7 +320,11 @@ async fn a_tunnel_that_carries_nothing_is_cut() {
     // a connection idle for 10 s, so the test stays well under that.)
     let started = std::time::Instant::now();
     while started.elapsed() < Duration::from_secs(5) {
-        assert_eq!(health(&mut busy).await, Some(200), "the busy tunnel is kept");
+        assert_eq!(
+            health(&mut busy).await,
+            Some(200),
+            "the busy tunnel is kept"
+        );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     assert_eq!(health(&mut quiet).await, None, "the quiet tunnel was cut");
