@@ -1426,7 +1426,12 @@ remotes:
 
     #[test]
     fn org_mode() {
-        let base = "server:\n  workspaces:\n    - name: it\n      path: /it\n  agents:\n    - id: a\n      command: x\n  org:\n    machine: C02XK1\n    require_grant: machines.operate\n    access:\n      agents: [a]\n      workspaces: [it]\n      default_workspace: it\n";
+        let base = &"server:\n  workspaces:\n    - name: it\n      path: WORKSPACE\n  agents:\n    - id: a\n      command: x\n  org:\n    machine: C02XK1\n    require_grant: machines.operate\n    access:\n      agents: [a]\n      workspaces: [it]\n      default_workspace: it\n"
+            .replace(
+                "WORKSPACE",
+                &format!("{:?}", std::env::temp_dir().to_string_lossy()),
+            );
+        let base = base.as_str();
         let c = Config::parse(base).unwrap();
         c.validate().unwrap();
         let o = c.server.unwrap().org.unwrap();
