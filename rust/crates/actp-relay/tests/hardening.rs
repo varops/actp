@@ -690,7 +690,69 @@ async fn a_machine_moves_to_its_next_key_with_the_old_keys_proof() {
         &as_machine(&pki, env.port, &old_pair).await,
         KEY_CHANGED
     ));
+
+    // The MDM delivers the same pair again: put in place, no reconnect.
+    let online = |env: &RelayEnv| {
+        env.audit()
+            .iter()
+            .filter(|e| e["event"] == "machine_online")
+            .count()
+    };
+    let before = online(&env);
+    std::fs::copy(&cert, format!("{}.next", cert.display())).unwrap();
+    std::fs::copy(&key, format!("{}.next", key.display())).unwrap();
+    eventually("taken up quietly", || {
+        !std::path::Path::new(&format!("{}.next", cert.display())).exists()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(online(&env), before, "no reconnect");
+    assert!(!env.audit_has("machine_refused", |e| e["route"] == "rekey"));
     drop(laptop);
+}
+
+#[test]
+fn a_swap_cut_short_is_repaired_at_start_and_a_key_never_lands_without_its_certificate() {
+    let dir = scratch("continuity-repair");
+    let pki = Pki::new(&dir);
+    let files = |cert: &(PathBuf, PathBuf)| actp_server::config::Relay {
+        url: "wss://localhost:1".into(),
+        cert: cert.0.to_string_lossy().into_owned(),
+        key: cert.1.to_string_lossy().into_owned(),
+        ca: pki.dir.join("relay-ca.pem").to_string_lossy().into_owned(),
+    };
+    // The key moved in, the certificate did not: the machine could not start.
+    let cert = device_for_days(&pki, "laptop-a", "current", 365);
+    let next = device_for_days(&pki, "laptop-a", "renewed", 365);
+    let f = files(&cert);
+    std::fs::copy(&next.0, format!("{}.next", f.cert)).unwrap();
+    std::fs::copy(&next.1, format!("{}.next", f.key)).unwrap();
+    std::fs::copy(&next.1, &f.key).unwrap();
+    assert!(actp_server::relay::client_tls(&f).is_err());
+    actp_server::continuity::repair(&f);
+    assert!(actp_server::relay::client_tls(&f).is_ok());
+    assert_eq!(key_of(&cert.0), key_of(&next.0));
+    // A good pair is left alone.
+    let before = std::fs::read(&f.key).unwrap();
+    actp_server::continuity::repair(&f);
+    assert_eq!(std::fs::read(&f.key).unwrap(), before);
+
+    // If the certificate cannot follow the key, the old key goes back.
+    let cert = device_for_days(&pki, "laptop-b", "current-b", 365);
+    let next = device_for_days(&pki, "laptop-b", "renewed-b", 365);
+    let f = files(&cert);
+    let old_key = std::fs::read(&f.key).unwrap();
+    std::fs::remove_file(&f.cert).unwrap();
+    std::fs::create_dir_all(format!("{}/in-the-way", f.cert)).unwrap();
+    std::fs::copy(&next.0, format!("{}.next", f.cert)).unwrap();
+    std::fs::copy(&next.1, format!("{}.next", f.key)).unwrap();
+    actp_server::continuity::repair(&f);
+    assert_eq!(
+        std::fs::read(&f.key).unwrap(),
+        old_key,
+        "the old key is back"
+    );
+    assert!(std::path::Path::new(&format!("{}.next", f.key)).exists());
 }
 
 /// A laptop on `cert` with continuity on, looking every `every`.

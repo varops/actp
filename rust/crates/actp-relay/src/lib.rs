@@ -1204,34 +1204,41 @@ impl Relay {
         // Saved before it is answered: a relay that restarted on the old pin
         // would lock out a machine that has moved to its new key.
         let _w = self.inner.writing.lock().unwrap_or_else(|p| p.into_inner());
-        let (seen, before) = {
-            let mut st = self.st();
-            let m = st.machines.entry(machine.to_string()).or_default();
-            // The pin may have moved since this connection was checked.
-            if m.seen.key.as_deref() != Some(old.key.as_str()) {
+        // The move is saved from a copy first; the pin in force changes
+        // only once it is on disk.
+        let seen = {
+            let st = self.st();
+            if st.machines.get(machine).and_then(|m| m.seen.key.as_deref())
+                != Some(old.key.as_str())
+            {
                 return Err("rekey_not_pinned");
             }
-            let before = (m.seen.key_since, m.seen.key_until);
-            m.seen.key = Some(new.key.clone());
-            m.seen.key_since = new.not_before;
-            m.seen.key_until = new.not_after;
-            let seen: BTreeMap<String, Seen> = st
+            let mut seen: BTreeMap<String, Seen> = st
                 .machines
                 .iter()
                 .map(|(k, m)| (k.clone(), m.seen.clone()))
                 .collect();
-            (seen, before)
+            let s = seen.get_mut(machine).expect("checked");
+            s.key = Some(new.key.clone());
+            s.key_since = new.not_before;
+            s.key_until = new.not_after;
+            seen
         };
         if let Err(e) = self.inner.store.save_seen(&seen) {
             tracing::error!(error = %e, machine, "cannot save a moved pin: keeping the old one");
-            let mut st = self.st();
-            if let Some(m) = st.machines.get_mut(machine)
-                && m.seen.key.as_deref() == Some(new.key.as_str())
-            {
-                m.seen.key = Some(old.key.clone());
-                (m.seen.key_since, m.seen.key_until) = before;
-            }
             return Err("rekey_not_saved");
+        }
+        {
+            let mut st = self.st();
+            let m = st.machines.entry(machine.to_string()).or_default();
+            // Re-pinned meanwhile: the admin's pin stands (and is saved by
+            // the next write, which it asked for).
+            if m.seen.key.as_deref() != Some(old.key.as_str()) {
+                return Err("rekey_not_pinned");
+            }
+            m.seen.key = Some(new.key.clone());
+            m.seen.key_since = new.not_before;
+            m.seen.key_until = new.not_after;
         }
         self.forget_nonces(machine);
         // The machine reconnects on its new key by itself; a connection

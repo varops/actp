@@ -35,10 +35,13 @@ use tokio_util::sync::CancellationToken;
 use crate::config;
 use crate::relay::{Status, client_tls_with};
 
-/// The TLS the machine speaks with: to the relay, and end to end to callers.
+/// The TLS the machine speaks with: to the relay, and end to end to callers;
+/// and the certificate and key it is made of, when known, which sign the
+/// proof for the next one.
 pub(crate) struct Identity {
     pub tls: Arc<rustls::ClientConfig>,
     pub e2e: Arc<rustls::ServerConfig>,
+    pub pair: Option<Arc<Pair>>,
 }
 
 pub(crate) type Shared = Arc<RwLock<Identity>>;
@@ -95,13 +98,19 @@ impl Pair {
     }
 
     /// The identity this pair makes, with `relay`'s roots for the relay.
-    pub(crate) fn identity(&self, relay: &config::Relay) -> Result<Identity, String> {
+    pub(crate) fn identity(self: &Arc<Self>, relay: &config::Relay) -> Result<Identity, String> {
         Ok(Identity {
             tls: client_tls_with(relay, self.chain.clone(), self.key.clone_key())
                 .map_err(|e| e.to_string())?,
             e2e: actp_proto::e2e::server_config(self.chain.clone(), self.key.clone_key())
                 .map_err(|e| e.to_string())?,
+            pair: Some(self.clone()),
         })
+    }
+
+    /// Whether `other` holds the same certificate and key.
+    fn same_as(&self, other: &Pair) -> bool {
+        self.cert_pem == other.cert_pem && self.key_pem == other.key_pem
     }
 
     /// Writes the pair's exact bytes next to the current files as
@@ -133,8 +142,15 @@ fn write_synced(path: &str, data: &[u8], private: bool) -> io::Result<()> {
 /// `.next` pair if it still holds the bytes that were staged. The old key
 /// is not kept.
 fn commit(relay: &config::Relay, pair: &Pair) -> io::Result<()> {
+    // If the certificate cannot follow the key, the old key goes back: a
+    // key without its certificate would stop the machine from starting.
+    let old_key = std::fs::read(&relay.key)?;
     std::fs::rename(format!("{}.staged", relay.key), &relay.key)?;
-    std::fs::rename(format!("{}.staged", relay.cert), &relay.cert)?;
+    if let Err(e) = std::fs::rename(format!("{}.staged", relay.cert), &relay.cert) {
+        let _ = write_synced(&format!("{}.staged", relay.key), &old_key, true)
+            .and_then(|()| std::fs::rename(format!("{}.staged", relay.key), &relay.key));
+        return Err(e);
+    }
     let next = next_files(relay);
     if std::fs::read(&next.cert).ok().as_deref() == Some(&pair.cert_pem[..])
         && std::fs::read(&next.key).ok().as_deref() == Some(&pair.key_pem[..])
@@ -161,14 +177,27 @@ pub(crate) fn install(relay: &config::Relay, pair: &Pair) {
     }
 }
 
+/// At start, before the device certificate is used: if the current pair
+/// does not read or check (a swap cut short) and the `.next` pair does,
+/// puts the `.next` pair in place, so the machine starts and the relay can
+/// take it.
+pub fn repair(relay: &config::Relay) {
+    if let Err(e) = Pair::read(relay)
+        && let Some(next) = next_pair(relay)
+    {
+        tracing::warn!(error = %e, "the device certificate cannot be used; putting the next one in place");
+        install(relay, &next);
+    }
+}
+
 /// The `.next` pair, when there is one that reads and checks.
-pub(crate) fn next_pair(relay: &config::Relay) -> Option<Pair> {
+pub(crate) fn next_pair(relay: &config::Relay) -> Option<Arc<Pair>> {
     let next = next_files(relay);
     if !Path::new(&next.cert).exists() || !Path::new(&next.key).exists() {
         return None;
     }
     match Pair::read(&next) {
-        Ok(p) => Some(p),
+        Ok(p) => Some(Arc::new(p)),
         Err(e) => {
             tracing::warn!(error = %e, "the next device certificate cannot be used");
             None
@@ -203,6 +232,18 @@ pub(crate) async fn run(
         let Some(pair) = next_pair(&relay) else {
             continue;
         };
+        // Already the identity in use (its files were not put in place, or
+        // the MDM delivered them again): only the files, no relay, no
+        // reconnect.
+        let current = identity
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .pair
+            .clone();
+        if current.is_some_and(|c| c.same_as(&pair)) {
+            install(&relay, &pair);
+            continue;
+        }
         match move_to(&relay, &pair, &machine, &identity).await {
             Ok(new) => {
                 tracing::info!(machine = %machine, "the relay took the next device certificate; reconnecting with it");
@@ -225,7 +266,7 @@ pub(crate) async fn run(
 /// for [`commit`].
 async fn move_to(
     relay: &config::Relay,
-    pair: &Pair,
+    pair: &Arc<Pair>,
     machine: &str,
     identity: &Shared,
 ) -> Result<Identity, String> {
@@ -234,12 +275,15 @@ async fn move_to(
     // Nothing is asked unless the files can be put in place afterwards.
     pair.stage(relay)
         .map_err(|e| format!("cannot stage the next certificate beside the current one: {e}"))?;
-    let current = Pair::read(relay)?;
-    let tls = identity
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .tls
-        .clone();
+    // Signed with the key in use, which is not always the one on disk.
+    let (tls, current) = {
+        let id = identity.read().unwrap_or_else(|p| p.into_inner());
+        (id.tls.clone(), id.pair.clone())
+    };
+    let current = match current {
+        Some(c) => c,
+        None => Arc::new(Pair::read(relay)?),
+    };
     let (status, body) = post(&relay.url, tls.clone(), PATH_REKEY_CHALLENGE, Vec::new()).await?;
     if status != 200 {
         return Err(format!(

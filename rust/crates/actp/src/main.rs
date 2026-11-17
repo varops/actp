@@ -489,7 +489,11 @@ async fn cmd_serve(args: &[String]) -> Result<(), Exit> {
     // Relay mode: nothing listens here; the machine dials out to the relay.
     let relay_tls = match &sc.relay {
         Some(r) => Some((
-            actp_server::relay::client_tls(r)?,
+            {
+                // A device certificate swap cut short: start on the next one.
+                actp_server::continuity::repair(r);
+                actp_server::relay::client_tls(r)?
+            },
             actp_server::relay::stream_tls(r)?,
         )),
         None => None,

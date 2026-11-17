@@ -241,7 +241,19 @@ async fn dial(
     );
     match tokio::time::timeout(opts.dial_timeout, connect).await {
         Err(_) => Err("timed out".into()),
-        Ok(Err(tungstenite::Error::Http(resp))) => Err(format!("HTTP {}", resp.status())),
+        Ok(Err(tungstenite::Error::Http(resp))) => {
+            // The relay's error code, when it gave a plain one.
+            let code = resp
+                .body()
+                .as_deref()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+                .filter(|c| c.len() <= 64 && c.bytes().all(|b| b.is_ascii_graphic()));
+            Err(match code {
+                Some(c) => format!("HTTP {} ({c})", resp.status()),
+                None => format!("HTTP {}", resp.status()),
+            })
+        }
         Ok(Err(e)) => Err(e.to_string()),
         Ok(Ok((ws, resp))) => {
             let chosen = resp
@@ -270,6 +282,10 @@ async fn control_loop(
         Arc::new(std::sync::RwLock::new(crate::continuity::Identity {
             tls: opts.tls.clone(),
             e2e: opts.e2e.clone(),
+            pair: opts
+                .continuity
+                .as_ref()
+                .and_then(|f| crate::continuity::Pair::read(f).ok().map(Arc::new)),
         }));
     let generation: crate::continuity::Generation = Arc::new(watch::channel(0u64).0);
     let mut generations = generation.subscribe();
@@ -286,7 +302,7 @@ async fn control_loop(
     // A `.next` pair being tried after the relay refused the current key:
     // the relay may have moved the pin already (a lost answer, files that
     // could not be put in place, an admin re-pin to the new key).
-    let mut trial: Option<(crate::continuity::Pair, crate::continuity::Identity)> = None;
+    let mut trial: Option<(Arc<crate::continuity::Pair>, crate::continuity::Identity)> = None;
     let mut last_trial: Option<Instant> = None;
     loop {
         {
@@ -308,7 +324,11 @@ async fn control_loop(
                     tracing::info!(
                         "the relay took the next device certificate; putting it in place"
                     );
-                    crate::continuity::install(files, &pair);
+                    let files = files.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        crate::continuity::install(&files, &pair)
+                    })
+                    .await;
                 }
                 let e = tokio::select! {
                     e = run_control(&server, &opts, ws, &tx, &status, &streams, &shutdown) => e,
@@ -335,6 +355,7 @@ async fn control_loop(
                     // the current one.
                     *identity.write().unwrap_or_else(|p| p.into_inner()) = before;
                 } else if e.starts_with("HTTP 403")
+                    && e.contains("(machine_key_changed)")
                     && last_trial.is_none_or(|t| t.elapsed() > Duration::from_secs(600))
                     && let Some(files) = &opts.continuity
                     && let Some(pair) = crate::continuity::next_pair(files)
