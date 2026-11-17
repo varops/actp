@@ -135,6 +135,8 @@ struct Inner {
     /// When each machine's last `machine_key_refused` was written, and how
     /// many were left out since.
     key_refusals: Mutex<HashMap<String, (Option<std::time::Instant>, u64)>>,
+    /// Open continuity nonces: nonce → (machine, when it was given).
+    rekey_nonces: Mutex<HashMap<String, (String, std::time::Instant)>>,
 }
 
 struct State {
@@ -216,6 +218,7 @@ impl Relay {
     }
 
     pub fn with_timing(cfg: Config, timing: Timing) -> std::io::Result<Relay> {
+        warn_renewal_window(&cfg);
         let store = Store::open(&cfg.state_dir)?;
         let audit = Audit::open(&cfg.log_dir, cfg.audit_max_bytes())?;
         let stop = store.load_stop();
@@ -276,6 +279,7 @@ impl Relay {
                 per_ip: Mutex::new(HashMap::new()),
                 per_machine: Arc::default(),
                 key_refusals: Mutex::default(),
+                rekey_nonces: Mutex::default(),
             }),
         })
     }
@@ -327,6 +331,7 @@ impl Relay {
     /// listen address and the state and log folders need a restart. A machine
     /// that is now blocked is cut off.
     pub fn reload(&self, cfg: Config, tls: tls::Setup) {
+        warn_renewal_window(&cfg);
         let blocked = cfg.blocked_machines.len();
         let blocked_callers = cfg.blocked_callers.len();
         self.inner
@@ -1115,6 +1120,159 @@ impl Relay {
         );
     }
 
+    /// A continuity nonce for `machine`: good once, for
+    /// [`actp_proto::relay::REKEY_NONCE_SECONDS`]. At most four open per
+    /// machine, and 10 000 in all.
+    pub(crate) fn rekey_challenge(&self, machine: &str) -> Result<String, &'static str> {
+        let ttl = Duration::from_secs(actp_proto::relay::REKEY_NONCE_SECONDS);
+        let mut m = self
+            .inner
+            .rekey_nonces
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        m.retain(|_, (_, at)| at.elapsed() < ttl);
+        if m.len() >= 10_000 || m.values().filter(|(n, _)| n == machine).count() >= 4 {
+            return Err("too_many_challenges");
+        }
+        let nonce = new_stream_id();
+        m.insert(
+            nonce.clone(),
+            (machine.to_string(), std::time::Instant::now()),
+        );
+        Ok(nonce)
+    }
+
+    /// Key continuity: moves `machine`'s pin to the key of the certificate
+    /// in `ask`, if the key the name is pinned to (`old_leaf`, presented on
+    /// this connection) signed it over a fresh nonce of the relay's. The
+    /// nonce is used up whatever the outcome. The new certificate must be a
+    /// valid device certificate now, for the same name, with another key.
+    /// Recorded as `machine_key_continued`, and the machine's connection on
+    /// the old key is cut so it reconnects on the new one. Returns the new
+    /// key; an error is a short reason.
+    pub(crate) fn rekey(
+        &self,
+        machine: &str,
+        old_leaf: &CertificateDer<'static>,
+        ask: actp_proto::relay::RekeyRequest,
+    ) -> Result<String, &'static str> {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        // The nonce first: used up even if the rest fails.
+        let fresh = {
+            let mut m = self
+                .inner
+                .rekey_nonces
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            m.remove(&ask.nonce).is_some_and(|(n, at)| {
+                n == machine
+                    && at.elapsed() < Duration::from_secs(actp_proto::relay::REKEY_NONCE_SECONDS)
+            })
+        };
+        if !fresh {
+            return Err("rekey_nonce_unknown");
+        }
+        if ask.certificates.is_empty() || ask.certificates.len() > 8 {
+            return Err("rekey_certificate_invalid");
+        }
+        let mut chain = Vec::with_capacity(ask.certificates.len());
+        for c in &ask.certificates {
+            let der = b64.decode(c).map_err(|_| "rekey_certificate_invalid")?;
+            chain.push(CertificateDer::from(der));
+        }
+        if self.kind(&chain) != tls::Kind::Device {
+            return Err("rekey_certificate_invalid");
+        }
+        let cfg = self.config();
+        if tls::machine_name(&chain[0], cfg.machine_name).as_deref() != Ok(machine) {
+            return Err("rekey_other_machine");
+        }
+        let (Some(old), Some(new)) = (cert_key(old_leaf), cert_key(&chain[0])) else {
+            return Err("rekey_certificate_invalid");
+        };
+        if old.key == new.key {
+            return Err("rekey_same_key");
+        }
+        let signature = b64
+            .decode(&ask.signature)
+            .map_err(|_| "rekey_signature_invalid")?;
+        let message = actp_proto::relay::rekey_message(machine, &ask.nonce, chain[0].as_ref());
+        if !actp_proto::relay::rekey_verify(old_leaf.as_ref(), ask.scheme, &message, &signature) {
+            return Err("rekey_signature_invalid");
+        }
+        // Saved before it is answered: a relay that restarted on the old pin
+        // would lock out a machine that has moved to its new key.
+        let _w = self.inner.writing.lock().unwrap_or_else(|p| p.into_inner());
+        // The move is saved from a copy first; the pin in force changes
+        // only once it is on disk.
+        let seen = {
+            let st = self.st();
+            if st.machines.get(machine).and_then(|m| m.seen.key.as_deref())
+                != Some(old.key.as_str())
+            {
+                return Err("rekey_not_pinned");
+            }
+            let mut seen: BTreeMap<String, Seen> = st
+                .machines
+                .iter()
+                .map(|(k, m)| (k.clone(), m.seen.clone()))
+                .collect();
+            let s = seen.get_mut(machine).expect("checked");
+            s.key = Some(new.key.clone());
+            s.key_since = new.not_before;
+            s.key_until = new.not_after;
+            seen
+        };
+        if let Err(e) = self.inner.store.save_seen(&seen) {
+            tracing::error!(error = %e, machine, "cannot save a moved pin: keeping the old one");
+            return Err("rekey_not_saved");
+        }
+        {
+            let mut st = self.st();
+            let m = st.machines.entry(machine.to_string()).or_default();
+            // Re-pinned meanwhile: the admin's pin stands, and is saved now
+            // over the one just written.
+            if m.seen.key.as_deref() != Some(old.key.as_str()) {
+                let seen: BTreeMap<String, Seen> = st
+                    .machines
+                    .iter()
+                    .map(|(k, m)| (k.clone(), m.seen.clone()))
+                    .collect();
+                drop(st);
+                if let Err(e) = self.inner.store.save_seen(&seen) {
+                    tracing::error!(error = %e, "could not save machines.json");
+                    self.inner.seen_dirty.store(true, Ordering::SeqCst);
+                }
+                return Err("rekey_not_pinned");
+            }
+            m.seen.key = Some(new.key.clone());
+            m.seen.key_since = new.not_before;
+            m.seen.key_until = new.not_after;
+        }
+        self.forget_nonces(machine);
+        // The machine reconnects on its new key by itself; a connection
+        // left on the old one is cut by the next recheck (`key_changed`).
+        self.inner.audit.event(
+            "machine_key_continued",
+            [
+                ("machine", json!(machine)),
+                ("old_key", json!(old.key)),
+                ("new_key", json!(new.key)),
+            ],
+        );
+        Ok(new.key)
+    }
+
+    /// Forgets `machine`'s open continuity nonces (its pin moved).
+    fn forget_nonces(&self, machine: &str) {
+        self.inner
+            .rekey_nonces
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|_, (n, _)| n != machine);
+    }
+
     /// Re-pins `machine`: to `key` (the SHA-256 of the public key, as
     /// hex) when given, otherwise to the next certificate seen. The
     /// machine's current connection is cut. Without `key`, whoever presents
@@ -1133,6 +1291,7 @@ impl Relay {
             (had, take_offline(&mut st, machine))
         };
         self.inner.seen_dirty.store(true, Ordering::SeqCst);
+        self.forget_nonces(machine);
         self.inner.audit.event(
             "machine_repinned",
             [
@@ -1409,6 +1568,16 @@ impl Drop for MachineSlot {
                 m.remove(&self.machine);
             }
         }
+    }
+}
+
+/// Says so when a new key may take a pinned name on time alone.
+fn warn_renewal_window(cfg: &Config) {
+    if cfg.machine_key_renewal_days > 0 {
+        tracing::warn!(
+            days = cfg.machine_key_renewal_days,
+            "machine_key_renewal_days is above 0: in the last days of a machine's pinned certificate, any newer certificate for its name takes it without the old key's proof; key continuity (POST /relay/v1/rekey) needs no window"
+        );
     }
 }
 

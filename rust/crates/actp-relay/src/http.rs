@@ -10,6 +10,7 @@
 //! | `GET /relay/v1/machines` | admin token | who is online, last seen |
 //! | `GET /relay/v1/stop` | admin token | the org-wide stop |
 //! | `POST /relay/v1/stop`, `POST /relay/v1/release` | admin token | press, release (`{"reason": …}`) |
+//! | `POST /relay/v1/rekey/challenge`, `POST /relay/v1/rekey` | a machine, on its pinned key | key continuity: a nonce, then the next certificate with the pinned key's signature ([`crate::Relay::rekey`]) |
 //! | `POST /relay/v1/repin` | admin token | forget or set a machine's pinned key (`{"machine": …, "reason": …, "key"?: …}`) |
 //!
 //! Caller and management routes are rate limited per IP address. The relay
@@ -27,9 +28,9 @@ use std::time::{Duration, Instant};
 
 use actp_proto::api;
 use actp_proto::relay::{
-    Control, HEADER_ON_BEHALF_OF, OpenedBy, PATH_CONNECT, PATH_ISSUER, PATH_STREAM, PATH_TUNNEL,
-    PROTOCOL_CONTROL, PROTOCOL_STREAM, PROTOCOL_TUNNEL, valid_machine_name, valid_on_behalf_of,
-    valid_stream_id,
+    Control, HEADER_ON_BEHALF_OF, OpenedBy, PATH_CONNECT, PATH_ISSUER, PATH_REKEY,
+    PATH_REKEY_CHALLENGE, PATH_STREAM, PATH_TUNNEL, PROTOCOL_CONTROL, PROTOCOL_STREAM,
+    PROTOCOL_TUNNEL, valid_machine_name, valid_on_behalf_of, valid_stream_id,
 };
 use actp_proto::wsio::WsIo;
 use base64::Engine;
@@ -131,6 +132,9 @@ async fn handle(
     {
         return issuer(relay, peer, req, rest).await;
     }
+    if path == PATH_REKEY_CHALLENGE || path == PATH_REKEY {
+        return rekey(relay, peer, req, &path).await;
+    }
     // Everything else is open to anyone on the network: rate limited.
     if !relay.callers().allow(peer.remote.ip()) {
         relay.refusal(
@@ -163,6 +167,84 @@ async fn handle(
 }
 
 // ---- machines ----
+
+/// Key continuity: `POST /relay/v1/rekey/challenge` for a nonce, then
+/// `POST /relay/v1/rekey` with the next certificate and the pinned key's
+/// signature over it ([`Relay::rekey`]). Machines only, on the pinned key.
+async fn rekey(relay: &Relay, peer: &Peer, req: Request<Incoming>, path: &str) -> Resp {
+    let machine = match machine_of(relay, peer, "rekey") {
+        Ok(m) => m,
+        Err(r) => return *r,
+    };
+    if req.method() != Method::POST {
+        let mut r = error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method_not_allowed",
+            "POST only",
+        );
+        r.headers_mut()
+            .insert(header::ALLOW, HeaderValue::from_static("POST"));
+        return r;
+    }
+    if path == PATH_REKEY_CHALLENGE {
+        return match relay.rekey_challenge(&machine) {
+            Ok(nonce) => json_resp(
+                StatusCode::OK,
+                serde_json::to_string(&actp_proto::relay::RekeyChallenge { nonce })
+                    .expect("encodes"),
+            ),
+            Err(why) => error(
+                StatusCode::TOO_MANY_REQUESTS,
+                why,
+                "too many open challenges",
+            ),
+        };
+    }
+    let body = match Limited::new(req.into_body(), 64 << 10).collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(_) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "the body is too large",
+            );
+        }
+    };
+    let Ok(ask) = serde_json::from_slice::<actp_proto::relay::RekeyRequest>(&body) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "not a continuity request",
+        );
+    };
+    match relay.rekey(&machine, &peer.chain[0], ask) {
+        Ok(new_key) => json_resp(
+            StatusCode::OK,
+            json!({ "machine": machine, "key": new_key }).to_string(),
+        ),
+        Err("rekey_not_saved") => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "rekey_not_saved",
+            "the relay could not record the new key: the old one stays pinned, try again later",
+        ),
+        Err(why) => {
+            relay.refusal(
+                "machine_refused",
+                [
+                    ("machine", json!(machine)),
+                    ("remote", json!(peer.remote.to_string())),
+                    ("route", json!("rekey")),
+                    ("reason", json!(why)),
+                ],
+            );
+            error(
+                StatusCode::FORBIDDEN,
+                why,
+                "the next certificate was not taken: see the reason",
+            )
+        }
+    }
+}
 
 /// The verified machine of a connection, or the response refusing it.
 fn machine_of(relay: &Relay, peer: &Peer, route: &str) -> Result<String, Box<Resp>> {

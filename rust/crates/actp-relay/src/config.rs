@@ -67,9 +67,11 @@ pub struct Config {
     pub max_connections: usize,
     #[serde(default = "default_max_connections_per_ip")]
     pub max_connections_per_ip: usize,
-    /// How close to its expiry (days) a machine's pinned certificate must be
-    /// for a certificate with a new key to be taken as its renewal (30).
-    /// Earlier, or with 0, a new key is refused until an admin re-pins.
+    /// Off (0) by default: a machine moves its pin to a new key by key
+    /// continuity, with the old key's signature, or an admin re-pins it.
+    /// Set, how close to its expiry (days) a machine's pinned certificate
+    /// must be for a newer certificate with a new key to be taken as its
+    /// renewal without that proof (at most 90; warned about at start).
     #[serde(default = "default_key_renewal_days")]
     pub machine_key_renewal_days: u64,
     /// Device connections held at once per machine, before any becomes a
@@ -125,7 +127,7 @@ impl std::fmt::Debug for Issuer {
 }
 
 fn default_key_renewal_days() -> u64 {
-    30
+    0
 }
 
 fn default_max_connections_per_machine() -> usize {

@@ -24,6 +24,93 @@ pub const PATH_TUNNEL: &str = "/relay/v1/tunnel/";
 /// prefix plus the issuer's path (docs/relay.md, the issuer pass-through).
 pub const PATH_ISSUER: &str = "/relay/v1/issuer";
 
+/// Key continuity (docs/relay.md): a machine asks for a nonce here, then
+/// posts its next certificate to [`PATH_REKEY`] with a signature by the key
+/// its name is pinned to.
+pub const PATH_REKEY_CHALLENGE: &str = "/relay/v1/rekey/challenge";
+pub const PATH_REKEY: &str = "/relay/v1/rekey";
+/// How long a continuity nonce is good for, in seconds.
+pub const REKEY_NONCE_SECONDS: u64 = 60;
+
+/// The relay's answer at [`PATH_REKEY_CHALLENGE`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RekeyChallenge {
+    /// 32 random bytes as lowercase hex; good once, for this machine, for
+    /// [`REKEY_NONCE_SECONDS`].
+    pub nonce: String,
+}
+
+/// What a machine posts at [`PATH_REKEY`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RekeyRequest {
+    /// The next certificate chain, leaf first, each DER in standard base64.
+    pub certificates: Vec<String>,
+    /// The nonce from [`PATH_REKEY_CHALLENGE`].
+    pub nonce: String,
+    /// The TLS signature scheme of `signature` (`u16`, as in TLS).
+    pub scheme: u16,
+    /// The pinned key's signature over [`rekey_message`], standard base64.
+    pub signature: String,
+}
+
+/// What the pinned key signs to vouch for the next certificate: a domain,
+/// the machine's address and the nonce (neither can hold a newline), then
+/// the next leaf certificate's DER, whole.
+pub fn rekey_message(machine: &str, nonce: &str, next_leaf: &[u8]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(next_leaf.len() + machine.len() + nonce.len() + 32);
+    m.extend_from_slice(b"actp-relay-rekey-v1\n");
+    m.extend_from_slice(machine.as_bytes());
+    m.push(b'\n');
+    m.extend_from_slice(nonce.as_bytes());
+    m.push(b'\n');
+    m.extend_from_slice(next_leaf);
+    m
+}
+
+/// The signature schemes a continuity proof may use.
+const REKEY_SCHEMES: [rustls::SignatureScheme; 4] = [
+    rustls::SignatureScheme::ED25519,
+    rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+    rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+    rustls::SignatureScheme::RSA_PSS_SHA256,
+];
+
+/// Signs `message` with `key` (a machine's device key): the scheme, as
+/// its TLS number, and the signature.
+pub fn rekey_sign(
+    key: &rustls::pki_types::PrivateKeyDer<'_>,
+    message: &[u8],
+) -> Result<(u16, Vec<u8>), String> {
+    let key = rustls::crypto::ring::default_provider()
+        .key_provider
+        .load_private_key(key.clone_key())
+        .map_err(|e| format!("the device key: {e}"))?;
+    let signer = key
+        .choose_scheme(&REKEY_SCHEMES)
+        .ok_or("the device key's type cannot sign a continuity proof")?;
+    let sig = signer.sign(message).map_err(|e| e.to_string())?;
+    Ok((u16::from(signer.scheme()), sig))
+}
+
+/// Whether `signature` over `message`, by `scheme`, verifies with the
+/// public key of the certificate `signer` (DER).
+pub fn rekey_verify(signer: &[u8], scheme: u16, message: &[u8], signature: &[u8]) -> bool {
+    use rustls::SignatureScheme as S;
+    use webpki::ring as alg;
+    let algorithm: &dyn rustls::pki_types::SignatureVerificationAlgorithm = match S::from(scheme) {
+        S::ED25519 => alg::ED25519,
+        S::ECDSA_NISTP256_SHA256 => alg::ECDSA_P256_SHA256,
+        S::ECDSA_NISTP384_SHA384 => alg::ECDSA_P384_SHA384,
+        S::RSA_PSS_SHA256 => alg::RSA_PSS_2048_8192_SHA256_LEGACY_KEY,
+        _ => return false,
+    };
+    let der = rustls::pki_types::CertificateDer::from(signer);
+    let Ok(cert) = webpki::EndEntityCert::try_from(&der) else {
+        return false;
+    };
+    cert.verify_signature(algorithm, message, signature).is_ok()
+}
+
 /// WebSocket subprotocols of the two machine connections and the caller's
 /// tunnel.
 pub const PROTOCOL_CONTROL: &str = "actp-relay.v2";

@@ -58,6 +58,12 @@ pub struct RelayOptions {
     pub max_streams: usize,
     /// How long dialing one data stream may take (10 s).
     pub dial_timeout: Duration,
+    /// The device certificate's files, for key continuity
+    /// ([`crate::continuity`]): when set, a `<cert>.next` / `<key>.next`
+    /// pair is moved to with the current key's proof. `None`: never.
+    pub continuity: Option<config::Relay>,
+    /// How often to look for a next certificate while connected (60 s).
+    pub continuity_every: Duration,
 }
 
 impl RelayOptions {
@@ -75,6 +81,8 @@ impl RelayOptions {
             dead_after: Duration::from_secs(60),
             max_streams: 64,
             dial_timeout: Duration::from_secs(10),
+            continuity: None,
+            continuity_every: Duration::from_secs(60),
         }
     }
 }
@@ -129,9 +137,18 @@ impl Acceptor for RelayAcceptor {
 /// TLS for the relay from the config: the device certificate as the client
 /// certificate, and the configured roots (or the OS store) for the relay.
 pub fn client_tls(relay: &config::Relay) -> io::Result<Arc<rustls::ClientConfig>> {
+    let (certs, key) = device_chain(relay)?;
+    client_tls_with(relay, certs, key)
+}
+
+/// [`client_tls`] with a device certificate chain and key already read.
+pub(crate) fn client_tls_with(
+    relay: &config::Relay,
+    certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
+) -> io::Result<Arc<rustls::ClientConfig>> {
     use rustls::pki_types::CertificateDer;
     use rustls::pki_types::pem::PemObject;
-    let (certs, key) = device_chain(relay)?;
     let mut roots = rustls::RootCertStore::empty();
     if relay.ca.is_empty() {
         for c in rustls_native_certs::load_native_certs().certs {
@@ -158,7 +175,7 @@ pub fn client_tls(relay: &config::Relay) -> io::Result<Arc<rustls::ClientConfig>
     Ok(Arc::new(cfg))
 }
 
-fn device_chain(
+pub(crate) fn device_chain(
     relay: &config::Relay,
 ) -> io::Result<(
     Vec<rustls::pki_types::CertificateDer<'static>>,
@@ -224,7 +241,19 @@ async fn dial(
     );
     match tokio::time::timeout(opts.dial_timeout, connect).await {
         Err(_) => Err("timed out".into()),
-        Ok(Err(tungstenite::Error::Http(resp))) => Err(format!("HTTP {}", resp.status())),
+        Ok(Err(tungstenite::Error::Http(resp))) => {
+            // The relay's error code, when it gave a plain one.
+            let code = resp
+                .body()
+                .as_deref()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+                .filter(|c| c.len() <= 64 && c.bytes().all(|b| b.is_ascii_graphic()));
+            Err(match code {
+                Some(c) => format!("HTTP {} ({c})", resp.status()),
+                None => format!("HTTP {}", resp.status()),
+            })
+        }
         Ok(Err(e)) => Err(e.to_string()),
         Ok(Ok((ws, resp))) => {
             let chosen = resp
@@ -241,14 +270,47 @@ async fn dial(
 
 async fn control_loop(
     server: Server,
-    opts: RelayOptions,
+    mut opts: RelayOptions,
     tx: mpsc::Sender<Connecting>,
     status: watch::Sender<Status>,
     shutdown: CancellationToken,
 ) {
     let streams = Arc::new(Semaphore::new(opts.max_streams));
     let mut backoff = Duration::from_secs(1);
+    // The identity can change under key continuity: read before every dial.
+    let identity: crate::continuity::Shared =
+        Arc::new(std::sync::RwLock::new(crate::continuity::Identity {
+            tls: opts.tls.clone(),
+            e2e: opts.e2e.clone(),
+            pair: opts
+                .continuity
+                .as_ref()
+                .and_then(|f| crate::continuity::Pair::read(f).ok().map(Arc::new)),
+        }));
+    let generation: crate::continuity::Generation = Arc::new(watch::channel(0u64).0);
+    let mut generations = generation.subscribe();
+    if let Some(files) = opts.continuity.clone() {
+        tokio::spawn(crate::continuity::run(
+            files,
+            identity.clone(),
+            generation.clone(),
+            status.subscribe(),
+            opts.continuity_every,
+            shutdown.clone(),
+        ));
+    }
+    // A `.next` pair being tried after the relay refused the current key:
+    // the relay may have moved the pin already (a lost answer, files that
+    // could not be put in place, an admin re-pin to the new key).
+    let mut trial: Option<(Arc<crate::continuity::Pair>, crate::continuity::Identity)> = None;
+    let mut last_trial: Option<Instant> = None;
     loop {
+        {
+            let id = identity.read().unwrap_or_else(|p| p.into_inner());
+            opts.tls = id.tls.clone();
+            opts.e2e = id.e2e.clone();
+        }
+        let dialed_generation = *generations.borrow_and_update();
         let _ = status.send(Status::Connecting);
         let started = Instant::now();
         let dialed = tokio::select! {
@@ -258,7 +320,27 @@ async fn control_loop(
         let error = match dialed {
             Ok(ws) => {
                 tracing::info!(relay = %opts.url, "connected to the relay");
-                let e = run_control(&server, &opts, ws, &tx, &status, &streams, &shutdown).await;
+                if let (Some((pair, _)), Some(files)) = (trial.take(), &opts.continuity) {
+                    tracing::info!(
+                        "the relay took the next device certificate; putting it in place"
+                    );
+                    let files = files.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        crate::continuity::install(&files, &pair)
+                    })
+                    .await;
+                }
+                let e = tokio::select! {
+                    e = run_control(&server, &opts, ws, &tx, &status, &streams, &shutdown) => e,
+                    _ = changed_from(&mut generations, dialed_generation) => {
+                        // A new device key: reconnect with it at once.
+                        backoff = Duration::from_millis(100);
+                        let _ = status.send(Status::Disconnected {
+                            error: "moving to the next device certificate".into(),
+                        });
+                        continue;
+                    }
+                };
                 if shutdown.is_cancelled() {
                     return;
                 }
@@ -267,7 +349,39 @@ async fn control_loop(
                 }
                 e
             }
-            Err(e) => e,
+            Err(e) => {
+                if let Some((_, before)) = trial.take() {
+                    // The relay did not take the next pair either: back to
+                    // the current one.
+                    *identity.write().unwrap_or_else(|p| p.into_inner()) = before;
+                } else if e.starts_with("HTTP 403")
+                    // The code, or none at all (a proxy may hold back the
+                    // body): either way the key may be what was refused.
+                    && (e.contains("(machine_key_changed)") || !e.contains('('))
+                    && last_trial.is_none_or(|t| t.elapsed() > Duration::from_secs(600))
+                    && let Some(files) = &opts.continuity
+                    && let Some(pair) = crate::continuity::next_pair(files)
+                {
+                    match pair.identity(files) {
+                        Ok(next) => {
+                            tracing::info!(
+                                "the relay refused the current device key; trying the next one"
+                            );
+                            let before = std::mem::replace(
+                                &mut *identity.write().unwrap_or_else(|p| p.into_inner()),
+                                next,
+                            );
+                            trial = Some((pair, before));
+                            last_trial = Some(Instant::now());
+                            continue;
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "the next device certificate cannot be used")
+                        }
+                    }
+                }
+                e
+            }
         };
         tracing::warn!(relay = %opts.url, error = %error, retry_in = ?backoff, "relay connection down");
         let _ = status.send(Status::Disconnected { error });
@@ -276,6 +390,18 @@ async fn control_loop(
         tokio::select! {
             _ = shutdown.cancelled() => return,
             _ = tokio::time::sleep(wait) => {}
+        }
+    }
+}
+
+/// Returns once the identity generation is other than `dialed`.
+async fn changed_from(rx: &mut watch::Receiver<u64>, dialed: u64) {
+    loop {
+        if rx.changed().await.is_err() {
+            return std::future::pending().await;
+        }
+        if *rx.borrow_and_update() != dialed {
+            return;
         }
     }
 }

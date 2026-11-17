@@ -489,7 +489,11 @@ async fn cmd_serve(args: &[String]) -> Result<(), Exit> {
     // Relay mode: nothing listens here; the machine dials out to the relay.
     let relay_tls = match &sc.relay {
         Some(r) => Some((
-            actp_server::relay::client_tls(r)?,
+            {
+                // A device certificate swap cut short: start on the next one.
+                actp_server::continuity::repair(r);
+                actp_server::relay::client_tls(r)?
+            },
             actp_server::relay::stream_tls(r)?,
         )),
         None => None,
@@ -519,10 +523,13 @@ async fn cmd_serve(args: &[String]) -> Result<(), Exit> {
                 &sc.tls_key,
             )?)
         };
-        let relay =
-            sc.relay.as_ref().zip(relay_tls).map(|(r, (tls, e2e))| {
-                actp_server::relay::RelayOptions::new(r.url.clone(), tls, e2e)
-            });
+        let relay = sc.relay.as_ref().zip(relay_tls).map(|(r, (tls, e2e))| {
+            let mut o = actp_server::relay::RelayOptions::new(r.url.clone(), tls, e2e);
+            // Key continuity: a `<cert>.next` / `<key>.next` pair is
+            // moved to with the current key's proof.
+            o.continuity = Some(r.clone());
+            o
+        });
         tokio::spawn(async move {
             if let Some(opts) = relay {
                 let acceptor =

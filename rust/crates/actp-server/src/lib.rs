@@ -17,6 +17,7 @@ pub mod agentproc;
 pub mod audit;
 pub mod auth;
 pub mod config;
+pub mod continuity;
 mod fsutil;
 pub mod http;
 mod leftovers;
