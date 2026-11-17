@@ -1003,7 +1003,17 @@ async fn the_machine_checks_what_the_relay_says() {
     )
     .await;
     c.wait_connected().await;
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    let dialed_streams = || {
+        fake.dialed
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.starts_with("/relay/v1/stream/"))
+            .count()
+    };
+    eventually("the first stream dialed", || dialed_streams() >= 1).await;
+    // Give the machine time to (wrongly) dial the others.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
     let streams: Vec<String> = fake
         .dialed
         .lock()
