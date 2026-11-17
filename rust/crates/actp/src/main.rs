@@ -191,7 +191,7 @@ async fn cmd_bridge(args: &[String]) -> Result<(), Exit> {
             "device-crl",
             "machine-name",
         ],
-        &["yes", "no"],
+        &["yes", "no", "no-device-crl"],
     )?;
     if !f.rest.is_empty() {
         let prompt = f.get("p").or(f.get("prompt")).unwrap_or("");
@@ -294,6 +294,13 @@ async fn cmd_bridge(args: &[String]) -> Result<(), Exit> {
                 }
             };
             let crls: Vec<PathBuf> = f.all("device-crl").map(PathBuf::from).collect();
+            // Revocation protects a caller from a compromised relay only if
+            // the caller checks it: no lists must be asked for in so many words.
+            if crls.is_empty() && f.get("no-device-crl") != Some("true") {
+                return Err(fail(
+                    "--relay-machine needs --device-crl FILE (the relay's device revocation lists), or --no-device-crl to accept revoked machine certificates",
+                ));
+            }
             Some(
                 actp_client::RelayRoute::from_files(
                     machine,

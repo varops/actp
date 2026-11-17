@@ -37,7 +37,12 @@ What they can do:
 - see who called which machine, when, for how long and how many bytes moved (what the relay's own audit records);
 - open tunnels to machines themselves, which get them a TLS connection to a machine and nothing more without credentials the machine accepts.
 
-Keep the device roots and the caller roots apart, protect the caller certificates' keys (they are what the relay checks), and keep the relay off the open internet where the org can.
+Keep the device roots and the caller roots apart, protect the caller certificates' keys (they are what the relay checks), make callers check device revocation lists themselves (the relay's lists do not protect a caller from a compromised relay), and keep the relay off the open internet where the org can.
+
+Two things the whole design rests on:
+
+- **Machine names nobody can change.** A caller knows it reached the machine because the certificate names it. Use an identifier fixed by the hardware or the MDM (the serial number, the hardware UUID), never a computer name a user can edit: a laptop renamed after another, with a certificate re-issued to match, would pass as it. The relay records both certificates' fingerprints in `machine_replaced` when a second certificate claims a live machine's name.
+- **Separate certificate hierarchies.** `device_ca` and `caller_ca` must be separate hierarchies, neither above the other. The relay refuses to start when they share a root (compared by subject and key, so a re-issued root counts) or one root is issued by the other, and refuses at every connection a certificate that is valid as both kinds (nesting deeper than the roots show). Callers check machines against the device roots only, so they rely on this too.
 
 ## The machine
 
@@ -75,11 +80,12 @@ machine_name: cn                          # cn, dns or uri: which certificate na
 blocked_machines: []                      # addresses refused even with a valid certificate
 caller_ca: /etc/actp-relay/caller-ca.pem  # roots of the caller certificates (the IT app's); no root shared with device_ca
 caller_crls: []                           # optional revocation lists for caller certificates
-caller_name: cn                           # which caller certificate name is recorded in the audit
+caller_name: cn                           # which caller certificate name names the caller (audit, blocks, limits)
 blocked_callers: []                       # callers refused even with a valid certificate
 state_dir: /var/lib/actp-relay            # stop.json, machines.json
 log_dir: /var/log/actp-relay              # audit.jsonl
 max_streams_per_machine: 32
+max_streams_per_caller: 8                 # streams one caller may have to one machine at once
 caller_rate: {per_second: 20, burst: 60}  # per caller IP, for tunnels and the management API
 max_connections: 20000                    # connections held at once by anyone but machines
 max_connections_per_ip: 1000              # the same per IP address (IPv6: per /64)
@@ -93,7 +99,9 @@ admin_tokens:
 actp-relay serve --config /etc/actp-relay/actp-relay.yaml
 ```
 
-The relay must terminate TLS itself: a TLS proxy in front of it would hide the device certificates. It serves from the root path only.
+The relay must terminate TLS itself: a TLS proxy in front of it would hide the device certificates. It serves from the root path only, and only TLS 1.3, so client certificates (which name every machine and caller) are never sent in the clear.
+
+A caller's name follows the same rules as a machine address (below); a caller certificate whose name does not is refused. `blocked_machines` and `blocked_callers` are compared exactly, case included.
 
 `SIGHUP` reloads the blocked machines and callers, the admin tokens, the rate limits, `max_connections_per_ip`, the device and caller roots and the revocation lists. The listen address, the folders, `audit_max_mb` and `max_connections` need a restart.
 
@@ -117,19 +125,20 @@ actp claude@https://relay.example.com --relay-machine C02XK1ABJG5H \
   --device-ca device-ca.pem --token-env ACTP_TOKEN
 ```
 
-`--device-crl FILE` (repeatable) adds the device revocation lists, and `--machine-name cn|dns|uri` says which certificate name is the address, as at the relay. The Go `actp` has none of this. A program using the bridge library sets `actp_client::Options::relay` to an `actp_client::RelayRoute` (`RelayRoute::from_files` builds one from the same files).
+`--device-crl FILE` (repeatable) gives the device revocation lists, re-read before every connection; the bridge refuses to start without one unless told `--no-device-crl`, because only a caller's own check keeps a compromised relay from presenting a revoked machine certificate. `--machine-name cn|dns|uri` says which certificate name is the address, and must match the relay's `machine_name`. The Go `actp` has none of this. A program using the bridge library sets `actp_client::Options::relay` to an `actp_client::RelayRoute` (`RelayRoute::from_files` builds one from the same files).
 
-The caller opens `wss://<relay>/relay/v1/tunnel/<machine>` (subprotocol `actp-relay-tunnel.v1`) with its caller certificate. Inside the tunnel it opens TLS 1.3 (ALPN `actp-e2e.v1`, no session resumption) and accepts the machine's certificate only if it chains to the device roots, is not revoked by the given lists, is valid for client use (as at the relay) and names exactly the machine asked for. Then it speaks actp as usual.
+The caller opens `wss://<relay>/relay/v1/tunnel/<machine>` (subprotocol `actp-relay-tunnel.v1`) with its caller certificate. Inside the tunnel it opens TLS 1.3 (ALPN `actp-e2e.v1`, required by both ends; no session resumption) and accepts the machine's certificate only if it chains to the device roots, is not revoked by the given lists, is valid for client use (as at the relay) and names exactly the machine asked for. Then it speaks actp as usual.
 
 | Answer | Meaning |
 | --- | --- |
-| `401 caller_certificate_required` | No caller certificate (a device certificate is not one). |
-| `403 bad_caller_certificate` | The caller certificate is no longer valid, or names no usable caller. |
+| `401 caller_certificate_required` | No client certificate. |
+| `403 bad_caller_certificate` | Not a usable caller certificate: a device certificate, one no longer valid, one valid as both kinds, or one whose name is not a valid caller name. |
 | `403 caller_blocked` | The caller is in `blocked_callers`. |
 | `503 machine_offline` | The machine is not connected to the relay. |
 | `503 org_stopped` | The org-wide stop is on. |
 | `429 machine_busy` | Too many callers are using the machine (`max_streams_per_machine`). |
-| `504 machine_timeout` | The machine did not open a stream in time. |
+| `429 caller_busy` | This caller already has `max_streams_per_caller` streams to the machine. |
+| `504 machine_timeout` | The machine did not open a stream in time. A stop, the machine going offline, or the caller being blocked meanwhile answers at once instead. |
 | `429 rate_limited` | Too many requests from this IP address (`caller_rate`). |
 
 Caller certificates are checked again on every tunnel request, on every reload and every ten seconds; a caller whose certificate is revoked, expires or is blocked is cut off with its sessions. `caller_rate` and `max_connections_per_ip` count per IP address (per /64 for IPv6), so callers behind one NAT address share them; the rate limit covers every route except the machines' own.
@@ -174,7 +183,8 @@ Keep `state_dir` with the relay: a relay that starts without its `stop.json` kno
 
 | Event | Fields |
 | --- | --- |
-| `machine_online`, `machine_replaced` | `machine`, `remote` |
+| `machine_online` | `machine`, `remote` |
+| `machine_replaced` | `machine`, `remote`, `old_certificate`, `new_certificate` (SHA-256 fingerprints) |
 | `machine_offline` | `machine`, `seconds`, `reason` (`closed`, `silent`, `blocked`, `certificate_invalid`, `relay stopping`, …) |
 | `machine_refused` | `remote`, `route`, `reason`, and `machine` when the certificate named one |
 | `session_open` | `session`, `machine`, `caller`, `remote` |
@@ -186,7 +196,7 @@ Keep `state_dir` with the relay: a relay that starts without its `stop.json` kno
 | `org_stop_not_saved`, `org_stop_saved` | `error` / nothing |
 | `org_release` | `by`, `reason` |
 | `admin_refused` | `remote`, `route` |
-| `config_reloaded` | `blocked_machines`, `machines_cut` |
+| `config_reloaded` | `blocked_machines`, `blocked_callers` |
 | `refusals_not_logged` | `kind`, `count` |
 
 Of each refusal kind (`caller_refused`, `caller_rate_limited`, `connection_refused`, `machine_refused`, `admin_refused`), at most 20 a minute are written, across all callers; the rest are counted in `refusals_not_logged`. A flood of refusals therefore leaves only a count of everyone's refusals for that minute; sessions, machines and the stop are always recorded.
@@ -236,8 +246,8 @@ The machine's audit log records `auth_refused` with the reason and the caller fo
 
 Between a machine and the relay (`actp_proto::relay`):
 
-1. The machine opens `wss://<relay>/relay/v1/connect` with its device certificate and the WebSocket subprotocol `actp-relay.v1`. The relay answers with `{"type":"hello","machine":"<address>","stopped":<bool>}` and pings every 15 s; the machine pings every 20 s. Either side drops a connection that stays silent too long.
-2. A caller opens `wss://<relay>/relay/v1/tunnel/<machine>` with its caller certificate and subprotocol `actp-relay-tunnel.v1`. The relay sends the machine `{"type":"open","stream":"<64 hex>"}`; the machine opens `wss://<relay>/relay/v1/stream/<id>` with its certificate and subprotocol `actp-relay-stream.v1`. Only the machine that was asked can take the stream. The relay answers the caller's upgrade once the stream is there, and joins the two: binary messages on both carry the same bytes, the caller's TLS to the machine (`actp_proto::e2e`), which the machine answers with its device certificate and then serves like any other connection. Closing either side closes both directions: a half-closed connection is not kept half open.
+1. The machine opens `wss://<relay>/relay/v1/connect` with its device certificate and the WebSocket subprotocol `actp-relay.v2` (v1 carried plain HTTP on its streams; a v1 machine and a v2 relay refuse each other). The relay answers with `{"type":"hello","machine":"<address>","stopped":<bool>}` and pings every 15 s; the machine pings every 20 s. Either side drops a connection that stays silent too long.
+2. A caller opens `wss://<relay>/relay/v1/tunnel/<machine>` with its caller certificate and subprotocol `actp-relay-tunnel.v1`. The relay sends the machine `{"type":"open","stream":"<64 hex>"}`; the machine opens `wss://<relay>/relay/v1/stream/<id>` with its certificate and subprotocol `actp-relay-stream.v2`. Only the machine that was asked can take the stream. The relay answers the caller's upgrade once the stream is there, and joins the two: binary messages on both carry the same bytes, the caller's TLS to the machine (`actp_proto::e2e`), which the machine answers with its device certificate and then serves like any other connection. Closing either side closes both directions: a half-closed connection is not kept half open.
 3. `{"type":"stop"}` and `{"type":"release"}` carry the org-wide stop, and so does the hello's `stopped`. While it is on, the machine ends every link and refuses new links and resumes with `503 org_stopped`, even if the relay goes on routing callers to it.
 
 Unknown message types are ignored, so a newer relay can add messages.

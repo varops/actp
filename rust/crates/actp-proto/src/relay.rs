@@ -23,8 +23,8 @@ pub const PATH_TUNNEL: &str = "/relay/v1/tunnel/";
 
 /// WebSocket subprotocols of the two machine connections and the caller's
 /// tunnel.
-pub const PROTOCOL_CONTROL: &str = "actp-relay.v1";
-pub const PROTOCOL_STREAM: &str = "actp-relay-stream.v1";
+pub const PROTOCOL_CONTROL: &str = "actp-relay.v2";
+pub const PROTOCOL_STREAM: &str = "actp-relay-stream.v2";
 pub const PROTOCOL_TUNNEL: &str = "actp-relay-tunnel.v1";
 
 /// Length of a stream id: 32 random bytes as lowercase hex.

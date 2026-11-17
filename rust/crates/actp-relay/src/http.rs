@@ -532,6 +532,26 @@ async fn tunnel(relay: &Relay, peer: &Peer, mut req: Request<Incoming>, raw_mach
                 "machine_timeout",
                 "the machine did not answer in time",
             ),
+            Refusal::CallerBusy => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "caller_busy",
+                "this caller has as many streams to this machine as it may",
+            ),
+            Refusal::Cut("org_stop") => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "org_stopped",
+                "the organization-wide stop is on",
+            ),
+            Refusal::Cut(why @ ("caller_blocked" | "caller_certificate_invalid")) => (
+                StatusCode::FORBIDDEN,
+                why,
+                "this caller was cut off while the machine was being asked",
+            ),
+            Refusal::Cut(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "machine_offline",
+                "the machine went offline while it was being asked",
+            ),
         };
         relay.refusal(
             "caller_refused",
@@ -560,11 +580,19 @@ async fn tunnel(relay: &Relay, peer: &Peer, mut req: Request<Incoming>, raw_mach
         session,
     };
     // The 101 waits for the machine's stream, so a caller is told in plain
-    // HTTP why it cannot have a tunnel.
-    let (stream, slot) = match relay.open_stream(&machine).await {
-        Ok(s) => s,
-        Err(r) => return refuse(r),
+    // HTTP why it cannot have a tunnel; a cut meanwhile (the stop, the
+    // machine gone, the caller revoked) answers at once, and is checked
+    // once more before the 101.
+    let (stream, slot) = tokio::select! {
+        opened = relay.open_stream(&machine) => match opened {
+            Ok(s) => s,
+            Err(r) => return refuse(r),
+        },
+        _ = cut.cancelled() => return refuse(Refusal::Cut(cut.why())),
     };
+    if cut.is_cut() {
+        return refuse(Refusal::Cut(cut.why()));
+    }
     relay.audit().event(
         "session_open",
         [

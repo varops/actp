@@ -70,13 +70,25 @@ pub struct RelayRoute {
     /// TLS to the machine, end to end inside the relayed stream:
     /// [`actp_proto::e2e::client_config`] for this machine.
     pub machine_tls: Arc<rustls::ClientConfig>,
+    /// Builds `machine_tls` afresh before every connection, so revocation
+    /// lists that change on disk are read again ([`RelayRoute::from_files`]
+    /// sets it). An error fails that connection attempt.
+    pub reload: Option<MachineTls>,
 }
+
+/// See [`RelayRoute::reload`].
+pub type MachineTls = Arc<dyn Fn() -> Result<Arc<rustls::ClientConfig>, String> + Send + Sync>;
 
 impl RelayRoute {
     /// A route from PEM files: the caller certificate and key the relay
     /// asks for, the roots for the relay's own certificate (`None`: the OS
     /// store), the org's device roots and revocation lists (PEM or DER) for
-    /// the machine's certificate, and which name in it is the address.
+    /// the machine's certificate, and which name in it is the address. The
+    /// device roots and lists are read again before every connection.
+    ///
+    /// Without revocation lists a revoked machine certificate is accepted:
+    /// revoking a machine at the relay does not protect a caller from a
+    /// relay that is itself compromised. Pass the lists the relay uses.
     pub fn from_files(
         machine: &str,
         caller_cert: &std::path::Path,
@@ -112,31 +124,39 @@ impl RelayRoute {
                 }
             }
         }
+        // TLS 1.3 only: the caller certificate is not sent in the clear.
         let relay_tls = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
-        .with_safe_default_protocol_versions()
+        .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| e.to_string())?
         .with_root_certificates(roots)
         .with_client_auth_cert(certs(caller_cert)?, key)
         .map_err(|e| format!("{}: {e}", caller_cert.display()))?;
-        let mut crls = Vec::new();
-        for p in device_crls {
-            let bytes = std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?;
-            if bytes.starts_with(b"-----BEGIN") {
-                for c in CertificateRevocationListDer::pem_slice_iter(&bytes) {
-                    crls.push(c.map_err(|e| format!("{}: {e}", p.display()))?);
+        let (machine_name, device_ca, device_crls) = (
+            machine.to_string(),
+            device_ca.to_path_buf(),
+            device_crls.to_vec(),
+        );
+        let reload: MachineTls = Arc::new(move || {
+            let mut crls = Vec::new();
+            for p in &device_crls {
+                let bytes = std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?;
+                if bytes.starts_with(b"-----BEGIN") {
+                    for c in CertificateRevocationListDer::pem_slice_iter(&bytes) {
+                        crls.push(c.map_err(|e| format!("{}: {e}", p.display()))?);
+                    }
+                } else {
+                    crls.push(CertificateRevocationListDer::from(bytes));
                 }
-            } else {
-                crls.push(CertificateRevocationListDer::from(bytes));
             }
-        }
-        let machine_tls =
-            actp_proto::e2e::client_config(&certs(device_ca)?, &crls, which, machine)?;
+            actp_proto::e2e::client_config(&certs(&device_ca)?, &crls, which, &machine_name)
+        });
         Ok(RelayRoute {
             machine: machine.to_string(),
             relay_tls: Arc::new(relay_tls),
-            machine_tls,
+            machine_tls: reload()?,
+            reload: Some(reload),
         })
     }
 }
@@ -249,9 +269,11 @@ where
             async move { to_client(&out, &pending, raw).await }
         }),
     );
-    let tls = match &opts.tls {
-        Some(t) => t.clone(),
-        None => default_tls().map_err(Error::Other)?,
+    let tls = match (&opts.tls, &opts.relay) {
+        (Some(t), _) => t.clone(),
+        // Through a relay the route's own TLS is used; no OS store needed.
+        (None, Some(route)) => route.relay_tls.clone(),
+        (None, None) => default_tls().map_err(Error::Other)?,
     };
     let b = Arc::new(Bridge {
         opts,
@@ -545,6 +567,11 @@ impl Bridge {
             None => self.opts.base_url.as_str(),
         };
         let target = link_url(base, &self.opts.agent).map_err(Error::Other)?;
+        // What to name in errors: through a relay, the machine and the relay.
+        let reached = match &self.opts.relay {
+            Some(route) => format!("{} through {}", route.machine, self.opts.base_url),
+            None => target.clone(),
+        };
         let mut req = target
             .as_str()
             .into_client_request()
@@ -600,7 +627,7 @@ impl Bridge {
             Ok(Ok(Err(e))) => return Err(e),
             Err(_) => {
                 return Err(Error::Other(format!(
-                    "failed to WebSocket dial {target}: timed out"
+                    "failed to WebSocket dial {reached}: timed out"
                 )));
             }
             Ok(Err(tokio_tungstenite::tungstenite::Error::Http(resp))) => {
@@ -619,7 +646,7 @@ impl Bridge {
             }
             Ok(Err(e)) => {
                 return Err(Error::Other(format!(
-                    "failed to WebSocket dial {target}: {e}"
+                    "failed to WebSocket dial {reached}: {e}"
                 )));
             }
             Ok(Ok(Ok(x))) => x,
@@ -689,7 +716,11 @@ impl Bridge {
                 )));
             }
         };
-        tokio_rustls::TlsConnector::from(route.machine_tls.clone())
+        let machine_tls = match &route.reload {
+            Some(reload) => reload().map_err(Error::Other)?,
+            None => route.machine_tls.clone(),
+        };
+        let tls = tokio_rustls::TlsConnector::from(machine_tls)
             .connect(
                 actp_proto::e2e::server_name(),
                 actp_proto::wsio::WsIo::new(ws),
@@ -700,7 +731,14 @@ impl Bridge {
                     "TLS to machine {} through the relay failed: {e}",
                     route.machine
                 ))
-            })
+            })?;
+        if tls.get_ref().1.alpn_protocol() != Some(actp_proto::e2e::ALPN) {
+            return Err(Error::Other(format!(
+                "machine {} did not agree on the actp protocol",
+                route.machine
+            )));
+        }
+        Ok(tls)
     }
 }
 

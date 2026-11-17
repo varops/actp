@@ -4,9 +4,11 @@
 //! - Machines log in with the org's device certificate over mutual TLS. The
 //!   name in the certificate is the machine's address; the relay never
 //!   assigns one.
-//! - A caller reaches a machine at `/m/<address>/…`. The relay forwards the
-//!   request, credentials and all, untouched over a stream the machine opens
-//!   for it. The machine decides who may do what; the relay only routes.
+//! - A caller with a caller certificate opens a tunnel to a machine, and
+//!   runs TLS through it straight to the machine's device certificate. The
+//!   relay joins the tunnel to a stream the machine opens, and carries bytes
+//!   it cannot read or change. The machine decides who may do what; the
+//!   relay only routes.
 //! - The relay knows who is online and when each machine was last seen.
 //! - The org-wide stop drops every session and refuses new ones until it is
 //!   released; machines are told, and end their sessions themselves too.
@@ -49,8 +51,6 @@ pub struct Timing {
     pub dead_after: Duration,
     /// How long a machine has to open a stream for a caller (10 s).
     pub stream_timeout: Duration,
-    /// How long a machine has to answer a forwarded request (60 s).
-    pub response_timeout: Duration,
     /// How long one write to a machine's control connection may take (10 s).
     pub send_timeout: Duration,
     /// How often machines.json and an unsaved stop are written (10 s).
@@ -63,7 +63,6 @@ impl Default for Timing {
             ping_every: Duration::from_secs(15),
             dead_after: Duration::from_secs(45),
             stream_timeout: Duration::from_secs(10),
-            response_timeout: Duration::from_secs(60),
             send_timeout: Duration::from_secs(10),
             flush_every: Duration::from_secs(10),
         }
@@ -85,6 +84,10 @@ impl Cut {
 
     pub(crate) async fn cancelled(&self) {
         self.token.cancelled().await
+    }
+
+    pub(crate) fn is_cut(&self) -> bool {
+        self.token.is_cancelled()
     }
 
     pub(crate) fn why(&self) -> &'static str {
@@ -282,14 +285,19 @@ impl Relay {
     /// that is now blocked is cut off.
     pub fn reload(&self, cfg: Config, tls: tls::Setup) {
         let blocked = cfg.blocked_machines.len();
+        let blocked_callers = cfg.blocked_callers.len();
         self.inner
             .callers
             .set_rate(cfg.caller_rate.per_second, cfg.caller_rate.burst);
         *self.inner.cfg.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(cfg);
         *self.inner.tls.write().unwrap_or_else(|p| p.into_inner()) = Some(tls);
-        self.inner
-            .audit
-            .event("config_reloaded", [("blocked_machines", json!(blocked))]);
+        self.inner.audit.event(
+            "config_reloaded",
+            [
+                ("blocked_machines", json!(blocked)),
+                ("blocked_callers", json!(blocked_callers)),
+            ],
+        );
         tracing::info!("configuration reloaded");
         // Machines now blocked, or with certificates no longer valid, are cut
         // off; off the async workers, as checking can take a while.
@@ -304,24 +312,26 @@ impl Relay {
         }
     }
 
-    /// Whether a device certificate chain is valid now, by the TLS setup in force.
+    /// Whether a device certificate chain is valid now, by the TLS setup in
+    /// force, and not also a caller certificate.
     pub(crate) fn chain_valid(&self, chain: &[CertificateDer<'static>]) -> bool {
-        self.inner
-            .tls
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_ref()
-            .is_some_and(|t| t.still_valid(chain))
+        self.kind(chain) == tls::Kind::Device
     }
 
-    /// Whether a caller certificate chain is valid now.
+    /// Whether a caller certificate chain is valid now, and not also a
+    /// device certificate.
     pub(crate) fn caller_chain_valid(&self, chain: &[CertificateDer<'static>]) -> bool {
+        self.kind(chain) == tls::Kind::Caller
+    }
+
+    /// What a client certificate chain is now, by the TLS setup in force.
+    pub(crate) fn kind(&self, chain: &[CertificateDer<'static>]) -> tls::Kind {
         self.inner
             .tls
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .as_ref()
-            .is_some_and(|t| t.caller_valid(chain))
+            .map_or(tls::Kind::Invalid, |t| t.kind(chain))
     }
 
     /// Whether `caller` is blocked in the configuration in force.
@@ -497,17 +507,30 @@ impl Relay {
                     .peer_certificates()
                     .map(|c| c.iter().map(|c| c.clone().into_owned()).collect())
                     .unwrap_or_default();
-                // Which kind of certificate this is, by the roots that sign
-                // it; the two sets share no root.
-                let machine = match relay.chain_valid(&chain) {
-                    true => chain
-                        .first()
-                        .map(|c| tls::machine_name(c, cfg.machine_name)),
-                    false => None,
-                };
-                let caller = match relay.caller_chain_valid(&chain) {
-                    true => chain.first().map(|c| tls::machine_name(c, cfg.caller_name)),
-                    false => None,
+                // Which kind of certificate this is, by the strict
+                // verifiers. A certificate of one kind is refused, with a
+                // reason, on the other kind's routes; one valid as both
+                // (nested hierarchies) on all of them.
+                let refused = |why: &str| Some(Err(why.to_string()));
+                let (machine, caller) = match (relay.kind(&chain), chain.first()) {
+                    (tls::Kind::Device, Some(c)) => (
+                        Some(tls::machine_name(c, cfg.machine_name)),
+                        refused("a device certificate is not a caller certificate"),
+                    ),
+                    (tls::Kind::Caller, Some(c)) => (
+                        refused("a caller certificate is not a device certificate"),
+                        Some(tls::machine_name(c, cfg.caller_name)),
+                    ),
+                    (tls::Kind::Both, _) => {
+                        let why = "the certificate is valid as both a device and a caller certificate: device_ca and caller_ca must be separate hierarchies";
+                        tracing::warn!(%remote, "{why}");
+                        (refused(why), refused(why))
+                    }
+                    (tls::Kind::Invalid, _) => (
+                        refused("the certificate is not valid now"),
+                        refused("the certificate is not valid now"),
+                    ),
+                    _ => (None, None),
                 };
                 // A machine that proved itself does not count against the
                 // limits meant for anyone on the network; everyone else's
@@ -828,6 +851,7 @@ impl Relay {
                 m.seen.first_seen = unix(now);
             }
             m.seen.last_seen = unix(now);
+            let fingerprint = chain.first().map(fingerprint);
             let replaced = m.conn.replace(Conn {
                 id,
                 chain,
@@ -835,15 +859,19 @@ impl Relay {
                 cut: cut.clone(),
                 since: now,
             });
-            (id, stopped, replaced)
+            (id, stopped, replaced.map(|r| (r, fingerprint)))
         };
-        if let Some(old) = replaced {
+        if let Some((old, new_cert)) = replaced {
             old.cut.cut("replaced");
+            // Both certificates, so a second certificate carrying a live
+            // machine's name stands out.
             self.inner.audit.event(
                 "machine_replaced",
                 [
                     ("machine", json!(machine)),
                     ("remote", json!(remote.to_string())),
+                    ("old_certificate", json!(old.chain.first().map(fingerprint))),
+                    ("new_certificate", json!(new_cert)),
                 ],
             );
         }
@@ -989,6 +1017,16 @@ impl Relay {
         if st.machines.get(machine).is_none_or(|m| m.conn.is_none()) {
             return Err(Refusal::Offline);
         }
+        // One caller cannot take all of a machine's streams.
+        let max = self.config().max_streams_per_caller;
+        let mine = st
+            .sessions
+            .values()
+            .filter(|s| s.machine == machine && s.caller == caller)
+            .count();
+        if mine >= max {
+            return Err(Refusal::CallerBusy);
+        }
         st.next_id += 1;
         let id = st.next_id;
         let cut = Cut::default();
@@ -1047,6 +1085,12 @@ impl Relay {
     }
 }
 
+/// The SHA-256 of a certificate, as hex.
+fn fingerprint(c: &CertificateDer<'_>) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(c.as_ref()))
+}
+
 /// Why a caller did not get through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Refusal {
@@ -1054,6 +1098,10 @@ enum Refusal {
     Offline,
     Busy,
     Timeout,
+    /// This caller has `max_streams_per_caller` streams to this machine.
+    CallerBusy,
+    /// The session was cut while the machine was being asked, for this reason.
+    Cut(&'static str),
 }
 
 /// A place under a machine's stream limit.

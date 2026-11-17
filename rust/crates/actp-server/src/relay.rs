@@ -145,10 +145,12 @@ pub fn client_tls(relay: &config::Relay) -> io::Result<Arc<rustls::ClientConfig>
             roots.add(c).map_err(io::Error::other)?;
         }
     }
+    // TLS 1.3 only, as at the relay: the device certificate is not sent in
+    // the clear.
     let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
-    .with_safe_default_protocol_versions()
+    .with_protocol_versions(&[&rustls::version::TLS13])
     .map_err(io::Error::other)?
     .with_root_certificates(roots)
     .with_client_auth_cert(certs, key)
@@ -383,7 +385,18 @@ async fn run_control(
                     let accept =
                         tokio_rustls::TlsAcceptor::from(opts.e2e.clone()).accept(WsIo::new(ws));
                     let tls = match tokio::time::timeout(opts.dial_timeout, accept).await {
-                        Ok(Ok(tls)) => tls,
+                        Ok(Ok(tls))
+                            if tls.get_ref().1.alpn_protocol() == Some(actp_proto::e2e::ALPN) =>
+                        {
+                            tls
+                        }
+                        Ok(Ok(_)) => {
+                            tracing::warn!("a relayed caller did not ask for the actp protocol");
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "the caller did not ask for the actp protocol",
+                            ));
+                        }
                         Ok(Err(e)) => {
                             tracing::warn!(error = %e, "a relayed caller's TLS failed");
                             return Err(e);

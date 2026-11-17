@@ -51,6 +51,10 @@ pub struct Config {
     /// Callers served at once per machine, waiting ones included.
     #[serde(default = "default_max_streams")]
     pub max_streams_per_machine: usize,
+    /// Streams one caller (by its certificate name) may have to one machine
+    /// at once, so a stolen caller certificate cannot hold all of them.
+    #[serde(default = "default_max_streams_per_caller")]
+    pub max_streams_per_caller: usize,
     /// Requests per caller IP address to machines and the management API.
     #[serde(default)]
     pub caller_rate: Rate,
@@ -100,6 +104,10 @@ fn default_listen() -> String {
 
 fn default_max_streams() -> usize {
     32
+}
+
+fn default_max_streams_per_caller() -> usize {
+    8
 }
 
 /// Which certificate name identifies a machine (and a caller).
@@ -161,8 +169,10 @@ impl Config {
         if self.audit_max_mb == 0 {
             errs.push("audit_max_mb must be at least 1".into());
         }
-        if self.max_streams_per_machine == 0 {
-            errs.push("max_streams_per_machine must be at least 1".into());
+        if self.max_streams_per_machine == 0 || self.max_streams_per_caller == 0 {
+            errs.push(
+                "max_streams_per_machine and max_streams_per_caller must be at least 1".into(),
+            );
         }
         for c in &self.blocked_callers {
             if !actp_proto::relay::valid_machine_name(c) {

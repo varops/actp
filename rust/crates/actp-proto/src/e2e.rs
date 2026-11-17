@@ -29,8 +29,9 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 
 use crate::relay::valid_machine_name;
 
-/// ALPN of the end-to-end TLS. A machine answers nothing else, so a stream
-/// that is not this protocol fails the handshake.
+/// ALPN of the end-to-end TLS. Both ends require it after the handshake: a
+/// machine serves no stream whose caller did not ask for it, and a caller
+/// uses no connection the machine did not agree it on.
 pub const ALPN: &[u8] = b"actp-e2e.v1";
 
 /// The server name the caller sends. Machine addresses are not always DNS
@@ -42,8 +43,10 @@ pub const SERVER_NAME: &str = "machine.actp.invalid";
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MachineName {
-    /// The subject's common name (the default; MDM tools usually put the
-    /// serial number or the computer name here).
+    /// The subject's common name (the default). It must be an identifier
+    /// nobody on the machine can change, such as the serial number or the
+    /// hardware UUID, never a computer name a user can edit: the name is
+    /// all a caller checks to know it reached the right machine.
     #[default]
     Cn,
     /// The one DNS name in the subject alternative names.

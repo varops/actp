@@ -296,7 +296,6 @@ pub fn fast_timing() -> Timing {
         ping_every: Duration::from_millis(100),
         dead_after: Duration::from_millis(800),
         stream_timeout: Duration::from_secs(5),
-        response_timeout: Duration::from_secs(10),
         send_timeout: Duration::from_secs(2),
         flush_every: Duration::from_millis(200),
     }
@@ -597,7 +596,11 @@ pub async fn open_tunnel(
     };
     tokio::time::timeout(
         Duration::from_secs(10),
-        tokio_rustls::TlsConnector::from(route.machine_tls.clone()).connect(
+        tokio_rustls::TlsConnector::from(match &route.reload {
+            Some(reload) => reload().map_err(Refused::Tls)?,
+            None => route.machine_tls.clone(),
+        })
+        .connect(
             actp_proto::e2e::server_name(),
             actp_proto::wsio::WsIo::new(ws),
         ),

@@ -64,7 +64,34 @@ fn valid(verifier: &Arc<dyn ClientCertVerifier>, chain: &[CertificateDer<'static
     }
 }
 
+/// What a client certificate chain is, by the strict verifiers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// No certificate.
+    None,
+    Device,
+    Caller,
+    /// Valid under both sets of roots: one hierarchy is inside the other,
+    /// so it cannot be told apart, and is refused as either.
+    Both,
+    /// Valid under neither now (revoked, expired, an issuer without a list).
+    Invalid,
+}
+
 impl Setup {
+    /// What `chain` is, now.
+    pub fn kind(&self, chain: &[CertificateDer<'static>]) -> Kind {
+        if chain.is_empty() {
+            return Kind::None;
+        }
+        match (self.still_valid(chain), self.caller_valid(chain)) {
+            (true, true) => Kind::Both,
+            (true, false) => Kind::Device,
+            (false, true) => Kind::Caller,
+            (false, false) => Kind::Invalid,
+        }
+    }
+
     /// Whether a chain (leaf first) is a valid device certificate now:
     /// signed by the device roots, in its validity period, not revoked.
     pub fn still_valid(&self, chain: &[CertificateDer<'static>]) -> bool {
@@ -82,6 +109,36 @@ impl Setup {
 /// management API), and a certificate whose issuer has no revocation list
 /// (a caller's, when only devices have lists), because every route checks
 /// the certificate again with the strict verifier of its own kind.
+/// Subject, issuer and key of a root, as DER.
+fn identity(c: &CertificateDer<'_>) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    use x509_parser::prelude::{FromDer, X509Certificate};
+    let (_, x) = X509Certificate::from_der(c.as_ref()).ok()?;
+    Some((
+        x.subject().as_raw().to_vec(),
+        x.issuer().as_raw().to_vec(),
+        x.public_key().raw.to_vec(),
+    ))
+}
+
+/// Why two sets of roots are not apart, if they are not.
+fn overlap(a: &[CertificateDer<'_>], b: &[CertificateDer<'_>]) -> Option<String> {
+    let ids = |set: &[CertificateDer<'_>]| -> Option<Vec<_>> { set.iter().map(identity).collect() };
+    let (Some(a), Some(b)) = (ids(a), ids(b)) else {
+        return Some("a root certificate could not be read".into());
+    };
+    for (sa, ia, ka) in &a {
+        for (sb, ib, kb) in &b {
+            if sa == sb || ka == kb {
+                return Some("caller_ca shares a root with device_ca".into());
+            }
+            if (ia == sb && ia != sa) || (ib == sa && ib != sb) {
+                return Some("one of the roots is issued by the other".into());
+            }
+        }
+    }
+    None
+}
+
 fn verifier(
     roots: &[CertificateDer<'static>],
     crls: Vec<CertificateRevocationListDer<'static>>,
@@ -117,11 +174,17 @@ pub fn server_config(cfg: &Config) -> io::Result<Setup> {
     let device_roots = certs(&cfg.device_ca)?;
     let caller_roots = certs(&cfg.caller_ca)?;
     // One root for both kinds would let a laptop open tunnels to other
-    // laptops, or a caller log in as a machine.
-    if device_roots.iter().any(|d| caller_roots.contains(d)) {
+    // laptops, or a caller log in as a machine. Roots are compared by
+    // subject and key, not bytes (a re-issued root has new bytes), and a
+    // root issued by the other kind's root is refused too. Deeper nesting
+    // cannot be seen from the roots alone: a certificate valid as both
+    // kinds is refused at every connection instead (`Setup::kind`).
+    if let Some(why) = overlap(&device_roots, &caller_roots) {
         return Err(err(
             &cfg.caller_ca,
-            "caller_ca shares a root with device_ca; use roots that sign only caller certificates",
+            format!(
+                "{why}; device_ca and caller_ca must be separate hierarchies, neither above the other"
+            ),
         ));
     }
     let mut device_crls = Vec::new();
@@ -142,7 +205,9 @@ pub fn server_config(cfg: &Config) -> io::Result<Setup> {
     let mut sc = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
-    .with_safe_default_protocol_versions()
+    // TLS 1.3 only: under 1.2 client certificates cross the network in the
+    // clear, naming every machine and caller to anyone watching.
+    .with_protocol_versions(&[&rustls::version::TLS13])
     .map_err(io::Error::other)?
     .with_client_cert_verifier(handshake)
     .with_single_cert(certs(&cfg.tls_cert)?, key)
