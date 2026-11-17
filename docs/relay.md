@@ -103,7 +103,7 @@ The relay must terminate TLS itself: a TLS proxy in front of it would hide the d
 
 A caller's name follows the same rules as a machine address (below); a caller certificate whose name does not is refused. `blocked_machines` and `blocked_callers` are compared exactly, case included.
 
-`SIGHUP` reloads the blocked machines and callers, the admin tokens, the rate limits, `max_connections_per_ip`, the device and caller roots and the revocation lists. The listen address, the folders, `audit_max_mb` and `max_connections` need a restart.
+`SIGHUP` reloads the blocked machines and callers, the `issuer` section, the admin tokens, the rate limits, `max_connections_per_ip`, the device and caller roots and the revocation lists. The listen address, the folders, `audit_max_mb` and `max_connections` need a restart.
 
 The connection limits count every connection from the moment it is accepted, before the TLS handshake (which may take 5 s), and for as long as it lives, sessions included. A connection that proves itself a machine with a valid device certificate stops counting, so callers filling the limits do not keep laptops from reconnecting once their handshake is through. A refused connection is closed at once and recorded as `connection_refused` (throttled).
 
@@ -146,6 +146,35 @@ Caller certificates are checked again on every tunnel request, on every reload a
 A session ends at the relay when either side closes, when its machine's control connection is lost (the machine is offline), when the machine or the caller is blocked or its certificate stops being valid, or on the org-wide stop. Idle TCP connections are probed with keepalives, so a laptop that vanishes mid-session is noticed within a few minutes.
 
 Anything else comes from the machine itself.
+
+### The issuer pass-through
+
+Laptops sometimes need to ask the organization's identity service something (for example, whether the person whose papers they hold has been revoked), and they cannot reach it. With an `issuer` section, a machine can ask it through the relay:
+
+```yaml
+issuer:
+  url: https://idm.internal:8788          # the identity service (http:// on loopback only)
+  ca: /etc/actp-relay/idm-ca.pem          # roots for its certificate; required for https
+  headers:                                # the relay's own credentials there
+    X-Example-Caller: relay
+    X-Example-Secret: env:RELAY_IDM_SECRET   # env:NAME reads an environment variable
+  paths: [/v1/generation/signed]          # the only paths forwarded, exactly
+  rate: {per_second: 1, burst: 10}        # per machine
+  timeout_seconds: 5
+```
+
+A machine sends `GET /relay/v1/issuer/<path>?<query>` with its device certificate (callers and strangers are refused, and blocked machines as on every machine route). If `<path>` is one of `paths`, the relay asks `GET <url><path>?<query>` with the configured headers and hands back the status and the body (at most 64 KB) as JSON. Nothing else from the machine is forwarded (not its headers, not a body), and nothing else of the answer comes back.
+
+| Answer | Meaning |
+| --- | --- |
+| `404 issuer_path_not_forwarded` | The path is not in `paths`. |
+| `414 issuer_query_too_long` | The query is over 2048 bytes. |
+| `429 issuer_rate_limited` | This machine asked too often (`rate`). |
+| `503 issuer_busy` | 32 questions are already in flight. |
+| `502 issuer_unavailable` | The identity service could not be reached, did not answer in time, or answered more than 64 KB. |
+| `404 not_found` | No `issuer` section. |
+
+The relay sees the questions and the answers, so only forward questions whose answers a machine can check itself: an answer signed by the identity service and bound to a nonce the machine chose cannot be forged or replayed by the relay, only withheld. Refusals are recorded as `issuer_refused` (machine and reason, throttled); questions themselves are not recorded, as their queries name people. A reload replaces the section; one that cannot be used (a missing roots file, an unset variable) leaves the old one in force and logs an error.
 
 ### Management
 
@@ -192,6 +221,7 @@ Keep `state_dir` with the relay: a relay that starts without its `stop.json` kno
 | `connection_refused` | `remote` (the address, or the IPv6 /64, at its limit) |
 | `caller_refused` | `caller` (when its certificate named one), `machine` (when one was reached), `remote`, `reason` |
 | `caller_rate_limited` | `remote` |
+| `issuer_refused` | `machine`, `reason` |
 | `org_stop` | `by`, `reason`, `sessions_dropped` |
 | `org_stop_not_saved`, `org_stop_saved` | `error` / nothing |
 | `org_release` | `by`, `reason` |
@@ -199,7 +229,7 @@ Keep `state_dir` with the relay: a relay that starts without its `stop.json` kno
 | `config_reloaded` | `blocked_machines`, `blocked_callers` |
 | `refusals_not_logged` | `kind`, `count` |
 
-Of each refusal kind (`caller_refused`, `caller_rate_limited`, `connection_refused`, `machine_refused`, `admin_refused`), at most 20 a minute are written, across all callers; the rest are counted in `refusals_not_logged`. A flood of refusals therefore leaves only a count of everyone's refusals for that minute; sessions, machines and the stop are always recorded.
+Of each refusal kind (`caller_refused`, `caller_rate_limited`, `connection_refused`, `machine_refused`, `admin_refused`, `issuer_refused`), at most 20 a minute are written, across all callers; the rest are counted in `refusals_not_logged`. A flood of refusals therefore leaves only a count of everyone's refusals for that minute; sessions, machines and the stop are always recorded.
 
 The stop's own events (`org_stop`, `org_release`, `org_stop_not_saved`, `org_stop_saved`) are also written to `log_dir/org_stops.jsonl`, which is never rotated, so no flood of other events can push them out.
 

@@ -20,6 +20,9 @@ pub const PATH_CONNECT: &str = "/relay/v1/connect";
 pub const PATH_STREAM: &str = "/relay/v1/stream/";
 /// A caller's tunnel to a machine: this prefix plus the machine's address.
 pub const PATH_TUNNEL: &str = "/relay/v1/tunnel/";
+/// A machine's question to the identity service, through the relay: this
+/// prefix plus the issuer's path (docs/relay.md, the issuer pass-through).
+pub const PATH_ISSUER: &str = "/relay/v1/issuer";
 
 /// WebSocket subprotocols of the two machine connections and the caller's
 /// tunnel.

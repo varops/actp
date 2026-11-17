@@ -18,6 +18,7 @@
 pub mod audit;
 pub mod config;
 mod http;
+pub mod issuer;
 mod limit;
 pub mod state;
 pub mod tls;
@@ -117,6 +118,8 @@ struct Inner {
     /// When machines.json was last written on the timer.
     seen_written: Mutex<std::time::Instant>,
     callers: RateLimiter,
+    /// The issuer pass-through, when configured.
+    issuer: RwLock<Option<Arc<issuer::Issuer>>>,
     refusals: Throttle,
     /// Connections held, before and after the TLS handshake.
     connections: Arc<tokio::sync::Semaphore>,
@@ -219,6 +222,10 @@ impl Relay {
             tracing::warn!(by = %stop.by, reason = %stop.reason, "the org-wide stop is on");
         }
         let callers = RateLimiter::new(cfg.caller_rate.per_second, cfg.caller_rate.burst);
+        let issuer = match &cfg.issuer {
+            Some(i) => Some(Arc::new(issuer::Issuer::from_config(i)?)),
+            None => None,
+        };
         let max_connections = cfg.max_connections;
         Ok(Relay {
             inner: Arc::new(Inner {
@@ -239,6 +246,7 @@ impl Relay {
                 writing: Mutex::new(()),
                 seen_written: Mutex::new(std::time::Instant::now()),
                 callers,
+                issuer: RwLock::new(issuer),
                 refusals: Throttle::new(20, Duration::from_secs(60)),
                 connections: Arc::new(tokio::sync::Semaphore::new(max_connections)),
                 per_ip: Mutex::new(HashMap::new()),
@@ -267,6 +275,15 @@ impl Relay {
         &self.inner.audit
     }
 
+    /// The issuer pass-through in force, if one is configured.
+    pub(crate) fn issuer(&self) -> Option<Arc<issuer::Issuer>> {
+        self.inner
+            .issuer
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
     pub(crate) fn callers(&self) -> &RateLimiter {
         &self.inner.callers
     }
@@ -289,6 +306,15 @@ impl Relay {
         self.inner
             .callers
             .set_rate(cfg.caller_rate.per_second, cfg.caller_rate.burst);
+        // A new issuer section takes effect only if it can be used; a broken
+        // one (a missing CA file, an unset variable) keeps the old one.
+        match cfg.issuer.as_ref().map(issuer::Issuer::from_config) {
+            None => *self.inner.issuer.write().unwrap_or_else(|p| p.into_inner()) = None,
+            Some(Ok(i)) => {
+                *self.inner.issuer.write().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(i))
+            }
+            Some(Err(e)) => tracing::error!(error = %e, "the issuer section was not reloaded"),
+        }
         *self.inner.cfg.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(cfg);
         *self.inner.tls.write().unwrap_or_else(|p| p.into_inner()) = Some(tls);
         self.inner.audit.event(
