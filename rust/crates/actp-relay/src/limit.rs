@@ -22,19 +22,20 @@ pub fn ip_key(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// A token bucket per caller IP address (see [`ip_key`]).
-pub struct RateLimiter {
-    inner: Mutex<Buckets>,
+/// A token bucket per key: a caller IP address (see [`ip_key`]) by default,
+/// or anything else, such as a machine's address.
+pub struct RateLimiter<K = IpAddr> {
+    inner: Mutex<Buckets<K>>,
 }
 
-struct Buckets {
+struct Buckets<K> {
     per_second: f64,
     burst: f64,
-    map: HashMap<IpAddr, (f64, Instant)>,
+    map: HashMap<K, (f64, Instant)>,
     pruned: Instant,
 }
 
-impl RateLimiter {
+impl<K: std::hash::Hash + Eq> RateLimiter<K> {
     pub fn new(per_second: u32, burst: u32) -> Self {
         RateLimiter {
             inner: Mutex::new(Buckets {
@@ -52,9 +53,8 @@ impl RateLimiter {
         b.burst = burst.max(1) as f64;
     }
 
-    /// Takes one request from `ip`'s allowance.
-    pub fn allow(&self, ip: IpAddr) -> bool {
-        let ip = ip_key(ip);
+    /// Takes one request from `key`'s allowance.
+    pub fn allow_key(&self, key: K) -> bool {
         let mut b = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
         let (rate, burst) = (b.per_second, b.burst);
@@ -66,7 +66,7 @@ impl RateLimiter {
             b.map.retain(|_, (_, t)| now.duration_since(*t) < full);
             b.pruned = now;
         }
-        let (tokens, last) = b.map.entry(ip).or_insert((burst, now));
+        let (tokens, last) = b.map.entry(key).or_insert((burst, now));
         *tokens = (*tokens + now.duration_since(*last).as_secs_f64() * rate).min(burst);
         *last = now;
         if *tokens >= 1.0 {
@@ -75,6 +75,13 @@ impl RateLimiter {
         } else {
             false
         }
+    }
+}
+
+impl RateLimiter<IpAddr> {
+    /// Takes one request from `ip`'s allowance (by [`ip_key`]).
+    pub fn allow(&self, ip: IpAddr) -> bool {
+        self.allow_key(ip_key(ip))
     }
 }
 

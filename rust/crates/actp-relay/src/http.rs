@@ -6,6 +6,7 @@
 //! | `GET /relay/v1/connect` | a machine (device certificate) | the control WebSocket |
 //! | `GET /relay/v1/stream/<id>` | the machine asked for it | a caller's stream |
 //! | `GET /relay/v1/tunnel/<address>` | a caller (caller certificate) | a byte tunnel to the machine, carrying the caller's TLS to it |
+//! | `GET /relay/v1/issuer/<path>` | a machine (device certificate) | a configured question to the identity service ([`crate::issuer`]) |
 //! | `GET /relay/v1/machines` | admin token | who is online, last seen |
 //! | `GET /relay/v1/stop` | admin token | the org-wide stop |
 //! | `POST /relay/v1/stop`, `POST /relay/v1/release` | admin token | press, release (`{"reason": …}`) |
@@ -25,8 +26,8 @@ use std::time::{Duration, Instant};
 
 use actp_proto::api;
 use actp_proto::relay::{
-    Control, PATH_CONNECT, PATH_STREAM, PATH_TUNNEL, PROTOCOL_CONTROL, PROTOCOL_STREAM,
-    PROTOCOL_TUNNEL, valid_machine_name, valid_stream_id,
+    Control, PATH_CONNECT, PATH_ISSUER, PATH_STREAM, PATH_TUNNEL, PROTOCOL_CONTROL,
+    PROTOCOL_STREAM, PROTOCOL_TUNNEL, valid_machine_name, valid_stream_id,
 };
 use actp_proto::wsio::WsIo;
 use base64::Engine;
@@ -122,6 +123,11 @@ async fn handle(
     }
     if let Some(id) = path.strip_prefix(PATH_STREAM) {
         return machine_stream(relay, peer, req, id.to_string());
+    }
+    if let Some(rest) = path.strip_prefix(PATH_ISSUER)
+        && (rest.is_empty() || rest.starts_with('/'))
+    {
+        return issuer(relay, peer, req, rest).await;
     }
     // Everything else is open to anyone on the network: rate limited.
     if !relay.callers().allow(peer.remote.ip()) {
@@ -425,6 +431,92 @@ fn machine_stream(relay: &Relay, peer: &Peer, mut req: Request<Incoming>, id: St
         let _ = tx.send(WsIo::new(ws));
     });
     resp
+}
+
+// ---- the issuer pass-through ----
+
+/// `GET /relay/v1/issuer/<path>?<query>`: a machine's question to the
+/// identity service, forwarded with the relay's own credentials there.
+async fn issuer(relay: &Relay, peer: &Peer, req: Request<Incoming>, path: &str) -> Resp {
+    let machine = match machine_of(relay, peer, "issuer") {
+        Ok(m) => m,
+        Err(r) => return *r,
+    };
+    let Some(issuer) = relay.issuer() else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no issuer is configured",
+        );
+    };
+    if req.method() != Method::GET {
+        return error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method_not_allowed",
+            "only GET is forwarded",
+        );
+    }
+    let refuse = |status: StatusCode, code: &'static str, msg: &str| {
+        // The machine and why, never the path's query (it names people).
+        relay.refusal(
+            "issuer_refused",
+            [("machine", json!(machine)), ("reason", json!(code))],
+        );
+        let mut r = error(status, code, msg);
+        if matches!(
+            code,
+            "issuer_rate_limited" | "issuer_busy" | "issuer_unavailable"
+        ) {
+            r.headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        }
+        r
+    };
+    match issuer.ask(&machine, path, req.uri().query()).await {
+        Ok((status, body)) => {
+            // Who asked which question, never its query (it names people).
+            relay.audit().event(
+                "issuer_asked",
+                [
+                    ("machine", json!(machine)),
+                    ("path", json!(path)),
+                    ("status", json!(status.as_u16())),
+                ],
+            );
+            let mut r = Response::new(full(body));
+            *r.status_mut() = status;
+            r.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            r
+        }
+        Err(crate::issuer::Refusal::NotForwarded) => refuse(
+            StatusCode::NOT_FOUND,
+            "issuer_path_not_forwarded",
+            "this path is not forwarded to the issuer",
+        ),
+        Err(crate::issuer::Refusal::QueryTooLong) => refuse(
+            StatusCode::URI_TOO_LONG,
+            "issuer_query_too_long",
+            "the query is too long",
+        ),
+        Err(crate::issuer::Refusal::RateLimited) => refuse(
+            StatusCode::TOO_MANY_REQUESTS,
+            "issuer_rate_limited",
+            "this machine asks the issuer too often",
+        ),
+        Err(crate::issuer::Refusal::Busy) => refuse(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "issuer_busy",
+            "too many questions to the issuer in flight",
+        ),
+        Err(crate::issuer::Refusal::Unavailable) => refuse(
+            StatusCode::BAD_GATEWAY,
+            "issuer_unavailable",
+            "the issuer could not be asked",
+        ),
+    }
 }
 
 // ---- callers ----

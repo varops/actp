@@ -67,6 +67,58 @@ pub struct Config {
     pub max_connections: usize,
     #[serde(default = "default_max_connections_per_ip")]
     pub max_connections_per_ip: usize,
+    /// The issuer pass-through: questions machines may ask the identity
+    /// service through the relay. Off when absent.
+    #[serde(default)]
+    pub issuer: Option<Issuer>,
+}
+
+/// The identity service machines may ask through the relay.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Issuer {
+    /// `https://host[:port][/prefix]` (`http://` on loopback only).
+    pub url: String,
+    /// Roots for its certificate (PEM); required for `https://`.
+    #[serde(default)]
+    pub ca: Option<PathBuf>,
+    /// Sent with every forwarded question: the relay's own credentials
+    /// there. A value `env:NAME` is read from that environment variable.
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+    /// The only paths forwarded, exactly (no query).
+    pub paths: Vec<String>,
+    /// Questions per machine (1 a second, 10 at once by default).
+    #[serde(default = "default_issuer_rate")]
+    pub rate: Rate,
+    /// How long one question may take (5 s).
+    #[serde(default = "default_issuer_timeout")]
+    pub timeout_seconds: u64,
+}
+
+impl std::fmt::Debug for Issuer {
+    // Header values can be secrets: their names only.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Issuer")
+            .field("url", &self.url)
+            .field("ca", &self.ca)
+            .field("headers", &self.headers.keys().collect::<Vec<_>>())
+            .field("paths", &self.paths)
+            .field("rate", &self.rate)
+            .field("timeout_seconds", &self.timeout_seconds)
+            .finish()
+    }
+}
+
+fn default_issuer_rate() -> Rate {
+    Rate {
+        per_second: 1,
+        burst: 10,
+    }
+}
+
+fn default_issuer_timeout() -> u64 {
+    5
 }
 
 fn default_max_connections() -> usize {
@@ -173,6 +225,31 @@ impl Config {
             errs.push(
                 "max_streams_per_machine and max_streams_per_caller must be at least 1".into(),
             );
+        }
+        if let Some(i) = &self.issuer {
+            if i.paths.is_empty() {
+                errs.push("issuer.paths must name at least one path".into());
+            }
+            for p in &i.paths {
+                let ok = p.starts_with('/')
+                    && p.len() <= 256
+                    && !p.contains("//")
+                    && !p.split('/').any(|seg| seg == ".." || seg == ".")
+                    && p.bytes().all(|b| {
+                        b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.')
+                    });
+                if !ok {
+                    errs.push(format!(
+                        "issuer path {p:?} must start with / and hold only letters, digits, /, -, _ and ."
+                    ));
+                }
+            }
+            if i.rate.per_second == 0 || i.rate.burst == 0 {
+                errs.push("issuer.rate per_second and burst must be at least 1".into());
+            }
+            if i.timeout_seconds == 0 || i.timeout_seconds > 30 {
+                errs.push("issuer.timeout_seconds must be 1 to 30".into());
+            }
         }
         for c in &self.blocked_callers {
             if !actp_proto::relay::valid_machine_name(c) {
