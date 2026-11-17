@@ -581,6 +581,7 @@ async fn a_reload_cuts_off_a_newly_blocked_machine() {
 async fn callers_are_rate_limited_and_floods_do_not_flood_the_audit() {
     let dir = scratch("rate");
     let pki = Pki::new(&dir);
+    let relay_started = std::time::Instant::now();
     let env = start_relay_with(&pki, &dir, "caller_rate: {per_second: 1, burst: 30}\n").await;
     let started = std::time::Instant::now();
     let mut statuses = Vec::new();
@@ -598,15 +599,20 @@ async fn callers_are_rate_limited_and_floods_do_not_flood_the_audit() {
     assert!((30..=30 + refill).contains(&through), "{statuses:?}");
     assert_eq!(through + limited, 40);
     assert!(limited >= 10 - refill.min(10), "{statuses:?}");
-    // Of the refusals, 20 written, the rest counted.
-    let refused = || {
-        env.audit()
-            .iter()
-            .filter(|e| e["event"] == "caller_refused")
-            .count()
-    };
-    assert_eq!(refused(), 20);
-    let left_out = (through - 20) as u64;
+    // Of the refusals, 20 a minute written, the rest counted. A slow
+    // machine can take the test past the relay's first minute, and each
+    // new minute writes up to 20 again.
+    let refused = env
+        .audit()
+        .iter()
+        .filter(|e| e["event"] == "caller_refused")
+        .count();
+    let minutes = relay_started.elapsed().as_secs() as usize / 60 + 1;
+    assert!(
+        (20..=20 * minutes).contains(&refused),
+        "{refused} written over {minutes} minute(s)"
+    );
+    let left_out = (through - refused) as u64;
     // Counted per flush, so possibly over several lines.
     eventually("the count of refusals left out", || {
         env.audit()
