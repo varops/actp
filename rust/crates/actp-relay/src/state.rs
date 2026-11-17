@@ -22,11 +22,24 @@ pub struct Stop {
     pub at: String,
 }
 
-/// When a machine was seen, in Unix seconds.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// When a machine was seen, in Unix seconds, and the key its name is
+/// pinned to.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Seen {
     pub first_seen: u64,
     pub last_seen: u64,
+    /// SHA-256 of the public key (SubjectPublicKeyInfo) of the device
+    /// certificate this name was first seen with, as hex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// When that certificate was issued (its notBefore, Unix seconds): a
+    /// renewal must be newer. 0 when an admin pinned the key by itself.
+    #[serde(default)]
+    pub key_since: u64,
+    /// When that certificate expires (Unix seconds): near it, a renewal
+    /// with a new key is taken. 0: not known yet, and no renewal is taken.
+    #[serde(default)]
+    pub key_until: u64,
 }
 
 pub fn create_private_dir(dir: &Path) -> io::Result<()> {
@@ -59,7 +72,20 @@ fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
         f.write_all(data)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path)?;
+    // The rename itself survives a crash only once the folder is synced.
+    // Some file systems (network and FUSE mounts) cannot sync a folder;
+    // the file itself is synced, so that is no reason to report a failure.
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        match std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+            Err(e)
+                if e.kind() == io::ErrorKind::Unsupported
+                    || e.kind() == io::ErrorKind::InvalidInput => {}
+            r => r?,
+        }
+    }
+    Ok(())
 }
 
 pub struct Store {
@@ -105,16 +131,23 @@ impl Store {
         )
     }
 
-    pub fn load_seen(&self) -> BTreeMap<String, Seen> {
-        match std::fs::read(self.machines_path()) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
-            Err(e) => {
-                tracing::warn!(error = %e, "cannot read machines.json: last-seen times start empty");
-                BTreeMap::new()
-            }
-            Ok(b) => serde_json::from_slice(&b).unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "machines.json is damaged: last-seen times start empty");
-                BTreeMap::new()
+    /// The machines seen, with their pinned keys. A file that cannot be
+    /// read or is damaged is an error, never an empty start: it holds the
+    /// pins, and starting without them would pin whatever key comes first.
+    pub fn load_seen(&self) -> io::Result<BTreeMap<String, Seen>> {
+        let path = self.machines_path();
+        let hint = "it holds each machine's pinned key: restore it, or move it aside to pin every machine afresh";
+        match std::fs::read(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+            Err(e) => Err(io::Error::new(
+                e.kind(),
+                format!("cannot read {}: {e}; {hint}", path.display()),
+            )),
+            Ok(b) => serde_json::from_slice(&b).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{} is damaged: {e}; {hint}", path.display()),
+                )
             }),
         }
     }

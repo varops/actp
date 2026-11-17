@@ -10,6 +10,7 @@
 //! | `GET /relay/v1/machines` | admin token | who is online, last seen |
 //! | `GET /relay/v1/stop` | admin token | the org-wide stop |
 //! | `POST /relay/v1/stop`, `POST /relay/v1/release` | admin token | press, release (`{"reason": …}`) |
+//! | `POST /relay/v1/repin` | admin token | forget or set a machine's pinned key (`{"machine": …, "reason": …, "key"?: …}`) |
 //!
 //! Caller and management routes are rate limited per IP address. The relay
 //! never reads what a tunnel carries: the caller's TLS ends at the machine
@@ -149,7 +150,7 @@ async fn handle(
     }
     let admin_route = matches!(
         path.as_str(),
-        "/relay/v1/machines" | "/relay/v1/stop" | "/relay/v1/release"
+        "/relay/v1/machines" | "/relay/v1/stop" | "/relay/v1/release" | "/relay/v1/repin"
     );
     if admin_route {
         return admin(relay, peer, req, &path).await;
@@ -218,7 +219,31 @@ fn machine_of(relay: &Relay, peer: &Peer, route: &str) -> Result<String, Box<Res
                 "the device certificate is no longer valid",
             )))
         }
-        Some(Ok(m)) => Ok(m.clone()),
+        Some(Ok(m)) => match relay.check_key(m, &peer.chain[0]) {
+            Ok(()) => Ok(m.clone()),
+            // Recorded by check_key, once a minute per machine.
+            Err("key_changed") => Err(Box::new(error(
+                StatusCode::FORBIDDEN,
+                "machine_key_changed",
+                "this machine's certificate has a key the relay has not seen for it: an admin must re-pin it",
+            ))),
+            Err(why) => {
+                relay.refusal(
+                    "machine_refused",
+                    [
+                        ("machine", json!(m)),
+                        ("remote", json!(peer.remote.to_string())),
+                        ("route", json!(route)),
+                        ("reason", json!(why)),
+                    ],
+                );
+                Err(Box::new(error(
+                    StatusCode::FORBIDDEN,
+                    "bad_device_certificate",
+                    "the relay cannot read this device certificate's key",
+                )))
+            }
+        },
     }
 }
 
@@ -702,6 +727,10 @@ async fn tunnel(relay: &Relay, peer: &Peer, mut req: Request<Incoming>, raw_mach
         let _ended = ended;
         let started = Instant::now();
         let (to_machine, to_caller) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+        let idle_after = relay
+            .timing()
+            .tunnel_idle
+            .unwrap_or(Duration::from_secs(relay.config().tunnel_idle_seconds));
         let reason = match on_upgrade.await {
             Ok(up) => {
                 let ws = WebSocketStream::from_raw_socket(
@@ -720,6 +749,7 @@ async fn tunnel(relay: &Relay, peer: &Peer, mut req: Request<Incoming>, raw_mach
                 };
                 tokio::select! {
                     _ = cut.cancelled() => cut.why(),
+                    _ = idle(&to_machine, &to_caller, idle_after) => "idle",
                     r = tokio::io::copy_bidirectional(&mut a, &mut b) => {
                         if r.is_ok() { "closed" } else { "error" }
                     }
@@ -745,6 +775,22 @@ async fn tunnel(relay: &Relay, peer: &Peer, mut req: Request<Incoming>, raw_mach
         );
     });
     resp
+}
+
+/// Returns once neither counter has moved for `limit`.
+async fn idle(a: &AtomicU64, b: &AtomicU64, limit: Duration) {
+    let tick = (limit / 10).clamp(Duration::from_millis(100), Duration::from_secs(10));
+    let total = || a.load(Ordering::Relaxed) + b.load(Ordering::Relaxed);
+    let (mut last, mut since) = (total(), Instant::now());
+    loop {
+        tokio::time::sleep(tick).await;
+        let now = total();
+        if now != last {
+            (last, since) = (now, Instant::now());
+        } else if since.elapsed() >= limit {
+            return;
+        }
+    }
 }
 
 /// Counts the bytes read through it.
@@ -822,6 +868,58 @@ async fn admin(relay: &Relay, peer: &Peer, req: Request<Incoming>, path: &str) -
             StatusCode::OK,
             json!({ "stop": relay.stop_state() }).to_string(),
         ),
+        (Method::POST, "/relay/v1/repin") => {
+            let body = match Limited::new(req.into_body(), 16 << 10).collect().await {
+                Ok(b) => b.to_bytes(),
+                Err(_) => {
+                    return error(
+                        StatusCode::BAD_REQUEST,
+                        "bad_request",
+                        "the body is too large",
+                    );
+                }
+            };
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            let field = |k: &str| {
+                v.get(k)
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default()
+            };
+            let (machine, reason) = (field("machine"), field("reason"));
+            if !valid_machine_name(&machine) || reason.is_empty() || reason.len() > 1000 {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "machine_and_reason_required",
+                    "say which machine and why: {\"machine\": \"…\", \"reason\": \"…\"}",
+                );
+            }
+            // Optionally the new key itself, so nothing else can be pinned
+            // first: the SHA-256 of its public key, as lowercase hex.
+            let key = match v.get("key") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(k) => match k.as_str() {
+                    Some(k)
+                        if k.len() == 64
+                            && k.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) =>
+                    {
+                        Some(k.to_string())
+                    }
+                    _ => {
+                        return error(
+                            StatusCode::BAD_REQUEST,
+                            "bad_key",
+                            "key is the SHA-256 of the certificate's public key, 64 lowercase hex characters",
+                        );
+                    }
+                },
+            };
+            let was = relay.repin(&by, &machine, key.as_deref(), &reason);
+            json_resp(
+                StatusCode::OK,
+                json!({ "machine": machine, "was_pinned": was }).to_string(),
+            )
+        }
         (Method::POST, "/relay/v1/stop" | "/relay/v1/release") => {
             let body = match Limited::new(req.into_body(), 16 << 10).collect().await {
                 Ok(b) => b.to_bytes(),
@@ -879,6 +977,7 @@ async fn admin(relay: &Relay, peer: &Peer, req: Request<Incoming>, path: &str) -
             } else if path == "/relay/v1/stop" {
                 "GET, POST"
             } else {
+                // release, repin
                 "POST"
             };
             r.headers_mut()

@@ -298,6 +298,7 @@ pub fn fast_timing() -> Timing {
         stream_timeout: Duration::from_secs(8),
         send_timeout: Duration::from_secs(2),
         flush_every: Duration::from_millis(200),
+        tunnel_idle: None,
     }
 }
 
@@ -333,10 +334,15 @@ pub fn relay_yaml(pki: &Pki, dir: &Path, extra: &str) -> String {
 }
 
 pub async fn start_relay_with(pki: &Pki, dir: &Path, extra: &str) -> RelayEnv {
+    start_relay_timed(pki, dir, extra, fast_timing()).await
+}
+
+/// [`start_relay_with`], with `timing`.
+pub async fn start_relay_timed(pki: &Pki, dir: &Path, extra: &str, timing: Timing) -> RelayEnv {
     let yaml = relay_yaml(pki, dir, extra);
     let cfg = actp_relay::config::Config::parse(&yaml).unwrap();
     let tls = actp_relay::tls::server_config(&cfg).unwrap();
-    let relay = Relay::with_timing(cfg, fast_timing()).unwrap();
+    let relay = Relay::with_timing(cfg, timing).unwrap();
     let ln = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = ln.local_addr().unwrap().port();
     let stop = CancellationToken::new();

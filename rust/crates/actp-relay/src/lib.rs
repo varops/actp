@@ -56,6 +56,9 @@ pub struct Timing {
     pub send_timeout: Duration,
     /// How often machines.json and an unsaved stop are written (10 s).
     pub flush_every: Duration,
+    /// For tests: cut idle tunnels after this instead of the configured
+    /// `tunnel_idle_seconds`, which cannot be set below a minute.
+    pub tunnel_idle: Option<Duration>,
 }
 
 impl Default for Timing {
@@ -66,6 +69,7 @@ impl Default for Timing {
             stream_timeout: Duration::from_secs(10),
             send_timeout: Duration::from_secs(10),
             flush_every: Duration::from_secs(10),
+            tunnel_idle: None,
         }
     }
 }
@@ -126,6 +130,11 @@ struct Inner {
     /// Connections held, before and after the TLS handshake.
     connections: Arc<tokio::sync::Semaphore>,
     per_ip: Mutex<HashMap<std::net::IpAddr, usize>>,
+    /// Device connections held per machine, before any becomes a stream.
+    per_machine: Arc<Mutex<HashMap<String, usize>>>,
+    /// When each machine's last `machine_key_refused` was written, and how
+    /// many were left out since.
+    key_refusals: Mutex<HashMap<String, (Option<std::time::Instant>, u64)>>,
 }
 
 struct State {
@@ -176,6 +185,10 @@ pub struct MachineInfo {
     pub first_seen: SystemTime,
     pub last_seen: SystemTime,
     pub sessions: usize,
+    /// The key the name is pinned to (SHA-256 of the public key, hex), and
+    /// when that certificate expires, when known.
+    pub key: Option<String>,
+    pub key_until: Option<SystemTime>,
 }
 
 /// What pressing the stop did.
@@ -207,7 +220,7 @@ impl Relay {
         let audit = Audit::open(&cfg.log_dir, cfg.audit_max_bytes())?;
         let stop = store.load_stop();
         let machines = store
-            .load_seen()
+            .load_seen()?
             .into_iter()
             .filter(|(m, _)| actp_proto::relay::valid_machine_name(m))
             .map(|(m, seen)| {
@@ -261,6 +274,8 @@ impl Relay {
                 refusals: Throttle::new(20, Duration::from_secs(60)),
                 connections: Arc::new(tokio::sync::Semaphore::new(max_connections)),
                 per_ip: Mutex::new(HashMap::new()),
+                per_machine: Arc::default(),
+                key_refusals: Mutex::default(),
             }),
         })
     }
@@ -422,6 +437,8 @@ impl Relay {
                     Some((name, id, "blocked"))
                 } else if !self.chain_valid(&chain) {
                     Some((name, id, "certificate_invalid"))
+                } else if !chain.first().is_some_and(|l| self.key_matches(&name, l)) {
+                    Some((name, id, "key_changed"))
                 } else {
                     None
                 }
@@ -580,12 +597,38 @@ impl Relay {
                     ),
                     _ => (None, None),
                 };
-                // A machine that proved itself does not count against the
-                // limits meant for anyone on the network; everyone else's
-                // connection keeps its place, upgrades included.
-                let held = match &machine {
-                    Some(Ok(_)) => None,
-                    _ => Some(Arc::new(held)),
+                // A machine that proved itself, with the key its name is
+                // pinned to, does not count against the limits meant for
+                // anyone on the network, but against its own. Everyone
+                // else's connection keeps its place, upgrades included; a
+                // certificate with another key counts as anyone's, and its
+                // requests are refused.
+                // A blocked name is never pinned or renewed: its holder may
+                // be the one it was blocked against.
+                let pinned = |name: &str| {
+                    !relay.blocked(name)
+                        && chain
+                            .first()
+                            .is_some_and(|l| relay.check_key(name, l).is_ok())
+                };
+                let (held, _machine_slot) = match &machine {
+                    Some(Ok(name)) if pinned(name) => match relay.hold_machine_connection(name) {
+                        Some(slot) => {
+                            drop(held);
+                            (None, Some(slot))
+                        }
+                        None => {
+                            relay.refusal(
+                                "connection_refused",
+                                [
+                                    ("machine", json!(name)),
+                                    ("remote", json!(limit::ip_key(remote.ip()).to_string())),
+                                ],
+                            );
+                            return;
+                        }
+                    },
+                    _ => (Some(Arc::new(held)), None),
                 };
                 http::serve_connection(
                     relay,
@@ -612,6 +655,26 @@ impl Relay {
         self.flush().await;
         Ok(())
     }
+    /// A place among `machine`'s connections, or `None` when it holds
+    /// `max_connections_per_machine` already. Freed when dropped.
+    fn hold_machine_connection(&self, machine: &str) -> Option<MachineSlot> {
+        let max = self.config().max_connections_per_machine;
+        let mut m = self
+            .inner
+            .per_machine
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let n = m.entry(machine.to_string()).or_default();
+        if *n >= max {
+            return None;
+        }
+        *n += 1;
+        Some(MachineSlot {
+            map: self.inner.per_machine.clone(),
+            machine: machine.to_string(),
+        })
+    }
+
     /// A place among the connections the relay holds, or `None` when the
     /// relay, or this address, is at its limit.
     fn hold_connection(&self, ip: std::net::IpAddr) -> Option<Held> {
@@ -703,7 +766,7 @@ impl Relay {
                 }
                 st.machines
                     .iter()
-                    .map(|(k, m)| (k.clone(), m.seen))
+                    .map(|(k, m)| (k.clone(), m.seen.clone()))
                     .collect()
             });
             if let Some(seen) = seen {
@@ -743,6 +806,8 @@ impl Relay {
                     from_unix(m.seen.last_seen)
                 },
                 sessions: sessions.get(name.as_str()).copied().unwrap_or(0),
+                key: m.seen.key.clone(),
+                key_until: (m.seen.key_until != 0).then(|| from_unix(m.seen.key_until)),
             })
             .collect()
     }
@@ -932,6 +997,193 @@ impl Relay {
         );
         self.inner.seen_dirty.store(true, Ordering::SeqCst);
         Some((id, rx, cut, stopped))
+    }
+
+    /// Whether `leaf` may speak for `machine`: the first certificate seen
+    /// for a name pins its public key. Another key is taken only as a
+    /// renewal: the pinned certificate's expiry is known and within its last
+    /// `machine_key_renewal_days` (or past), and the new certificate is
+    /// newer (issued later) and outlasts it. The machine's connection with
+    /// the old key is then cut. Otherwise it is refused until an admin
+    /// re-pins the name ([`Relay::repin`]); refusals are recorded as
+    /// `machine_key_refused`, once a minute per machine.
+    pub(crate) fn check_key(
+        &self,
+        machine: &str,
+        leaf: &CertificateDer<'static>,
+    ) -> Result<(), &'static str> {
+        let Some(cert) = cert_key(leaf) else {
+            return Err("certificate_unreadable");
+        };
+        let window = self
+            .config()
+            .machine_key_renewal_days
+            .saturating_mul(86_400);
+        let now = unix(SystemTime::now());
+        let mut offline = None;
+        let renewed = {
+            let mut st = self.st();
+            let m = st.machines.entry(machine.to_string()).or_default();
+            let seen = &mut m.seen;
+            match seen.key.clone() {
+                None => {
+                    seen.key = Some(cert.key.clone());
+                    seen.key_since = cert.not_before;
+                    seen.key_until = cert.not_after;
+                    if seen.first_seen == 0 {
+                        seen.first_seen = now;
+                        seen.last_seen = now;
+                    }
+                    None
+                }
+                Some(pinned) if pinned == cert.key => {
+                    if cert.not_after <= seen.key_until && seen.key_since != 0 {
+                        return Ok(());
+                    }
+                    // A renewal with the same key, or the first certificate
+                    // seen after an admin pinned the key by itself.
+                    seen.key_until = seen.key_until.max(cert.not_after);
+                    if seen.key_since == 0 {
+                        seen.key_since = cert.not_before;
+                    }
+                    None
+                }
+                Some(pinned)
+                    if window > 0
+                        && seen.key_until != 0
+                        && now.saturating_add(window) >= seen.key_until
+                        && cert.not_before > seen.key_since
+                        && cert.not_after > seen.key_until =>
+                {
+                    seen.key = Some(cert.key.clone());
+                    seen.key_since = cert.not_before;
+                    seen.key_until = cert.not_after;
+                    offline = take_offline(&mut st, machine);
+                    Some(pinned)
+                }
+                Some(pinned) => {
+                    drop(st);
+                    self.key_refused(machine, &pinned, &cert.key);
+                    return Err("key_changed");
+                }
+            }
+        };
+        self.inner.seen_dirty.store(true, Ordering::SeqCst);
+        if let Some(old) = renewed {
+            self.inner.audit.event(
+                "machine_key_renewed",
+                [
+                    ("machine", json!(machine)),
+                    ("old_key", json!(old)),
+                    ("new_key", json!(cert.key)),
+                ],
+            );
+        }
+        if let Some(o) = offline {
+            self.went_offline(machine, o, "key_renewed");
+        }
+        Ok(())
+    }
+
+    /// Records a refused key: at once the first time, then once a minute
+    /// per machine with how many were left out. Only a certificate the
+    /// org's CA signed gets this far, so the names are bounded.
+    fn key_refused(&self, machine: &str, pinned: &str, presented: &str) {
+        let repeats = {
+            let mut m = self
+                .inner
+                .key_refusals
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let e = m.entry(machine.to_string()).or_insert((None, 0));
+            if e.0.is_some_and(|t| t.elapsed() < Duration::from_secs(60)) {
+                e.1 += 1;
+                return;
+            }
+            let repeats = e.1;
+            *e = (Some(std::time::Instant::now()), 0);
+            repeats
+        };
+        self.inner.audit.event(
+            "machine_key_refused",
+            [
+                ("machine", json!(machine)),
+                ("pinned_key", json!(pinned)),
+                ("presented_key", json!(presented)),
+                ("repeats", json!(repeats)),
+            ],
+        );
+    }
+
+    /// Re-pins `machine`: to `key` (the SHA-256 of the public key, as
+    /// hex) when given, otherwise to the next certificate seen. The
+    /// machine's current connection is cut. Without `key`, whoever presents
+    /// a certificate first is pinned, the old key too if its holder
+    /// reconnects first: revoke it beforehand, or pass `key`. Recorded with
+    /// who and why;
+    /// returns whether the name was pinned before.
+    pub fn repin(&self, by: &str, machine: &str, key: Option<&str>, reason: &str) -> bool {
+        let (had, offline) = {
+            let mut st = self.st();
+            let m = st.machines.entry(machine.to_string()).or_default();
+            let had = m.seen.key.is_some();
+            m.seen.key = key.map(str::to_string);
+            m.seen.key_since = 0;
+            m.seen.key_until = 0;
+            (had, take_offline(&mut st, machine))
+        };
+        self.inner.seen_dirty.store(true, Ordering::SeqCst);
+        self.inner.audit.event(
+            "machine_repinned",
+            [
+                ("machine", json!(machine)),
+                ("by", json!(by)),
+                ("reason", json!(reason)),
+                ("key", json!(key)),
+                ("was_pinned", json!(had)),
+            ],
+        );
+        if let Some(o) = offline {
+            self.went_offline(machine, o, "repinned");
+        }
+        had
+    }
+
+    /// Cuts what [`take_offline`] took and records it.
+    fn went_offline(
+        &self,
+        machine: &str,
+        (cuts, since): (Vec<Cut>, SystemTime),
+        why: &'static str,
+    ) {
+        for c in cuts {
+            c.cut(why);
+        }
+        self.inner.audit.event(
+            "machine_offline",
+            [
+                ("machine", json!(machine)),
+                (
+                    "seconds",
+                    json!(since.elapsed().unwrap_or_default().as_secs()),
+                ),
+                ("reason", json!(why)),
+            ],
+        );
+    }
+
+    /// Whether `leaf`'s key is the one `machine` is pinned to, or the name
+    /// is pinned to none.
+    fn key_matches(&self, machine: &str, leaf: &CertificateDer<'_>) -> bool {
+        let pinned = self
+            .st()
+            .machines
+            .get(machine)
+            .and_then(|m| m.seen.key.clone());
+        match pinned {
+            None => true,
+            Some(p) => cert_key(leaf).is_some_and(|c| c.key == p),
+        }
     }
 
     fn machine_seen(&self, machine: &str) {
@@ -1126,11 +1378,68 @@ impl Relay {
                     "first_seen": rfc3339(m.first_seen),
                     "last_seen": rfc3339(m.last_seen),
                     "sessions": m.sessions,
+                    "key": m.key,
+                    "key_until": m.key_until.map(rfc3339),
                 })
             })
             .collect();
         json!({ "stop": self.stop_state(), "machines": list })
     }
+}
+
+/// A place among one machine's connections.
+struct MachineSlot {
+    map: Arc<Mutex<HashMap<String, usize>>>,
+    machine: String,
+}
+
+impl Drop for MachineSlot {
+    fn drop(&mut self) {
+        let mut m = self.map.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(n) = m.get_mut(&self.machine) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                m.remove(&self.machine);
+            }
+        }
+    }
+}
+
+/// A certificate's public key, by SHA-256 of its SubjectPublicKeyInfo as
+/// hex, and its validity (Unix seconds).
+struct CertKey {
+    key: String,
+    not_before: u64,
+    not_after: u64,
+}
+
+fn cert_key(c: &CertificateDer<'_>) -> Option<CertKey> {
+    use sha2::Digest;
+    use x509_parser::prelude::{FromDer, X509Certificate};
+    let (_, x) = X509Certificate::from_der(c.as_ref()).ok()?;
+    let secs = |t: x509_parser::time::ASN1Time| u64::try_from(t.timestamp()).unwrap_or(0);
+    Some(CertKey {
+        key: hex::encode(sha2::Sha256::digest(x.public_key().raw)),
+        not_before: secs(x.validity().not_before),
+        not_after: secs(x.validity().not_after),
+    })
+}
+
+/// Takes `machine`'s connection off the table, under the state lock: the
+/// cuts for it and its sessions, and since when it was connected. `None`
+/// when it is not connected.
+fn take_offline(st: &mut State, machine: &str) -> Option<(Vec<Cut>, SystemTime)> {
+    let m = st.machines.get_mut(machine)?;
+    let c = m.conn.take()?;
+    m.seen.last_seen = unix(SystemTime::now());
+    let mut cuts = vec![c.cut];
+    cuts.extend(
+        st.sessions
+            .values()
+            .filter(|s| s.machine == machine)
+            .map(|s| s.cut.clone()),
+    );
+    Some((cuts, c.since))
 }
 
 /// The SHA-256 of a certificate, as hex.
