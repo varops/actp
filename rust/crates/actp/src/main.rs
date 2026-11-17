@@ -183,8 +183,15 @@ async fn cmd_bridge(args: &[String]) -> Result<(), Exit> {
             "p",
             "prompt",
             "map",
+            "relay-machine",
+            "relay-cert",
+            "relay-key",
+            "relay-ca",
+            "device-ca",
+            "device-crl",
+            "machine-name",
         ],
-        &["yes", "no"],
+        &["yes", "no", "no-device-crl"],
     )?;
     if !f.rest.is_empty() {
         let prompt = f.get("p").or(f.get("prompt")).unwrap_or("");
@@ -266,6 +273,48 @@ async fn cmd_bridge(args: &[String]) -> Result<(), Exit> {
             }
         }
     });
+    // Through a relay, encrypted end to end (Rust only): the server is the
+    // relay, and the machine is named and checked by its device certificate.
+    let relay = match f.get("relay-machine") {
+        None => None,
+        Some(machine) => {
+            let need = |flag: &str| {
+                f.get(flag)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| fail(format!("--relay-machine needs --{flag}")))
+            };
+            let which = match f.get("machine-name").unwrap_or("cn") {
+                "cn" => actp_proto::e2e::MachineName::Cn,
+                "dns" => actp_proto::e2e::MachineName::Dns,
+                "uri" => actp_proto::e2e::MachineName::Uri,
+                other => {
+                    return Err(fail(format!(
+                        "--machine-name is cn, dns or uri, not {other:?}"
+                    )));
+                }
+            };
+            let crls: Vec<PathBuf> = f.all("device-crl").map(PathBuf::from).collect();
+            // Revocation protects a caller from a compromised relay only if
+            // the caller checks it: no lists must be asked for in so many words.
+            if crls.is_empty() && f.get("no-device-crl") != Some("true") {
+                return Err(fail(
+                    "--relay-machine needs --device-crl FILE (the relay's device revocation lists), or --no-device-crl to accept revoked machine certificates",
+                ));
+            }
+            Some(
+                actp_client::RelayRoute::from_files(
+                    machine,
+                    &need("relay-cert")?,
+                    &need("relay-key")?,
+                    f.get("relay-ca").map(std::path::Path::new),
+                    &need("device-ca")?,
+                    &crls,
+                    which,
+                )
+                .map_err(fail)?,
+            )
+        }
+    };
     let opts = actp_client::Options {
         agent: agent.into(),
         base_url,
@@ -273,6 +322,7 @@ async fn cmd_bridge(args: &[String]) -> Result<(), Exit> {
         client_name: name,
         cwd: f.get("cwd").unwrap_or("").into(),
         maps,
+        relay,
         ..Default::default()
     };
     match actp_client::run(opts, stdin_r, tokio::io::stdout()).await {
@@ -438,7 +488,10 @@ async fn cmd_serve(args: &[String]) -> Result<(), Exit> {
     }
     // Relay mode: nothing listens here; the machine dials out to the relay.
     let relay_tls = match &sc.relay {
-        Some(r) => Some(actp_server::relay::client_tls(r)?),
+        Some(r) => Some((
+            actp_server::relay::client_tls(r)?,
+            actp_server::relay::stream_tls(r)?,
+        )),
         None => None,
     };
     let listener = match &sc.relay {
@@ -466,11 +519,10 @@ async fn cmd_serve(args: &[String]) -> Result<(), Exit> {
                 &sc.tls_key,
             )?)
         };
-        let relay = sc
-            .relay
-            .as_ref()
-            .zip(relay_tls)
-            .map(|(r, tls)| actp_server::relay::RelayOptions::new(r.url.clone(), tls));
+        let relay =
+            sc.relay.as_ref().zip(relay_tls).map(|(r, (tls, e2e))| {
+                actp_server::relay::RelayOptions::new(r.url.clone(), tls, e2e)
+            });
         tokio::spawn(async move {
             if let Some(opts) = relay {
                 let acceptor =

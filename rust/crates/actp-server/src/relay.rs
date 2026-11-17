@@ -3,10 +3,12 @@
 //!
 //! [`RelayAcceptor`] keeps a control WebSocket open to the relay, with the
 //! machine's device certificate, and reconnects with backoff when it drops.
-//! For every caller the relay announces, it dials a data WebSocket and hands
-//! it to [`crate::http::serve`] as one more connection, so everything past
-//! the transport (authentication, links, confinement) is the same as when
-//! the server listens. The relay's org-wide stop reaches
+//! For every caller the relay announces, it dials a data WebSocket, answers
+//! the caller's end-to-end TLS on it with the device certificate
+//! ([`actp_proto::e2e`]), and hands the result to [`crate::http::serve`] as
+//! one more connection, so everything past the transport (authentication,
+//! links, confinement) is the same as when the server listens. The relay
+//! carries the caller's TLS and cannot read it. The relay's org-wide stop reaches
 //! [`Server::set_org_stopped`].
 
 use std::future::Future;
@@ -42,6 +44,9 @@ pub struct RelayOptions {
     pub url: String,
     /// TLS with the device certificate as the client certificate.
     pub tls: Arc<rustls::ClientConfig>,
+    /// The end-to-end TLS callers open inside each relayed stream: the
+    /// device certificate again, as the server ([`stream_tls`]).
+    pub e2e: Arc<rustls::ServerConfig>,
     /// Longest wait between reconnects (30 s).
     pub max_backoff: Duration,
     /// How often the machine pings the relay (20 s).
@@ -56,10 +61,15 @@ pub struct RelayOptions {
 }
 
 impl RelayOptions {
-    pub fn new(url: impl Into<String>, tls: Arc<rustls::ClientConfig>) -> Self {
+    pub fn new(
+        url: impl Into<String>,
+        tls: Arc<rustls::ClientConfig>,
+        e2e: Arc<rustls::ServerConfig>,
+    ) -> Self {
         RelayOptions {
             url: url.into(),
             tls,
+            e2e,
             max_backoff: Duration::from_secs(30),
             ping_every: Duration::from_secs(20),
             dead_after: Duration::from_secs(60),
@@ -119,6 +129,41 @@ impl Acceptor for RelayAcceptor {
 /// TLS for the relay from the config: the device certificate as the client
 /// certificate, and the configured roots (or the OS store) for the relay.
 pub fn client_tls(relay: &config::Relay) -> io::Result<Arc<rustls::ClientConfig>> {
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
+    let (certs, key) = device_chain(relay)?;
+    let mut roots = rustls::RootCertStore::empty();
+    if relay.ca.is_empty() {
+        for c in rustls_native_certs::load_native_certs().certs {
+            let _ = roots.add(c);
+        }
+    } else {
+        for c in CertificateDer::pem_file_iter(&relay.ca)
+            .map_err(|e| io::Error::other(format!("relay ca {}: {e}", relay.ca)))?
+        {
+            let c = c.map_err(|e| io::Error::other(format!("relay ca {}: {e}", relay.ca)))?;
+            roots.add(c).map_err(io::Error::other)?;
+        }
+    }
+    // TLS 1.3 only, as at the relay: the device certificate is not sent in
+    // the clear.
+    let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .map_err(io::Error::other)?
+    .with_root_certificates(roots)
+    .with_client_auth_cert(certs, key)
+    .map_err(io::Error::other)?;
+    Ok(Arc::new(cfg))
+}
+
+fn device_chain(
+    relay: &config::Relay,
+) -> io::Result<(
+    Vec<rustls::pki_types::CertificateDer<'static>>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+)> {
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&relay.cert)
@@ -133,28 +178,14 @@ pub fn client_tls(relay: &config::Relay) -> io::Result<Arc<rustls::ClientConfig>
     }
     let key = PrivateKeyDer::from_pem_file(&relay.key)
         .map_err(|e| io::Error::other(format!("relay key {}: {e}", relay.key)))?;
-    let mut roots = rustls::RootCertStore::empty();
-    if relay.ca.is_empty() {
-        for c in rustls_native_certs::load_native_certs().certs {
-            let _ = roots.add(c);
-        }
-    } else {
-        for c in CertificateDer::pem_file_iter(&relay.ca)
-            .map_err(|e| io::Error::other(format!("relay ca {}: {e}", relay.ca)))?
-        {
-            let c = c.map_err(|e| io::Error::other(format!("relay ca {}: {e}", relay.ca)))?;
-            roots.add(c).map_err(io::Error::other)?;
-        }
-    }
-    let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .map_err(io::Error::other)?
-    .with_root_certificates(roots)
-    .with_client_auth_cert(certs, key)
-    .map_err(io::Error::other)?;
-    Ok(Arc::new(cfg))
+    Ok((certs, key))
+}
+
+/// The end-to-end TLS the machine answers callers with, inside relayed
+/// streams: its device certificate as the server certificate.
+pub fn stream_tls(relay: &config::Relay) -> io::Result<Arc<rustls::ServerConfig>> {
+    let (certs, key) = device_chain(relay)?;
+    actp_proto::e2e::server_config(certs, key).map_err(io::Error::other)
 }
 
 fn join_url(base: &str, path: &str) -> String {
@@ -348,8 +379,35 @@ async fn run_control(
                             tracing::warn!(error = %e, "could not open a relayed stream");
                             io::Error::other(e)
                         })?;
+                    // The caller's TLS, end to end: nothing but a caller
+                    // that completes it (and so checked this machine's
+                    // certificate) reaches the server.
+                    let accept =
+                        tokio_rustls::TlsAcceptor::from(opts.e2e.clone()).accept(WsIo::new(ws));
+                    let tls = match tokio::time::timeout(opts.dial_timeout, accept).await {
+                        Ok(Ok(tls))
+                            if tls.get_ref().1.alpn_protocol() == Some(actp_proto::e2e::ALPN) =>
+                        {
+                            tls
+                        }
+                        Ok(Ok(_)) => {
+                            tracing::warn!("a relayed caller did not ask for the actp protocol");
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "the caller did not ask for the actp protocol",
+                            ));
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, "a relayed caller's TLS failed");
+                            return Err(e);
+                        }
+                        Err(_) => {
+                            tracing::warn!("a relayed caller's TLS did not complete in time");
+                            return Err(io::Error::from(io::ErrorKind::TimedOut));
+                        }
+                    };
                     Ok(Box::new(Held {
-                        io: WsIo::new(ws),
+                        io: tls,
                         _permit: permit,
                     }) as Box<dyn Io>)
                 });

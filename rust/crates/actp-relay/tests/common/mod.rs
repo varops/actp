@@ -80,7 +80,11 @@ pub fn scratch(name: &str) -> PathBuf {
 pub struct Pki {
     pub dir: PathBuf,
     pub device_ca: Issuer<'static, KeyPair>,
+    pub caller_ca: Issuer<'static, KeyPair>,
 }
+
+/// The caller certificate tests use unless they say otherwise.
+pub const CALLER: &str = "it-bridge";
 
 pub fn ca(cn: &str) -> (CertificateParams, KeyPair, String) {
     let key = KeyPair::generate().unwrap();
@@ -111,10 +115,72 @@ impl Pki {
 
         let (dp, dk, dpem) = ca("device test CA");
         std::fs::write(dir.join("device-ca.pem"), dpem).unwrap();
-        Pki {
+        let (cp, ck, cpem) = ca("caller test CA");
+        std::fs::write(dir.join("caller-ca.pem"), cpem).unwrap();
+        let pki = Pki {
             dir: dir.to_path_buf(),
             device_ca: Issuer::new(dp, dk),
-        }
+            caller_ca: Issuer::new(cp, ck),
+        };
+        pki.caller(CALLER, None);
+        pki
+    }
+
+    /// A caller certificate for `cn`, signed by `issuer` (the caller CA by
+    /// default), written as `caller-<cn>.pem` and `.key`.
+    pub fn caller(
+        &self,
+        cn: &str,
+        issuer: Option<&Issuer<'static, KeyPair>>,
+    ) -> (PathBuf, PathBuf) {
+        self.caller_with(cn, issuer, |_| {})
+    }
+
+    /// [`Pki::caller`], with `edit` changing the certificate first.
+    pub fn caller_with(
+        &self,
+        cn: &str,
+        issuer: Option<&Issuer<'static, KeyPair>>,
+        edit: impl FnOnce(&mut CertificateParams),
+    ) -> (PathBuf, PathBuf) {
+        let key = KeyPair::generate().unwrap();
+        let mut p = CertificateParams::new(Vec::<String>::new()).unwrap();
+        p.distinguished_name.push(DnType::CommonName, cn);
+        p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        edit(&mut p);
+        let cert = p
+            .signed_by(&key, issuer.unwrap_or(&self.caller_ca))
+            .unwrap();
+        let (c, k) = (
+            self.dir.join(format!("caller-{cn}.pem")),
+            self.dir.join(format!("caller-{cn}.key")),
+        );
+        std::fs::write(&c, cert.pem()).unwrap();
+        std::fs::write(&k, key.serialize_pem()).unwrap();
+        (c, k)
+    }
+
+    /// How a caller holding `cert` reaches `machine` through a relay.
+    pub fn route_as(&self, cert: &(PathBuf, PathBuf), machine: &str) -> actp_client::RelayRoute {
+        actp_client::RelayRoute::from_files(
+            machine,
+            &cert.0,
+            &cert.1,
+            Some(&self.dir.join("relay-ca.pem")),
+            &self.dir.join("device-ca.pem"),
+            &[],
+            actp_proto::e2e::MachineName::Cn,
+        )
+        .unwrap()
+    }
+
+    /// [`Pki::route_as`] with the default caller certificate.
+    pub fn route(&self, machine: &str) -> actp_client::RelayRoute {
+        let cert = (
+            self.dir.join(format!("caller-{CALLER}.pem")),
+            self.dir.join(format!("caller-{CALLER}.key")),
+        );
+        self.route_as(&cert, machine)
     }
 
     /// A device certificate for `cn`, signed by `issuer` (the org's device CA by default).
@@ -154,6 +220,21 @@ impl Pki {
     /// A revocation list from the device CA, revoking `serials`, written to
     /// `name` in the PKI folder; `stale` makes its next update already past.
     pub fn crl(&self, name: &str, serials: &[u64], stale: bool) -> PathBuf {
+        self.crl_by(&self.device_ca, name, serials, stale)
+    }
+
+    /// [`Pki::crl`] from the caller CA.
+    pub fn caller_crl(&self, name: &str, serials: &[u64]) -> PathBuf {
+        self.crl_by(&self.caller_ca, name, serials, false)
+    }
+
+    fn crl_by(
+        &self,
+        issuer: &Issuer<'static, KeyPair>,
+        name: &str,
+        serials: &[u64],
+        stale: bool,
+    ) -> PathBuf {
         use rcgen::{
             CertificateRevocationListParams, KeyIdMethod, RevocationReason, RevokedCertParams,
             SerialNumber,
@@ -183,7 +264,7 @@ impl Pki {
                 .collect(),
             key_identifier_method: KeyIdMethod::Sha256,
         };
-        let crl = params.signed_by(&self.device_ca).unwrap();
+        let crl = params.signed_by(issuer).unwrap();
         let path = self.dir.join(name);
         std::fs::write(&path, crl.pem().unwrap()).unwrap();
         path
@@ -214,8 +295,7 @@ pub fn fast_timing() -> Timing {
     Timing {
         ping_every: Duration::from_millis(100),
         dead_after: Duration::from_millis(800),
-        stream_timeout: Duration::from_secs(5),
-        response_timeout: Duration::from_secs(10),
+        stream_timeout: Duration::from_secs(8),
         send_timeout: Duration::from_secs(2),
         flush_every: Duration::from_millis(200),
     }
@@ -241,10 +321,11 @@ pub async fn start_relay(pki: &Pki, dir: &Path) -> RelayEnv {
 /// The test relay config, plus `extra` YAML.
 pub fn relay_yaml(pki: &Pki, dir: &Path, extra: &str) -> String {
     format!(
-        "listen: 127.0.0.1:0\ntls_cert: {}\ntls_key: {}\ndevice_ca: {}\nstate_dir: {}\nlog_dir: {}\nblocked_machines: [lost-laptop]\nadmin_tokens:\n  - name: dave\n    hash: {}\n{extra}",
+        "listen: 127.0.0.1:0\ntls_cert: {}\ntls_key: {}\ndevice_ca: {}\ncaller_ca: {}\nstate_dir: {}\nlog_dir: {}\nblocked_machines: [lost-laptop]\nadmin_tokens:\n  - name: dave\n    hash: {}\n{extra}",
         yaml_path(&pki.dir.join("relay.pem")),
         yaml_path(&pki.dir.join("relay.key")),
         yaml_path(&pki.dir.join("device-ca.pem")),
+        yaml_path(&pki.dir.join("caller-ca.pem")),
         yaml_path(&dir.join("state")),
         yaml_path(&dir.join("logs")),
         hash(ADMIN),
@@ -348,6 +429,14 @@ pub async fn start_laptop_full(
     verifier: Option<Arc<dyn actp_server::org::PapersVerifier>>,
     adjust: impl FnOnce(&mut RelayOptions),
 ) -> Laptop {
+    // ACTP_TEST_LOG=<filter> (for example `warn` or `actp_server=debug`)
+    // shows the machines' and the relay's logs.
+    if let Ok(filter) = std::env::var("ACTP_TEST_LOG") {
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_env_filter(filter)
+            .try_init();
+    }
     let root = scratch(name);
     std::fs::create_dir_all(root.join("site")).unwrap();
     let yaml = format!(
@@ -380,11 +469,12 @@ pub async fn start_laptop_full(
     let mut opts = RelayOptions::new(
         relay_cfg.url.clone(),
         actp_server::relay::client_tls(&relay_cfg).unwrap(),
+        actp_server::relay::stream_tls(&relay_cfg).unwrap(),
     );
     opts.ping_every = Duration::from_millis(100);
     opts.dead_after = Duration::from_millis(800);
     opts.max_backoff = Duration::from_millis(200);
-    opts.dial_timeout = Duration::from_secs(3);
+    opts.dial_timeout = Duration::from_secs(6);
     adjust(&mut opts);
     let stop = CancellationToken::new();
     let acceptor = RelayAcceptor::start(srv.clone(), opts, stop.clone());
@@ -437,7 +527,142 @@ pub async fn request(
     bearer: &str,
     body: Option<Value>,
 ) -> (u16, Value) {
+    // `/m/<machine>/<path>` is shorthand for `<path>` on that machine,
+    // through a tunnel with the default caller certificate.
+    if let Some(rest) = path.strip_prefix("/m/") {
+        let (machine, inner) = rest.split_once('/').unwrap_or((rest, ""));
+        let inner = format!("/{inner}");
+        return match tunnel_request(
+            &pki.route(machine),
+            port,
+            machine,
+            method,
+            &inner,
+            bearer,
+            body,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(Refused::Relay(status, body)) => (status, body),
+            Err(Refused::Tls(e)) => panic!("TLS to {machine} failed: {e}"),
+        };
+    }
     request_with(pki.caller_tls(), port, method, path, bearer, body).await
+}
+
+/// Why a tunnel request got no answer from the machine.
+#[derive(Debug)]
+pub enum Refused {
+    /// The relay refused the tunnel: its status and JSON body.
+    Relay(u16, Value),
+    /// The end-to-end TLS failed: the machine was not the machine asked
+    /// for, or the bytes were changed on the way.
+    Tls(String),
+}
+
+/// The end-to-end TLS stream of a caller's tunnel.
+pub type TunnelTls = tokio_rustls::client::TlsStream<
+    actp_proto::wsio::WsIo<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
+>;
+
+/// A tunnel to `machine` through the relay at `port`, and TLS to the
+/// machine inside it.
+pub async fn open_tunnel(
+    route: &actp_client::RelayRoute,
+    port: u16,
+    machine: &str,
+) -> Result<TunnelTls, Refused> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = format!("wss://localhost:{port}/relay/v1/tunnel/{machine}")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut().insert(
+        "Sec-WebSocket-Protocol",
+        actp_proto::relay::PROTOCOL_TUNNEL.parse().unwrap(),
+    );
+    let ws = match tokio_tungstenite::connect_async_tls_with_config(
+        req,
+        None,
+        true,
+        Some(tokio_tungstenite::Connector::Rustls(
+            route.relay_tls.clone(),
+        )),
+    )
+    .await
+    {
+        Ok((ws, _)) => ws,
+        Err(tokio_tungstenite::tungstenite::Error::Http(r)) => {
+            let body = r
+                .body()
+                .as_deref()
+                .and_then(|b| serde_json::from_slice(b).ok())
+                .unwrap_or(Value::Null);
+            return Err(Refused::Relay(r.status().as_u16(), body));
+        }
+        Err(e) => return Err(Refused::Tls(format!("the relay: {e}"))),
+    };
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio_rustls::TlsConnector::from(match &route.reload {
+            Some(reload) => reload().map_err(Refused::Tls)?,
+            None => route.machine_tls.clone(),
+        })
+        .connect(
+            actp_proto::e2e::server_name(),
+            actp_proto::wsio::WsIo::new(ws),
+        ),
+    )
+    .await
+    .map_err(|_| Refused::Tls("timed out".into()))?
+    .map_err(|e| Refused::Tls(e.to_string()))
+}
+
+/// One request to `path` on `machine`, through the relay at `port`, over
+/// TLS end to end to the machine.
+pub async fn tunnel_request(
+    route: &actp_client::RelayRoute,
+    port: u16,
+    machine: &str,
+    method: &str,
+    path: &str,
+    bearer: &str,
+    body: Option<Value>,
+) -> Result<(u16, Value), Refused> {
+    let tls = open_tunnel(route, port, machine).await?;
+    let (mut sender, conn) =
+        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tls))
+            .await
+            .map_err(|e| Refused::Tls(e.to_string()))?;
+    tokio::spawn(conn);
+    let mut req = http::Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", "machine.actp.invalid");
+    if !bearer.is_empty() {
+        req = req.header("authorization", format!("Bearer {bearer}"));
+    }
+    use http_body_util::BodyExt;
+    let req = req
+        .body(http_body_util::Full::new(bytes::Bytes::from(
+            body.map(|b| b.to_string()).unwrap_or_default(),
+        )))
+        .unwrap();
+    let resp = tokio::time::timeout(Duration::from_secs(10), sender.send_request(req))
+        .await
+        .map_err(|_| Refused::Tls("no answer".into()))?
+        .map_err(|e| Refused::Tls(e.to_string()))?;
+    let status = resp.status().as_u16();
+    let bytes = resp
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| Refused::Tls(e.to_string()))?
+        .to_bytes();
+    Ok((
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    ))
 }
 
 pub async fn request_with(
@@ -500,12 +725,12 @@ impl Caller {
     ) -> Caller {
         let mut o = actp_client::Options {
             agent: "test".into(),
-            base_url: format!("https://localhost:{port}/m/{machine}"),
+            base_url: format!("https://localhost:{port}"),
             token: TOKEN.into(),
             client_name: "relay-test".into(),
             max_backoff: Duration::from_millis(100),
             give_up_after: Duration::from_secs(2),
-            tls: Some(pki.caller_tls()),
+            relay: Some(pki.route(machine)),
             ..Default::default()
         };
         adjust(&mut o);
@@ -598,5 +823,61 @@ impl Proxy {
         for h in self.conns.lock().unwrap().drain(..) {
             h.abort();
         }
+    }
+}
+
+/// Whether `needle` occurs in `hay`.
+pub fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Records every byte read through it.
+pub struct Recorder<T> {
+    io: T,
+    pub seen: Arc<Mutex<Vec<u8>>>,
+}
+
+impl<T> Recorder<T> {
+    pub fn new(io: T) -> Self {
+        Recorder {
+            io,
+            seen: Arc::default(),
+        }
+    }
+}
+
+impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Recorder<T> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let r = std::pin::Pin::new(&mut self.io).poll_read(cx, buf);
+        let new = buf.filled()[before..].to_vec();
+        self.seen.lock().unwrap().extend_from_slice(&new);
+        r
+    }
+}
+
+impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Recorder<T> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_shutdown(cx)
     }
 }

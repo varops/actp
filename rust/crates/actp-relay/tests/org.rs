@@ -56,10 +56,14 @@ fn refusals(l: &Laptop) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Tries to resume `link` on `machine` with `bearer`; returns the HTTP status.
+/// Tries to resume `link` on `machine` with `bearer`, through a tunnel;
+/// returns the HTTP status.
 async fn resume_status(pki: &Pki, port: u16, machine: &str, link: &str, bearer: &str) -> u16 {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-    let mut req = format!("wss://localhost:{port}/m/{machine}/actp/v1/agents/test/link")
+    let tls = open_tunnel(&pki.route(machine), port, machine)
+        .await
+        .unwrap();
+    let mut req = "ws://machine.actp.invalid/actp/v1/agents/test/link"
         .into_client_request()
         .unwrap();
     let h = req.headers_mut();
@@ -67,14 +71,7 @@ async fn resume_status(pki: &Pki, port: u16, machine: &str, link: &str, bearer: 
     h.insert("Sec-WebSocket-Protocol", "actp.v1".parse().unwrap());
     h.insert("Actp-Link-Id", link.parse().unwrap());
     h.insert("Actp-Last-Seq", "0".parse().unwrap());
-    match tokio_tungstenite::connect_async_tls_with_config(
-        req,
-        None,
-        false,
-        Some(tokio_tungstenite::Connector::Rustls(pki.caller_tls())),
-    )
-    .await
-    {
+    match tokio_tungstenite::client_async(req, tls).await {
         Ok(_) => 101,
         Err(tokio_tungstenite::tungstenite::Error::Http(r)) => r.status().as_u16(),
         Err(e) => panic!("{e}"),

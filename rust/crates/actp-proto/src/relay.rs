@@ -1,12 +1,16 @@
-//! The relay protocol (docs/relay.md) between a machine and the relay.
+//! The relay protocol (docs/relay.md).
 //!
 //! A machine keeps one control WebSocket open to the relay
 //! ([`PATH_CONNECT`]). The relay sends [`Control`] messages on it as JSON
-//! text frames. When a caller arrives for the machine, the relay sends
-//! [`Control::Open`] with a fresh stream id, and the machine dials a second
-//! WebSocket ([`PATH_STREAM`] + id) that carries the caller's HTTP connection
-//! as bytes (see [`crate::wsio`]). Both WebSockets are made over TLS with the
+//! text frames. Both machine WebSockets are made over TLS with the
 //! machine's device certificate.
+//!
+//! A caller opens a tunnel WebSocket to the relay ([`PATH_TUNNEL`] + the
+//! machine's address) over TLS with its own caller certificate. The relay
+//! sends the machine [`Control::Open`] with a fresh stream id, the machine
+//! dials a data WebSocket ([`PATH_STREAM`] + id), and the relay joins the
+//! two. Both carry bytes ([`crate::wsio`]): the caller's TLS straight to
+//! the machine ([`crate::e2e`]), which the relay cannot read.
 
 use serde::{Deserialize, Serialize};
 
@@ -14,12 +18,14 @@ use serde::{Deserialize, Serialize};
 pub const PATH_CONNECT: &str = "/relay/v1/connect";
 /// A data stream: this prefix plus the stream id from [`Control::Open`].
 pub const PATH_STREAM: &str = "/relay/v1/stream/";
-/// Callers reach a machine under this prefix plus its address.
-pub const PATH_MACHINE: &str = "/m/";
+/// A caller's tunnel to a machine: this prefix plus the machine's address.
+pub const PATH_TUNNEL: &str = "/relay/v1/tunnel/";
 
-/// WebSocket subprotocols of the two machine connections.
-pub const PROTOCOL_CONTROL: &str = "actp-relay.v1";
-pub const PROTOCOL_STREAM: &str = "actp-relay-stream.v1";
+/// WebSocket subprotocols of the two machine connections and the caller's
+/// tunnel.
+pub const PROTOCOL_CONTROL: &str = "actp-relay.v2";
+pub const PROTOCOL_STREAM: &str = "actp-relay-stream.v2";
+pub const PROTOCOL_TUNNEL: &str = "actp-relay-tunnel.v1";
 
 /// Length of a stream id: 32 random bytes as lowercase hex.
 pub const STREAM_ID_LEN: usize = 64;
@@ -31,7 +37,8 @@ pub enum Control {
     /// First message on every control connection: the address the relay
     /// knows this machine by, and whether the org-wide stop is on.
     Hello { machine: String, stopped: bool },
-    /// A caller is waiting: dial [`PATH_STREAM`] + `stream`.
+    /// A caller is waiting: dial [`PATH_STREAM`] + `stream`, and answer the
+    /// caller's TLS on it ([`crate::e2e::server_config`]).
     Open { stream: String },
     /// The org-wide stop was pressed: end every session, refuse new ones.
     Stop,
