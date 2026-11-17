@@ -761,7 +761,7 @@ fn a_swap_cut_short_is_repaired_at_start_and_a_key_never_lands_without_its_certi
     let f = files(&cert);
     let old_key = std::fs::read(&f.key).unwrap();
     std::fs::remove_file(&f.cert).unwrap();
-    std::fs::create_dir_all(format!("{}/in-the-way", f.cert)).unwrap();
+    std::fs::create_dir_all(std::path::Path::new(&f.cert).join("in-the-way")).unwrap();
     std::fs::copy(&next.0, format!("{}.next", f.cert)).unwrap();
     std::fs::copy(&next.1, format!("{}.next", f.key)).unwrap();
     actp_server::continuity::repair(&f);
@@ -809,7 +809,8 @@ async fn a_machine_that_cannot_put_the_files_in_place_asks_nothing() {
     laptop.wait_connected().await;
     // Something in the way of the staged key: staging fails.
     std::fs::create_dir(format!("{}.staged", cert.1.display())).unwrap();
-    std::fs::create_dir(format!("{}.staged/x", cert.1.display())).unwrap();
+    std::fs::create_dir(std::path::PathBuf::from(format!("{}.staged", cert.1.display())).join("x"))
+        .unwrap();
     let next = device_for_days(&pki, "laptop-a", "renewed", 365);
     put_next(&cert, &next);
     tokio::time::sleep(Duration::from_secs(2)).await;
