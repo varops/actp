@@ -345,6 +345,11 @@ async fn a_machine_configured_for_another_name_takes_no_papers() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_session_resumes_with_fresh_papers_after_a_drop() {
+    // Long enough to outlast opening the first link everywhere: on the
+    // Windows runners every connection to `localhost` first tries `::1`,
+    // where nothing listens, and costs about two seconds, so the first
+    // initialize alone takes about four.
+    const FIRST_PAPERS: Duration = Duration::from_secs(12);
     let dir = scratch("org-resume");
     let pki = Pki::new(&dir);
     let env = start_relay(&pki, &dir).await;
@@ -359,8 +364,8 @@ async fn a_session_resumes_with_fresh_papers_after_a_drop() {
         o.token_source = Some(Arc::new(move || {
             let mut n = i2.lock().unwrap();
             *n += 1;
-            // The first papers expire in five seconds; later ones last.
-            let ttl = if *n == 1 { 5 } else { 60 };
+            // The first papers expire after FIRST_PAPERS; later ones last.
+            let ttl = if *n == 1 { FIRST_PAPERS.as_secs() } else { 60 };
             let p = v2.issue(
                 "dave",
                 "laptop-a",
@@ -381,7 +386,8 @@ async fn a_session_resumes_with_fresh_papers_after_a_drop() {
 
     // The first papers expire, then the connection drops while the issuer
     // cannot be asked: the bridge keeps trying instead of giving up.
-    tokio::time::sleep(Duration::from_secs(7).saturating_sub(started.elapsed())).await;
+    tokio::time::sleep((FIRST_PAPERS + Duration::from_secs(2)).saturating_sub(started.elapsed()))
+        .await;
     v.unavailable.store(true, Ordering::SeqCst);
     proxy.drop_all();
     tokio::time::sleep(Duration::from_millis(1500)).await;
