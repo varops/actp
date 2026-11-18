@@ -345,12 +345,6 @@ async fn a_machine_configured_for_another_name_takes_no_papers() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_session_resumes_with_fresh_papers_after_a_drop() {
-    // DIAGNOSTIC (to be reverted): logs for the Windows failure.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("actp_relay=debug,actp_server=debug,actp_client=debug")
-        .with_writer(std::io::stderr)
-        .try_init();
-    eprintln!("DIAG start {:?}", std::time::Instant::now());
     let dir = scratch("org-resume");
     let pki = Pki::new(&dir);
     let env = start_relay(&pki, &dir).await;
