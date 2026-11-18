@@ -403,7 +403,7 @@ async fn dial_as(
         ca: pki.dir.join("relay-ca.pem").to_string_lossy().into_owned(),
     })
     .unwrap();
-    let mut req = format!("wss://localhost:{port}{path}")
+    let mut req = format!("wss://127.0.0.1:{port}{path}")
         .into_client_request()
         .unwrap();
     req.headers_mut()
@@ -1566,7 +1566,7 @@ fn cert_fingerprint(pem: &std::path::Path) -> String {
 /// the relay's status when it refuses.
 async fn tunnel_with_on_behalf_of(pki: &Pki, port: u16, machine: &str, values: &[&[u8]]) -> u16 {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-    let mut req = format!("wss://localhost:{port}/relay/v1/tunnel/{machine}")
+    let mut req = format!("wss://127.0.0.1:{port}/relay/v1/tunnel/{machine}")
         .into_client_request()
         .unwrap();
     req.headers_mut().insert(

@@ -16,7 +16,7 @@ use tokio::net::TcpStream;
 const OPERATORS: &str = "operators:\n  - caller: it-bridge\n    may: [machines, audit, stop, release]\n  - caller: manager\n    may: [machines]\n  - caller: blocked-op\n    may: [machines, audit, stop, release]\n  - caller: revoked-op\n    may: [machines, audit, stop, release]\nblocked_callers: [blocked-op]\n";
 
 fn relay_url(port: u16) -> String {
-    format!("https://localhost:{port}")
+    format!("https://127.0.0.1:{port}")
 }
 
 /// The relay's management API as the holder of `cert`.

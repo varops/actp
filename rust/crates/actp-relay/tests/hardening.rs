@@ -604,7 +604,7 @@ async fn a_machine_moves_to_its_next_key_with_the_old_keys_proof() {
     std::fs::copy(&cert, &old_pair.0).unwrap();
     std::fs::copy(&key, &old_pair.1).unwrap();
     let files = actp_server::config::Relay {
-        url: format!("wss://localhost:{}", env.port),
+        url: format!("wss://127.0.0.1:{}", env.port),
         cert: cert.to_string_lossy().into_owned(),
         key: key.to_string_lossy().into_owned(),
         ca: dir.join("relay-ca.pem").to_string_lossy().into_owned(),
@@ -781,7 +781,7 @@ async fn continuity_laptop(
     every: Duration,
 ) -> Laptop {
     let files = actp_server::config::Relay {
-        url: format!("wss://localhost:{}", env.port),
+        url: format!("wss://127.0.0.1:{}", env.port),
         cert: cert.0.to_string_lossy().into_owned(),
         key: cert.1.to_string_lossy().into_owned(),
         ca: pki.dir.join("relay-ca.pem").to_string_lossy().into_owned(),

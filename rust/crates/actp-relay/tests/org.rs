@@ -345,10 +345,9 @@ async fn a_machine_configured_for_another_name_takes_no_papers() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_session_resumes_with_fresh_papers_after_a_drop() {
-    // Long enough to outlast opening the first link everywhere: on the
-    // Windows runners every connection to `localhost` first tries `::1`,
-    // where nothing listens, and costs about two seconds, so the first
-    // initialize alone takes about four.
+    // Long enough to outlast opening the first link on a slow runner: if
+    // the papers expire before the machine checks them, the bridge gives up
+    // and the test proves nothing.
     const FIRST_PAPERS: Duration = Duration::from_secs(12);
     let dir = scratch("org-resume");
     let pki = Pki::new(&dir);
