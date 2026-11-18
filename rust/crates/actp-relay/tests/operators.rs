@@ -198,38 +198,13 @@ async fn nobody_but_an_operator_gets_anything() {
             (403, Some("caller_blocked")),
             "{method} {path}"
         );
-        // (or refused at the handshake)
-        if let Ok((status, b)) = try_request(
-            revoked.clone(),
-            env.port,
-            method,
-            path,
-            &[OBO],
-            body.clone(),
-        )
-        .await
-        {
-            assert_eq!(
-                (status, b["error"].as_str()),
-                (403, Some("bad_caller_certificate")),
-                "{method} {path}"
-            );
-        }
-        // The operator's name on a certificate from another CA.
-        if let Ok((status, b)) = try_request(
-            impostor.clone(),
-            env.port,
-            method,
-            path,
-            &[OBO],
-            body.clone(),
-        )
-        .await
-        {
-            assert!(
-                status == 403 || status == 401,
-                "{method} {path}: {status} {b}"
-            );
+        // A revoked certificate, and the operator's name on a certificate
+        // from another CA, are refused at the TLS handshake: no HTTP at all.
+        // (A certificate revoked after the handshake is refused per request:
+        // operators_lose_their_role_on_a_live_connection.)
+        for (who, tls) in [("revoked", revoked.clone()), ("impostor", impostor.clone())] {
+            let r = try_request(tls, env.port, method, path, &[OBO], body.clone()).await;
+            assert!(r.is_err(), "{who} {method} {path}: {r:?}");
         }
         // A real operator with a bad admin token: the token decides, and
         // there is no falling back to the certificate.
@@ -529,6 +504,9 @@ async fn an_operators_stop_drops_live_sessions_and_refuses_new_ones_until_releas
         .await
         .unwrap();
     assert_eq!(again.on_behalf_of.as_deref(), Some("dana@example.com"));
+    assert!(env.audit_has("org_stop_repeated", |e| e["on_behalf_of"]
+        == "eve@example.com"
+        && e["by"] == "it-bridge"));
     // Anyone with a role sees it.
     let manager = ops_as(&pki, &pki.caller("manager", None), env.port);
     let seen = manager.stop_state().await.unwrap();
@@ -597,6 +575,22 @@ async fn an_operators_stop_drops_live_sessions_and_refuses_new_ones_until_releas
         Some(64)
     );
     assert!(release.time > stop.time);
+    assert!(
+        stops.events.iter().any(
+            |e| e.event == "org_stop_repeated" && e.fields["on_behalf_of"] == "eve@example.com"
+        )
+    );
+    // The stops a program pressed are found by its name too.
+    let by_bridge = sam
+        .audit(&AuditQuery {
+            kinds: vec![AuditKind::Stops],
+            caller: Some(CALLER.into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(by_bridge.events.iter().any(|e| e.event == "org_stop"));
+    assert!(by_bridge.events.iter().any(|e| e.event == "org_release"));
 
     // Who connected to laptop-a, when and for how long: dave's session,
     // ended by the stop.
@@ -710,7 +704,7 @@ async fn the_audit_pages_newest_first_without_losing_an_event() {
         if !p.more {
             break;
         }
-        q.before = p.next_before;
+        q.cursor = p.next;
     }
     assert_eq!(pages, 4, "ten events in pages of three");
     assert_eq!(got.len(), 10);
@@ -773,4 +767,127 @@ async fn the_audit_pages_newest_first_without_losing_an_event() {
     }
     drop(a);
     drop(b);
+}
+
+// ---- a role taken away on a connection that stays open ----
+
+/// One kept-alive HTTPS connection to the relay.
+struct Conn {
+    sender: hyper::client::conn::http1::SendRequest<http_body_util::Full<bytes::Bytes>>,
+}
+
+impl Conn {
+    async fn open(tls: Arc<rustls::ClientConfig>, port: u16) -> Conn {
+        let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let tls = tokio_rustls::TlsConnector::from(tls)
+            .connect("localhost".try_into().unwrap(), tcp)
+            .await
+            .unwrap();
+        let (sender, conn) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tls))
+                .await
+                .unwrap();
+        tokio::spawn(conn);
+        Conn { sender }
+    }
+
+    async fn get(&mut self, path: &str) -> (u16, Value) {
+        use http_body_util::BodyExt;
+        self.sender.ready().await.unwrap();
+        let req = http::Request::builder()
+            .method("GET")
+            .uri(path)
+            .header("host", "localhost")
+            .body(http_body_util::Full::new(bytes::Bytes::new()))
+            .unwrap();
+        let resp = self.sender.send_request(req).await.unwrap();
+        let status = resp.status().as_u16();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn operators_lose_their_role_on_a_live_connection() {
+    let dir = scratch("ops-reload");
+    let pki = Pki::new(&dir);
+    let cert = pki.caller_with("ops-live", None, |p| {
+        p.serial_number = Some(rcgen::SerialNumber::from(8008u64))
+    });
+    let fp = {
+        use rustls::pki_types::CertificateDer;
+        use rustls::pki_types::pem::PemObject;
+        use sha2::Digest;
+        let der = CertificateDer::pem_file_iter(&cert.0)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        hex::encode(sha2::Sha256::digest(der.as_ref()))
+    };
+    let empty = pki.caller_crl("callers-empty.crl", &[]);
+    let crls = |p: &std::path::Path| format!("caller_crls: [{}]\n", yaml_path(p));
+    let role = "operators:\n  - caller: ops-live\n    may: [machines, audit]\n";
+    let env = start_relay_with(&pki, &dir, &format!("{role}{}", crls(&empty))).await;
+    let reload = |extra: String| {
+        let yaml = relay_yaml(&pki, &dir, &extra);
+        let cfg = actp_relay::config::Config::parse(&yaml).unwrap();
+        let tls = actp_relay::tls::server_config(&cfg).unwrap();
+        env.relay.reload(cfg, tls);
+    };
+    let mut c = Conn::open(pki.route_as(&cert, "x").relay_tls, env.port).await;
+    assert_eq!(c.get("/relay/v1/machines").await.0, 200);
+
+    // The role is taken away: the same connection gets nothing.
+    reload(crls(&empty));
+    let (status, b) = c.get("/relay/v1/machines").await;
+    assert_eq!(
+        (status, b["error"].as_str()),
+        (403, Some("not_an_operator"))
+    );
+    // Given back, then the caller is blocked.
+    reload(format!("{role}{}", crls(&empty)));
+    assert_eq!(c.get("/relay/v1/audit").await.0, 200);
+    reload(format!(
+        "{role}blocked_callers: [ops-live]\n{}",
+        crls(&empty)
+    ));
+    let (status, b) = c.get("/relay/v1/audit").await;
+    assert_eq!((status, b["error"].as_str()), (403, Some("caller_blocked")));
+    // Pinned to another certificate: the name alone is not enough.
+    let other = format!("sha256:{}", "ab".repeat(32));
+    reload(format!(
+        "operators:\n  - caller: ops-live\n    may: [machines]\n    certificates: [{other}]\n{}",
+        crls(&empty)
+    ));
+    let (status, b) = c.get("/relay/v1/machines").await;
+    assert_eq!(
+        (status, b["error"].as_str()),
+        (403, Some("operator_certificate_not_listed"))
+    );
+    // Pinned to its own (in upper case, as some tools write it): taken.
+    reload(format!(
+        "operators:\n  - caller: ops-live\n    may: [machines]\n    certificates: [{other}, \"SHA256:{}\"]\n{}",
+        fp.to_ascii_uppercase(),
+        crls(&empty)
+    ));
+    assert_eq!(c.get("/relay/v1/machines").await.0, 200);
+    // Its certificate is revoked: refused on the open connection.
+    let revoked = pki.caller_crl("callers-revoked.crl", &[8008]);
+    reload(format!("{role}{}", crls(&revoked)));
+    let (status, b) = c.get("/relay/v1/machines").await;
+    assert_eq!(
+        (status, b["error"].as_str()),
+        (403, Some("bad_caller_certificate"))
+    );
+    // Every reload records who holds a role.
+    assert!(
+        env.audit_has("config_reloaded", |e| e["operators"][0]["caller"]
+            == "ops-live"
+            && e["operators"][0]["may"] == json!(["machines", "audit"]))
+    );
+    assert!(env.audit_has("config_reloaded", |e| e["operators"] == json!([])));
 }

@@ -215,6 +215,12 @@ pub struct Operator {
     pub caller: String,
     /// What it may do; at least one.
     pub may: Vec<Permission>,
+    /// When set, only these certificates (SHA-256 of the DER, as
+    /// `sha256:<hex>`) count as this operator: another certificate with the
+    /// same name, from any root in `caller_ca`, does not. Empty: any valid
+    /// caller certificate with the name.
+    #[serde(default)]
+    pub certificates: Vec<String>,
 }
 
 /// What an operator may do at the relay.
@@ -231,7 +237,23 @@ pub enum Permission {
     Release,
 }
 
+impl Permission {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Permission::Machines => "machines",
+            Permission::Audit => "audit",
+            Permission::Stop => "stop",
+            Permission::Release => "release",
+        }
+    }
+}
+
 impl Config {
+    /// The operator entry for the caller named `caller`.
+    pub fn operator_entry(&self, caller: &str) -> Option<&Operator> {
+        self.operators.iter().find(|o| o.caller == caller)
+    }
+
     /// What the caller named `caller` may do at the relay; empty when it is
     /// not an operator.
     pub fn operator(&self, caller: &str) -> &[Permission] {
@@ -259,6 +281,11 @@ impl Config {
         // uppercase. Both mean the same token.
         for t in &mut cfg.admin_tokens {
             t.hash = t.hash.to_ascii_lowercase();
+        }
+        for o in &mut cfg.operators {
+            for c in &mut o.certificates {
+                *c = c.to_ascii_lowercase();
+            }
         }
         cfg.validate()?;
         Ok(cfg)
@@ -339,6 +366,14 @@ impl Config {
                 ));
             } else if !ops.insert(&o.caller) {
                 errs.push(format!("operator {:?} is listed twice", o.caller));
+            }
+            for c in &o.certificates {
+                if !valid_hash(c) {
+                    errs.push(format!(
+                        "operator {:?}: certificates are sha256:<64 lowercase hex digits>",
+                        o.caller
+                    ));
+                }
             }
             if o.may.is_empty() {
                 errs.push(format!(
@@ -462,6 +497,7 @@ mod tests {
             "operators:\n  - caller: a/b\n    may: [audit]\n",
             "operators:\n  - caller: a\n    may: [audit]\n  - caller: a\n    may: [stop]\n",
             "operators:\n  - caller: a\n    may: [audit]\n    role: admin\n",
+            "operators:\n  - caller: a\n    may: [audit]\n    certificates: [abc]\n",
         ] {
             assert!(Config::parse(&format!("{BASE}{bad}")).is_err(), "{bad}");
         }

@@ -3,8 +3,9 @@
 //! anything a session carries.
 //!
 //! Every line's `time` is in microseconds and later than the line before
-//! it, also across rotations and restarts, so a time names one line: the
-//! audit query ([`query`]) pages by it.
+//! it, also across rotations and restarts. The audit query ([`query`])
+//! pages by position in the files, so older relays' lines (millisecond
+//! times, not always in order) page exactly too.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -192,12 +193,24 @@ impl Log {
     fn write(&mut self, line: &str) {
         if self.size + line.len() as u64 > self.max && self.size > 0 {
             for i in (1..KEEP).rev() {
-                let _ = std::fs::rename(
-                    self.dir.join(format!("audit.jsonl.{i}")),
-                    self.dir.join(format!("audit.jsonl.{}", i + 1)),
-                );
+                let from = self.dir.join(format!("audit.jsonl.{i}"));
+                if let Err(e) =
+                    std::fs::rename(&from, self.dir.join(format!("audit.jsonl.{}", i + 1)))
+                    && e.kind() != io::ErrorKind::NotFound
+                {
+                    tracing::error!(error = %e, file = %from.display(), "could not rotate an audit file");
+                }
             }
-            let _ = std::fs::rename(self.dir.join("audit.jsonl"), self.dir.join("audit.jsonl.1"));
+            if let Err(e) =
+                std::fs::rename(self.dir.join("audit.jsonl"), self.dir.join("audit.jsonl.1"))
+            {
+                // The file goes on growing past the limit until a rotation
+                // succeeds (on Windows, a file being read cannot always be
+                // renamed); nothing is lost.
+                tracing::error!(error = %e, "could not rotate the audit log");
+                self.size = 0;
+                return self.append_only(line);
+            }
             match open_log(&self.dir) {
                 Ok(f) => {
                     self.file = f;
@@ -206,6 +219,10 @@ impl Log {
                 Err(e) => tracing::error!(error = %e, "could not rotate the audit log"),
             }
         }
+        self.append_only(line);
+    }
+
+    fn append_only(&mut self, line: &str) {
         match self.file.write_all(line.as_bytes()) {
             Ok(()) => self.size += line.len() as u64,
             Err(e) => tracing::error!(error = %e, "could not write the audit log"),
@@ -215,15 +232,16 @@ impl Log {
 
 // ---- reading it back ----
 
-/// The lines of the first `len` bytes of a file, last first.
+/// The lines of the first `len` bytes of a file, last first, each with
+/// the offset it starts at.
 struct Lines {
     f: File,
     /// Bytes not read yet, from the start of the file.
     pos: u64,
     /// The start of a line whose beginning is further back.
     carry: Vec<u8>,
-    /// Whole lines read, in file order.
-    ready: Vec<Vec<u8>>,
+    /// Whole lines read, in file order, with their offsets.
+    ready: Vec<(u64, Vec<u8>)>,
 }
 
 /// Bytes read at a time, going back.
@@ -242,13 +260,18 @@ impl Lines {
     }
 
     fn next_line(&mut self) -> io::Result<Option<Vec<u8>>> {
+        Ok(self.next_at()?.map(|(_, l)| l))
+    }
+
+    /// The next line back, and the offset it starts at.
+    fn next_at(&mut self) -> io::Result<Option<(u64, Vec<u8>)>> {
         loop {
             if let Some(l) = self.ready.pop() {
                 return Ok(Some(l));
             }
             if self.pos == 0 {
                 let l = std::mem::take(&mut self.carry);
-                return Ok((!l.is_empty()).then_some(l));
+                return Ok((!l.is_empty()).then_some((0, l)));
             }
             let n = CHUNK.min(self.pos);
             self.pos -= n;
@@ -256,17 +279,47 @@ impl Lines {
             let mut data = vec![0u8; n as usize];
             self.f.read_exact(&mut data)?;
             data.extend_from_slice(&self.carry);
-            let mut parts = data.split(|b| *b == b'\n');
-            let first = parts.next().unwrap_or_default().to_vec();
-            self.ready = parts
-                .filter(|l| !l.is_empty() && l.len() <= MAX_LINE)
-                .map(<[u8]>::to_vec)
-                .collect();
-            self.carry = if first.len() > MAX_LINE {
-                Vec::new()
-            } else {
-                first
-            };
+            let mut ready = Vec::new();
+            let mut first_end = None;
+            let mut start = 0usize;
+            for (i, b) in data.iter().enumerate() {
+                if *b != b'\n' {
+                    continue;
+                }
+                match first_end {
+                    None => first_end = Some(i),
+                    Some(_) => {
+                        let l = &data[start..i];
+                        if !l.is_empty() && l.len() <= MAX_LINE {
+                            ready.push((self.pos + start as u64, l.to_vec()));
+                        }
+                    }
+                }
+                start = i + 1;
+            }
+            match first_end {
+                None => {
+                    // No line ends in it: all of it is the start of a line
+                    // further back.
+                    self.carry = if data.len() > MAX_LINE {
+                        Vec::new()
+                    } else {
+                        data
+                    };
+                }
+                Some(fe) => {
+                    let l = &data[start..];
+                    if !l.is_empty() && l.len() <= MAX_LINE {
+                        ready.push((self.pos + start as u64, l.to_vec()));
+                    }
+                    self.carry = if fe > MAX_LINE {
+                        Vec::new()
+                    } else {
+                        data[..fe].to_vec()
+                    };
+                }
+            }
+            self.ready = ready;
         }
     }
 }
@@ -281,6 +334,8 @@ pub enum Kind {
     /// Machines coming and going, and every change to a machine's pinned
     /// key (an admin's re-pin included).
     Machines,
+    /// Configuration reloads, with who holds a role at the relay.
+    Config,
 }
 
 impl Kind {
@@ -289,6 +344,7 @@ impl Kind {
             "sessions" => Some(Kind::Sessions),
             "stops" => Some(Kind::Stops),
             "machines" => Some(Kind::Machines),
+            "config" => Some(Kind::Config),
             _ => None,
         }
     }
@@ -343,7 +399,19 @@ fn projection(event: &str) -> Option<(Kind, &'static [&'static str])> {
                 "reason",
             ],
         ),
+        "org_stop_repeated" => (
+            Kind::Stops,
+            &[
+                "by",
+                "by_kind",
+                "caller_certificate",
+                "on_behalf_of",
+                "reason",
+                "sessions_dropped",
+            ],
+        ),
         "org_stop_not_saved" | "org_stop_saved" => (Kind::Stops, &[]),
+        "config_reloaded" => (Kind::Config, &["operators"]),
         "machine_online" => (Kind::Machines, &["machine"]),
         "machine_offline" => (Kind::Machines, &["machine", "seconds", "reason"]),
         "machine_replaced" => (
@@ -370,80 +438,163 @@ fn projection(event: &str) -> Option<(Kind, &'static [&'static str])> {
 pub struct Query {
     /// Which kinds of events; empty: all.
     pub kinds: Vec<Kind>,
-    /// Only events naming exactly this machine, caller, or person.
+    /// Only events naming exactly this machine, or person. `caller` also
+    /// matches the operator (`by`) that pressed or released the stop.
     pub machine: Option<String>,
     pub caller: Option<String>,
     pub on_behalf_of: Option<String>,
     /// Events at or after this time (microseconds since the epoch).
     pub since: Option<u64>,
-    /// Events before this time: the `next_before` of the page before.
+    /// Events before this time.
     pub before: Option<u64>,
-    /// Events per page.
+    /// Where the page before ended ([`Page::next`]): this page goes on
+    /// from there, older.
+    pub cursor: Option<String>,
+    /// Events per page (at least 1).
     pub limit: usize,
+    /// Bytes of the log one page reads at most (0: no limit). A page that
+    /// reaches it ends early, with `more` and a cursor to go on from.
+    pub budget: u64,
 }
 
 /// One page of events, newest first.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Page {
     pub events: Vec<Value>,
-    /// Older events match too: ask again with `before` = `next_before`.
+    /// There may be more: ask again with `cursor` = `next`.
     pub more: bool,
-    pub next_before: Option<String>,
+    pub next: Option<String>,
+}
+
+/// Lines written before times were unique and in order (millisecond
+/// times, taken before the writer's lock) can be out of order by this
+/// much; `since` stops the scan only this far past it.
+const DISORDER_US: u64 = 2_000_000;
+
+/// A file's identity across renames: the hash of its first line (the
+/// files are only ever appended to).
+fn file_id(f: &mut File) -> io::Result<Option<String>> {
+    use sha2::Digest;
+    f.seek(SeekFrom::Start(0))?;
+    let mut first = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            return Ok(None); // no whole line yet
+        }
+        match buf[..n].iter().position(|b| *b == b'\n') {
+            Some(i) => {
+                first.extend_from_slice(&buf[..i]);
+                break;
+            }
+            None => first.extend_from_slice(&buf[..n]),
+        }
+        if first.len() > MAX_LINE {
+            return Ok(None);
+        }
+    }
+    Ok(Some(hex::encode(&sha2::Sha256::digest(&first)[..12])))
+}
+
+fn cursor(file: &str, offset: u64) -> String {
+    format!("{file}-{offset}")
+}
+
+/// A cursor's file and offset, if it is one.
+pub fn parse_cursor(c: &str) -> Option<(String, u64)> {
+    let (file, offset) = c.split_once('-')?;
+    (file.len() == 24 && file.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        .then_some(())?;
+    Some((file.to_string(), offset.parse().ok()?))
+}
+
+/// The string value of `"key":"…"` in a line the relay wrote, without
+/// parsing it all. Inside a JSON string every `"` is escaped, so the
+/// pattern only matches a key.
+fn field<'a>(line: &'a [u8], key: &str) -> Option<&'a str> {
+    let pat = format!("\"{key}\":\"");
+    let at = line.windows(pat.len()).position(|w| w == pat.as_bytes())? + pat.len();
+    let end = line[at..].iter().position(|b| *b == b'"')? + at;
+    std::str::from_utf8(&line[at..end]).ok()
 }
 
 /// Reads the audit files of a [`Audit::snapshot`], newest first, for the
 /// events `q` asks for.
 pub(crate) fn query(files: Vec<(File, u64)>, q: &Query) -> io::Result<Page> {
+    let limit = q.limit.max(1);
     let mut events = Vec::new();
-    let matches = |v: &Value, key: &str, want: &Option<String>| match want {
+    let mut scanned = 0u64;
+    let matches = |v: &Map<String, Value>, key: &str, want: &Option<String>| match want {
         None => true,
         Some(w) => v.get(key).and_then(|x| x.as_str()) == Some(w.as_str()),
     };
-    'files: for (f, len) in files {
-        let mut lines = Lines::new(f, len);
-        while let Some(line) = lines.next_line()? {
-            let Ok(Value::Object(v)) = serde_json::from_slice::<Value>(&line) else {
-                continue;
-            };
-            let (Some(event), Some(time)) = (
-                v.get("event").and_then(|e| e.as_str()),
-                v.get("time").and_then(|t| t.as_str()),
-            ) else {
+    let from = match &q.cursor {
+        None => None,
+        Some(c) => Some(
+            parse_cursor(c)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not a cursor"))?,
+        ),
+    };
+    // With a cursor, files newer than its file are passed over, and its
+    // file is read from the cursor back.
+    let mut found = from.is_none();
+    let mut last: Option<String> = None;
+    'files: for (mut f, len) in files {
+        let Some(id) = file_id(&mut f)? else {
+            continue;
+        };
+        let end = match &from {
+            Some((file, offset)) if !found => {
+                if *file != id {
+                    continue;
+                }
+                found = true;
+                (*offset).min(len)
+            }
+            _ => len,
+        };
+        let mut lines = Lines::new(f, end);
+        while let Some((at, line)) = lines.next_at()? {
+            if q.budget > 0 && scanned >= q.budget {
+                return Ok(Page {
+                    events,
+                    more: true,
+                    next: last,
+                });
+            }
+            scanned += line.len() as u64 + 1;
+            last = Some(cursor(&id, at));
+            let (Some(event), Some(time)) = (field(&line, "event"), field(&line, "time")) else {
                 continue;
             };
             let Some(t) = parse_rfc3339(time) else {
                 continue;
             };
-            if q.before.is_some_and(|b| t >= b) {
-                continue;
-            }
-            if q.since.is_some_and(|s| t < s) {
-                // Lines are in the order of their times: nothing older can
-                // be newer than this.
+            if q.since.is_some_and(|s| t.saturating_add(DISORDER_US) < s) {
                 break 'files;
+            }
+            if q.since.is_some_and(|s| t < s) || q.before.is_some_and(|b| t >= b) {
+                continue;
             }
             let Some((kind, fields)) = projection(event) else {
                 continue;
             };
-            let v = Value::Object(v.clone());
-            if !(q.kinds.is_empty() || q.kinds.contains(&kind))
-                || !matches(&v, "machine", &q.machine)
-                || !matches(&v, "caller", &q.caller)
+            if !(q.kinds.is_empty() || q.kinds.contains(&kind)) {
+                continue;
+            }
+            let Ok(Value::Object(v)) = serde_json::from_slice::<Value>(&line) else {
+                continue;
+            };
+            let caller_ok = matches(&v, "caller", &q.caller)
+                || (kind == Kind::Stops
+                    && matches(&v, "by", &q.caller)
+                    && v.get("by_kind").and_then(|k| k.as_str()) == Some("operator"));
+            if !matches(&v, "machine", &q.machine)
+                || !caller_ok
                 || !matches(&v, "on_behalf_of", &q.on_behalf_of)
             {
                 continue;
-            }
-            if events.len() == q.limit {
-                let next_before = events
-                    .last()
-                    .and_then(|e: &Value| e.get("time"))
-                    .and_then(|t| t.as_str())
-                    .map(str::to_string);
-                return Ok(Page {
-                    events,
-                    more: true,
-                    next_before,
-                });
             }
             let mut out = Map::new();
             out.insert("event".into(), json_str(event));
@@ -454,12 +605,19 @@ pub(crate) fn query(files: Vec<(File, u64)>, q: &Query) -> io::Result<Page> {
                 }
             }
             events.push(Value::Object(out));
+            if events.len() == limit {
+                return Ok(Page {
+                    events,
+                    more: true,
+                    next: last,
+                });
+            }
         }
     }
     Ok(Page {
         events,
         more: false,
-        next_before: None,
+        next: None,
     })
 }
 
@@ -652,10 +810,68 @@ mod tests {
         }
         want.reverse();
         assert_eq!(got, want);
+        // Each line's offset is where it starts.
+        let bytes = std::fs::read(&p).unwrap();
+        let mut r = Lines::new(File::open(&p).unwrap(), len);
+        while let Some((at, l)) = r.next_at().unwrap() {
+            assert_eq!(&bytes[at as usize..at as usize + l.len()], &l[..]);
+            assert!(at == 0 || bytes[at as usize - 1] == b'\n');
+        }
         // Only the first `len` bytes count.
         let mut r = Lines::new(File::open(&p).unwrap(), 7);
         assert_eq!(r.next_line().unwrap().as_deref(), Some(&b"line 0 "[..]));
         assert_eq!(r.next_line().unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Lines from before times were unique: the same millisecond several
+    /// times, and out of order.
+    #[test]
+    fn old_lines_are_paged_without_loss() {
+        let dir = scratch("legacy");
+        std::fs::create_dir_all(&dir).unwrap();
+        let times = [".001", ".002", ".002", ".002", ".004", ".003", ".005"];
+        let mut text = String::new();
+        for (i, t) in times.iter().enumerate() {
+            text.push_str(&format!(
+                "{{\"caller\":\"c\",\"event\":\"session_open\",\"machine\":\"m\",\"remote\":\"1.2.3.4:5\",\"session\":{i},\"time\":\"2026-11-18T10:00:00{t}Z\"}}\n"
+            ));
+        }
+        std::fs::write(dir.join("audit.jsonl"), text).unwrap();
+        let a = Audit::open(&dir, 1 << 20).unwrap();
+        let mut q = Query {
+            limit: 2,
+            ..Query::default()
+        };
+        let mut seen = Vec::new();
+        loop {
+            let p = query(a.snapshot(), &q).unwrap();
+            seen.extend(p.events.iter().map(|e| e["session"].as_u64().unwrap()));
+            if !p.more {
+                break;
+            }
+            q.cursor = p.next;
+        }
+        assert_eq!(seen, [6, 5, 4, 3, 2, 1, 0]);
+        let p = query(
+            a.snapshot(),
+            &Query {
+                since: parse_rfc3339("2026-11-18T10:00:00.004Z"),
+                limit: 100,
+                ..Query::default()
+            },
+        )
+        .unwrap();
+        let got: Vec<u64> = p
+            .events
+            .iter()
+            .map(|e| e["session"].as_u64().unwrap())
+            .collect();
+        assert_eq!(got, [6, 4]);
+        // A limit of 0 is taken as 1, so a caller looping on `more` ends.
+        let p = query(a.snapshot(), &Query::default()).unwrap();
+        assert_eq!(p.events.len(), 1);
+        assert!(p.next.is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -706,7 +922,7 @@ mod tests {
         );
         // The projection leaves addresses out, and refusals.
         assert!(all.events.iter().all(|e| e.get("remote").is_none()));
-        // Paging by next_before gives every match exactly once.
+        // Paging by the cursor gives every match exactly once.
         let mut q = Query {
             machine: Some("m-a".into()),
             kinds: vec![Kind::Sessions],
@@ -721,7 +937,7 @@ mod tests {
             if !p.more {
                 break;
             }
-            q.before = parse_rfc3339(p.next_before.as_deref().unwrap());
+            q.cursor = p.next;
         }
         let want: Vec<u64> = (0..300).rev().filter(|i| i % 3 == 0).collect();
         assert_eq!(seen, want);
@@ -737,6 +953,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.events.len(), 11);
+        // A small budget ends pages early; the cursor goes on from there,
+        // and nothing is lost or repeated.
+        let mut q = Query {
+            kinds: vec![Kind::Sessions],
+            limit: 1000,
+            budget: 3000,
+            ..Query::default()
+        };
+        let mut seen = Vec::new();
+        let mut pages = 0;
+        loop {
+            let p = query(a.snapshot(), &q).unwrap();
+            pages += 1;
+            seen.extend(p.events.iter().map(|e| e["session"].as_u64().unwrap()));
+            if !p.more {
+                break;
+            }
+            q.cursor = p.next;
+        }
+        assert!(pages > 10, "{pages}");
+        assert_eq!(seen, (0..300).rev().collect::<Vec<u64>>());
+        // A cursor the relay never gave is refused.
+        for bad in [
+            "",
+            "x",
+            "0123456789abcdef01234567",
+            "0123456789abcdef0123456g-1",
+            "0123456789abcdef01234567-x",
+        ] {
+            let q = Query {
+                cursor: Some(bad.into()),
+                limit: 1,
+                ..Query::default()
+            };
+            assert!(query(a.snapshot(), &q).is_err(), "{bad}");
+        }
         // Times keep rising after a restart.
         drop(a);
         let b = Audit::open(&dir, 16 << 10).unwrap();

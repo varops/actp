@@ -1034,8 +1034,8 @@ fn who(relay: &Relay, peer: &Peer, req: &Request<Incoming>, path: &str) -> Resul
     }
     // The certificate is checked as for a tunnel: valid now, not blocked.
     let caller = caller_of(relay, peer)?;
-    let may = relay.config().operator(&caller).to_vec();
-    if may.is_empty() {
+    let cfg = relay.config();
+    let Some(entry) = cfg.operator_entry(&caller) else {
         return Err(operator_refused(
             relay,
             peer,
@@ -1044,11 +1044,28 @@ fn who(relay: &Relay, peer: &Peer, req: &Request<Incoming>, path: &str) -> Resul
             "not_an_operator",
             "this caller has no role at the relay",
         ));
+    };
+    let certificate = crate::fingerprint(&peer.chain[0]);
+    // Pinned to certificates: the name alone is not enough.
+    if !entry.certificates.is_empty()
+        && !entry
+            .certificates
+            .iter()
+            .any(|c| c.strip_prefix("sha256:") == Some(certificate.as_str()))
+    {
+        return Err(operator_refused(
+            relay,
+            peer,
+            path,
+            &caller,
+            "operator_certificate_not_listed",
+            "this certificate is not one the relay takes for this operator",
+        ));
     }
     Ok(Who::Operator {
         caller,
-        certificate: crate::fingerprint(&peer.chain[0]),
-        may,
+        certificate,
+        may: entry.may.clone(),
     })
 }
 
@@ -1225,7 +1242,11 @@ fn machines(relay: &Relay, req: &Request<Incoming>) -> Resp {
     )
 }
 
-/// `GET /relay/v1/audit?kind=…&machine=…&caller=…&on_behalf_of=…&since=…&before=…&limit=…`.
+/// Bytes of the audit log one page reads at most, so no single request
+/// reads every file; a page that reaches it ends early with a cursor.
+const AUDIT_PAGE_BUDGET: u64 = 64 << 20;
+
+/// `GET /relay/v1/audit?kind=…&machine=…&caller=…&on_behalf_of=…&since=…&before=…&cursor=…&limit=…`.
 async fn audit(relay: &Relay, req: &Request<Incoming>) -> Resp {
     let pairs = match query_pairs(req) {
         Ok(p) => p,
@@ -1234,6 +1255,7 @@ async fn audit(relay: &Relay, req: &Request<Incoming>) -> Resp {
     let bad = |m: &str| error(StatusCode::BAD_REQUEST, "bad_query", m);
     let mut q = crate::audit::Query {
         limit: 100,
+        budget: AUDIT_PAGE_BUDGET,
         ..Default::default()
     };
     let mut seen = std::collections::HashSet::new();
@@ -1247,7 +1269,7 @@ async fn audit(relay: &Relay, req: &Request<Incoming>) -> Resp {
                     match crate::audit::Kind::parse(part) {
                         Some(kind) if !q.kinds.contains(&kind) => q.kinds.push(kind),
                         Some(_) => {}
-                        None => return bad("kind is sessions, stops or machines"),
+                        None => return bad("kind is sessions, stops, machines or config"),
                     }
                 }
             }
@@ -1259,6 +1281,10 @@ async fn audit(relay: &Relay, req: &Request<Incoming>) -> Resp {
                 Some(t) => q.before = Some(t),
                 None => return bad(&format!("{k} is an RFC 3339 time in UTC")),
             },
+            "cursor" => match crate::audit::parse_cursor(&v) {
+                Some(_) => q.cursor = Some(v),
+                None => return bad("cursor is a page's next, as given"),
+            },
             "limit" => match v.parse::<usize>() {
                 Ok(n) if (1..=1000).contains(&n) => q.limit = n,
                 _ => return bad("limit is 1 to 1000"),
@@ -1268,7 +1294,7 @@ async fn audit(relay: &Relay, req: &Request<Incoming>) -> Resp {
             }
             _ => {
                 return bad(
-                    "the query takes kind, machine, caller, on_behalf_of, since, before and limit",
+                    "the query takes kind, machine, caller, on_behalf_of, since, before, cursor and limit",
                 );
             }
         }
@@ -1294,7 +1320,7 @@ async fn audit(relay: &Relay, req: &Request<Incoming>) -> Resp {
         }
         Some(Ok(p)) => json_resp(
             StatusCode::OK,
-            json!({ "events": p.events, "more": p.more, "next_before": p.next_before }).to_string(),
+            json!({ "events": p.events, "more": p.more, "next": p.next }).to_string(),
         ),
     }
 }

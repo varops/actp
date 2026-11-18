@@ -81,6 +81,8 @@ pub enum AuditKind {
     Stops,
     /// Machines coming and going, and changes to their pinned keys.
     Machines,
+    /// Configuration reloads, with who holds a role at the relay.
+    Config,
 }
 
 impl AuditKind {
@@ -89,6 +91,7 @@ impl AuditKind {
             AuditKind::Sessions => "sessions",
             AuditKind::Stops => "stops",
             AuditKind::Machines => "machines",
+            AuditKind::Config => "config",
         }
     }
 }
@@ -100,13 +103,16 @@ pub struct AuditQuery {
     pub kinds: Vec<AuditKind>,
     /// Only events naming exactly this machine, caller, or person (events
     /// without the field, such as the stop's for `machine`, are left out).
+    /// `caller` also matches the operator that pressed or released the stop.
     pub machine: Option<String>,
     pub caller: Option<String>,
     pub on_behalf_of: Option<String>,
     /// RFC 3339, at or after.
     pub since: Option<String>,
-    /// RFC 3339, before: the previous page's [`AuditPage::next_before`].
+    /// RFC 3339, before.
     pub before: Option<String>,
+    /// The previous page's [`AuditPage::next`], to go on from it.
+    pub cursor: Option<String>,
     /// 1 to 1000; the relay's default is 100.
     pub limit: Option<usize>,
 }
@@ -126,9 +132,11 @@ pub struct AuditEvent {
 #[serde(default)]
 pub struct AuditPage {
     pub events: Vec<AuditEvent>,
-    /// Older events match too: ask again with `before` = `next_before`.
+    /// There may be more: ask again with `cursor` = `next`. A page can end
+    /// early, even empty, when the relay has read as much as it reads for
+    /// one page; go on until `more` is false.
     pub more: bool,
-    pub next_before: Option<String>,
+    pub next: Option<String>,
 }
 
 /// A client for the relay's management API.
@@ -243,6 +251,7 @@ impl RelayOps {
             ("on_behalf_of", &q.on_behalf_of),
             ("since", &q.since),
             ("before", &q.before),
+            ("cursor", &q.cursor),
             ("limit", &limit),
         ] {
             if let Some(v) = v {

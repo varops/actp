@@ -399,6 +399,13 @@ impl Relay {
         warn_renewal_window(&cfg);
         let blocked = cfg.blocked_machines.len();
         let blocked_callers = cfg.blocked_callers.len();
+        // Who holds a role at the relay, so the audit shows when someone
+        // gained the right to stop the org.
+        let operators: Vec<Value> = cfg
+            .operators
+            .iter()
+            .map(|o| json!({"caller": o.caller, "may": o.may.iter().map(|p| p.as_str()).collect::<Vec<_>>(), "certificates": o.certificates.len()}))
+            .collect();
         self.inner
             .callers
             .set_rate(cfg.caller_rate.per_second, cfg.caller_rate.burst);
@@ -429,6 +436,7 @@ impl Relay {
             [
                 ("blocked_machines", json!(blocked)),
                 ("blocked_callers", json!(blocked_callers)),
+                ("operators", json!(operators)),
             ],
         );
         tracing::info!("configuration reloaded");
@@ -926,6 +934,36 @@ impl Relay {
                 .values()
                 .filter_map(|m| m.conn.as_ref().map(|c| (c.tx.clone(), c.cut.clone())))
                 .collect();
+            // Recorded while the state is held, so the audit has stops and
+            // releases in the order they happened (an append, no sync).
+            let [a, b, c, d] = who.fields();
+            if fresh {
+                self.inner.audit.kept(
+                    "org_stop",
+                    [
+                        a,
+                        b,
+                        c,
+                        d,
+                        ("reason", json!(reason)),
+                        ("sessions_dropped", json!(sessions.len())),
+                    ],
+                );
+            } else {
+                // Pressed again while on: the first record stays, and this
+                // press is recorded too.
+                self.inner.audit.kept(
+                    "org_stop_repeated",
+                    [
+                        a,
+                        b,
+                        c,
+                        d,
+                        ("reason", json!(reason)),
+                        ("sessions_dropped", json!(sessions.len())),
+                    ],
+                );
+            }
             (st.stop.clone(), sessions, conns, fresh)
         };
         for s in &sessions {
@@ -939,18 +977,6 @@ impl Relay {
             }
         }
         if fresh {
-            let [a, b, c, d] = who.fields();
-            self.inner.audit.kept(
-                "org_stop",
-                [
-                    a,
-                    b,
-                    c,
-                    d,
-                    ("reason", json!(reason)),
-                    ("sessions_dropped", json!(sessions.len())),
-                ],
-            );
             tracing::warn!(by = who.name, on_behalf_of = ?who.on_behalf_of, reason, "org-wide stop pressed");
         }
         let saved = {
@@ -1007,6 +1033,10 @@ impl Relay {
             self.inner.stop_unsaved.store(false, Ordering::SeqCst);
             let mut st = self.st();
             st.stop = next.clone();
+            let [a, b, c, d] = who.fields();
+            self.inner
+                .audit
+                .kept("org_release", [a, b, c, d, ("reason", json!(reason))]);
             st.machines
                 .values()
                 .filter_map(|m| m.conn.as_ref().map(|c| (c.tx.clone(), c.cut.clone())))
@@ -1017,10 +1047,6 @@ impl Relay {
                 cut.cut("could not deliver the release");
             }
         }
-        let [a, b, c, d] = who.fields();
-        self.inner
-            .audit
-            .kept("org_release", [a, b, c, d, ("reason", json!(reason))]);
         tracing::warn!(by = who.name, on_behalf_of = ?who.on_behalf_of, reason, "org-wide stop released");
         Ok(next)
     }
