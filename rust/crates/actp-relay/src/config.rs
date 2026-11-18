@@ -48,6 +48,12 @@ pub struct Config {
     /// has a name, recorded with every stop and release, and a SHA-256 hash.
     #[serde(default)]
     pub admin_tokens: Vec<AdminToken>,
+    /// Callers with a role at the relay itself, by the name in their caller
+    /// certificate: who may see who is online, read the audit, and press or
+    /// release the org-wide stop. None by default: a caller certificate
+    /// opens tunnels and nothing else.
+    #[serde(default)]
+    pub operators: Vec<Operator>,
     /// Callers served at once per machine, waiting ones included.
     #[serde(default = "default_max_streams")]
     pub max_streams_per_machine: usize,
@@ -201,7 +207,63 @@ pub struct AdminToken {
     pub hash: String,
 }
 
+/// A caller with a role at the relay ([`Config::operators`]).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Operator {
+    /// The caller's name, as `caller_name` reads it from its certificate.
+    pub caller: String,
+    /// What it may do; at least one.
+    pub may: Vec<Permission>,
+    /// When set, only these certificates (SHA-256 of the DER, as
+    /// `sha256:<hex>`) count as this operator: another certificate with the
+    /// same name, from any root in `caller_ca`, does not. Empty: any valid
+    /// caller certificate with the name.
+    #[serde(default)]
+    pub certificates: Vec<String>,
+}
+
+/// What an operator may do at the relay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Permission {
+    /// `GET /relay/v1/machines`: who is online, and when each was last seen.
+    Machines,
+    /// `GET /relay/v1/audit`: the relay's half of the audit.
+    Audit,
+    /// `POST /relay/v1/stop`: press the org-wide stop.
+    Stop,
+    /// `POST /relay/v1/release`: release it.
+    Release,
+}
+
+impl Permission {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Permission::Machines => "machines",
+            Permission::Audit => "audit",
+            Permission::Stop => "stop",
+            Permission::Release => "release",
+        }
+    }
+}
+
 impl Config {
+    /// The operator entry for the caller named `caller`.
+    pub fn operator_entry(&self, caller: &str) -> Option<&Operator> {
+        self.operators.iter().find(|o| o.caller == caller)
+    }
+
+    /// What the caller named `caller` may do at the relay; empty when it is
+    /// not an operator.
+    pub fn operator(&self, caller: &str) -> &[Permission] {
+        self.operators
+            .iter()
+            .find(|o| o.caller == caller)
+            .map(|o| o.may.as_slice())
+            .unwrap_or(&[])
+    }
+
     pub fn audit_max_bytes(&self) -> u64 {
         self.audit_max_mb.saturating_mul(1 << 20)
     }
@@ -219,6 +281,11 @@ impl Config {
         // uppercase. Both mean the same token.
         for t in &mut cfg.admin_tokens {
             t.hash = t.hash.to_ascii_lowercase();
+        }
+        for o in &mut cfg.operators {
+            for c in &mut o.certificates {
+                *c = c.to_ascii_lowercase();
+            }
         }
         cfg.validate()?;
         Ok(cfg)
@@ -288,6 +355,31 @@ impl Config {
             }
             if i.timeout_seconds == 0 || i.timeout_seconds > 30 {
                 errs.push("issuer.timeout_seconds must be 1 to 30".into());
+            }
+        }
+        let mut ops = std::collections::HashSet::new();
+        for o in &self.operators {
+            if !actp_proto::relay::valid_machine_name(&o.caller) {
+                errs.push(format!(
+                    "operator {:?} is not a valid caller name",
+                    o.caller
+                ));
+            } else if !ops.insert(&o.caller) {
+                errs.push(format!("operator {:?} is listed twice", o.caller));
+            }
+            for c in &o.certificates {
+                if !valid_hash(c) {
+                    errs.push(format!(
+                        "operator {:?}: certificates are sha256:<64 lowercase hex digits>",
+                        o.caller
+                    ));
+                }
+            }
+            if o.may.is_empty() {
+                errs.push(format!(
+                    "operator {:?}: may must name at least one of machines, audit, stop, release",
+                    o.caller
+                ));
             }
         }
         for c in &self.blocked_callers {
@@ -379,5 +471,35 @@ mod tests {
             .is_err()
         );
         assert!(Config::parse(&format!("{BASE}blocked_machines: [\"a/b\"]\n")).is_err());
+    }
+
+    #[test]
+    fn operators() {
+        let c = Config::parse(&format!(
+            "{BASE}operators:\n  - caller: it-bridge\n    may: [machines, audit, stop, release]\n  - caller: manager\n    may: [machines]\n"
+        ))
+        .unwrap();
+        assert_eq!(c.operator("it-bridge").len(), 4);
+        assert_eq!(c.operator("manager"), &[Permission::Machines]);
+        // Not listed: nothing. Names are compared exactly.
+        assert!(c.operator("IT-bridge").is_empty());
+        assert!(c.operator("").is_empty());
+        assert!(
+            Config::parse(BASE)
+                .unwrap()
+                .operator("it-bridge")
+                .is_empty()
+        );
+        for bad in [
+            "operators:\n  - caller: a\n    may: []\n",
+            "operators:\n  - caller: a\n",
+            "operators:\n  - caller: a\n    may: [everything]\n",
+            "operators:\n  - caller: a/b\n    may: [audit]\n",
+            "operators:\n  - caller: a\n    may: [audit]\n  - caller: a\n    may: [stop]\n",
+            "operators:\n  - caller: a\n    may: [audit]\n    role: admin\n",
+            "operators:\n  - caller: a\n    may: [audit]\n    certificates: [abc]\n",
+        ] {
+            assert!(Config::parse(&format!("{BASE}{bad}")).is_err(), "{bad}");
+        }
     }
 }

@@ -106,7 +106,11 @@ impl Pki {
         std::fs::write(dir.join("relay-ca.pem"), rpem).unwrap();
         let relay_ca = Issuer::new(rp, rk);
         let key = KeyPair::generate().unwrap();
-        let mut p = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        // 127.0.0.1 too, and tests dial it: on Windows, `localhost` is
+        // tried as `::1` first, where nothing listens, and every connection
+        // then costs about two seconds.
+        let mut p =
+            CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()]).unwrap();
         p.distinguished_name.push(DnType::CommonName, "relay");
         p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         let cert = p.signed_by(&key, &relay_ca).unwrap();
@@ -446,7 +450,7 @@ pub async fn start_laptop_full(
     let root = scratch(name);
     std::fs::create_dir_all(root.join("site")).unwrap();
     let yaml = format!(
-        "server:\n  name: {name}\n  idle_close: 5s\n  log_dir: {}\n  state_dir: {}\n  tokens_file: {}\n  relay:\n    url: wss://localhost:{relay_port}\n    cert: {}\n    key: {}\n    ca: {}\n  workspaces:\n    - name: site\n      path: {}\n  agents:\n    - id: test\n      command: {}\n      env:\n        ACTP_TESTAGENT_STORE: {}\n{auth}",
+        "server:\n  name: {name}\n  idle_close: 5s\n  log_dir: {}\n  state_dir: {}\n  tokens_file: {}\n  relay:\n    url: wss://127.0.0.1:{relay_port}\n    cert: {}\n    key: {}\n    ca: {}\n  workspaces:\n    - name: site\n      path: {}\n  agents:\n    - id: test\n      command: {}\n      env:\n        ACTP_TESTAGENT_STORE: {}\n{auth}",
         yaml_path(&root.join("logs")),
         yaml_path(&root.join("state")),
         yaml_path(&root.join("tokens.yaml")),
@@ -580,7 +584,7 @@ pub async fn open_tunnel(
     machine: &str,
 ) -> Result<TunnelTls, Refused> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-    let mut req = format!("wss://localhost:{port}/relay/v1/tunnel/{machine}")
+    let mut req = format!("wss://127.0.0.1:{port}/relay/v1/tunnel/{machine}")
         .into_client_request()
         .unwrap();
     req.headers_mut().insert(
@@ -731,7 +735,7 @@ impl Caller {
     ) -> Caller {
         let mut o = actp_client::Options {
             agent: "test".into(),
-            base_url: format!("https://localhost:{port}"),
+            base_url: format!("https://127.0.0.1:{port}"),
             token: TOKEN.into(),
             client_name: "relay-test".into(),
             max_backoff: Duration::from_millis(100),

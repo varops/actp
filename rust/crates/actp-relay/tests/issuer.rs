@@ -476,7 +476,7 @@ async fn an_https_issuer_is_checked_against_its_roots() {
     });
     let yaml = |ca: &std::path::Path| {
         format!(
-            "issuer:\n  url: https://localhost:{port}\n  ca: {}\n  paths: [/v1/generation/signed]\n",
+            "issuer:\n  url: https://127.0.0.1:{port}\n  ca: {}\n  paths: [/v1/generation/signed]\n",
             yaml_path(ca)
         )
     };

@@ -12,9 +12,19 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stop {
     pub stopped: bool,
-    /// The admin token name that pressed or released it last.
+    /// Who pressed or released it last: an admin token's name, or an
+    /// operator's caller name ([`Stop::by_kind`]).
     #[serde(default)]
     pub by: String,
+    /// `admin`, `operator`, or `relay` (the relay itself, when `stop.json`
+    /// could not be read). Records written before operators existed have
+    /// none, and were an admin's.
+    #[serde(default)]
+    pub by_kind: String,
+    /// The person an operator pressed or released it for, as the operator
+    /// said (`X-Actp-On-Behalf-Of`).
+    #[serde(default)]
+    pub on_behalf_of: Option<String>,
     #[serde(default)]
     pub reason: String,
     /// RFC 3339.
@@ -117,10 +127,18 @@ impl Store {
                 tracing::error!(error = %e, "cannot read stop.json: starting with the org-wide stop on");
                 damaged()
             }
-            Ok(b) => serde_json::from_slice(&b).unwrap_or_else(|e| {
-                tracing::error!(error = %e, "stop.json is damaged: starting with the org-wide stop on");
-                damaged()
-            }),
+            Ok(b) => match serde_json::from_slice::<Stop>(&b) {
+                Ok(mut s) => {
+                    if s.by_kind.is_empty() && !s.by.is_empty() {
+                        s.by_kind = "admin".into();
+                    }
+                    s
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "stop.json is damaged: starting with the org-wide stop on");
+                    damaged()
+                }
+            },
         }
     }
 
@@ -164,6 +182,8 @@ fn damaged() -> Stop {
     Stop {
         stopped: true,
         by: "relay".into(),
+        by_kind: "relay".into(),
+        on_behalf_of: None,
         reason: "stop.json could not be read".into(),
         at: crate::audit::rfc3339(std::time::SystemTime::now()),
     }
@@ -181,12 +201,23 @@ mod tests {
         assert!(!st.load_stop().stopped);
         let s = Stop {
             stopped: true,
-            by: "dave".into(),
+            by: "it-bridge".into(),
+            by_kind: "operator".into(),
+            on_behalf_of: Some("dana@example.com".into()),
             reason: "incident".into(),
             at: "x".into(),
         };
         st.save_stop(&s).unwrap();
         assert_eq!(st.load_stop(), s);
+        // A record from before operators was an admin's.
+        std::fs::write(
+            dir.join("stop.json"),
+            br#"{"stopped": true, "by": "dave", "reason": "r", "at": "x"}"#,
+        )
+        .unwrap();
+        let old = st.load_stop();
+        assert_eq!((old.by.as_str(), old.by_kind.as_str()), ("dave", "admin"));
+        assert_eq!(old.on_behalf_of, None);
         std::fs::write(dir.join("stop.json"), b"{not json").unwrap();
         assert!(st.load_stop().stopped);
         let _ = std::fs::remove_dir_all(&dir);
