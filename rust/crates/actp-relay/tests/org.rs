@@ -345,12 +345,6 @@ async fn a_machine_configured_for_another_name_takes_no_papers() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_session_resumes_with_fresh_papers_after_a_drop() {
-    // DIAGNOSTIC (to be reverted): logs for the Windows failure.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("actp_relay=debug,actp_server=debug,actp_client=debug")
-        .with_writer(std::io::stderr)
-        .try_init();
-    eprintln!("DIAG start {:?}", std::time::Instant::now());
     let dir = scratch("org-resume");
     let pki = Pki::new(&dir);
     let env = start_relay(&pki, &dir).await;
@@ -408,4 +402,69 @@ async fn a_session_resumes_with_fresh_papers_after_a_drop() {
         && e["relay_report"] == "given"
         && e["relay_caller"] == CALLER));
     assert_eq!(a.srv.links().len(), 1, "the same link, resumed");
+}
+
+// DIAGNOSTIC (to be reverted): the resume scenario eight times, with timings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn zz_diag_resume_loop() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("actp_client=info,actp_server=info,actp_relay=info")
+        .with_writer(std::io::stderr)
+        .try_init();
+    let mut fails = 0;
+    for i in 0..8 {
+        let t = std::time::Instant::now();
+        eprintln!("DIAG iteration {i} start");
+        let r = tokio::spawn(async move { diag_once(i).await }).await;
+        eprintln!(
+            "DIAG iteration {i}: {} in {:?}",
+            if r.is_ok() { "ok" } else { "FAILED" },
+            t.elapsed()
+        );
+        if r.is_err() {
+            fails += 1;
+        }
+    }
+    eprintln!("DIAG failures: {fails}/8");
+    panic!("DIAG summary (always fails, to print its output): {fails}/8 failed");
+}
+
+async fn diag_once(i: u32) {
+    let dir = scratch(&format!("org-diag-{i}"));
+    let pki = Pki::new(&dir);
+    let env = start_relay(&pki, &dir).await;
+    let v = Arc::new(SharedSecret::new(b"org secret"));
+    let t = std::time::Instant::now();
+    let a = org_laptop(&pki, "laptop-a", env.port, &v).await;
+    eprintln!("DIAG {i} laptop connected after {:?}", t.elapsed());
+    let proxy = Proxy::start(env.port).await;
+    let issued = Arc::new(Mutex::new(0u32));
+    let (v2, i2) = (v.clone(), issued.clone());
+    let mut caller = Caller::start_with(&pki, proxy.port, "laptop-a", move |o| {
+        o.give_up_after = Duration::from_secs(10);
+        o.token_source = Some(Arc::new(move || {
+            let mut n = i2.lock().unwrap();
+            *n += 1;
+            eprintln!("DIAG papers #{n}");
+            let ttl = if *n == 1 { 5 } else { 60 };
+            let p = v2.issue(
+                "dave",
+                "laptop-a",
+                json!({ GRANT: true }),
+                Duration::from_secs(ttl),
+            );
+            Box::pin(async move { Ok(p) })
+        }));
+    });
+    let t = std::time::Instant::now();
+    let r = caller
+        .call(1, "initialize", json!({"protocolVersion": 1}))
+        .await;
+    eprintln!(
+        "DIAG {i} initialize answered after {:?}: {}",
+        t.elapsed(),
+        r.get("result").is_some()
+    );
+    drop(a);
+    drop(env);
 }
