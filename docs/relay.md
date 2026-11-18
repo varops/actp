@@ -21,6 +21,7 @@ Everything between a caller and a machine is encrypted end to end. The caller op
 - **It knows who is online,** and when each machine was last seen.
 - **It holds the org-wide stop.** One switch drops every session on every machine and refuses new ones until it is released. Machines are told, and end their sessions themselves too.
 - **It writes its half of the audit:** which caller (by its certificate) connected to which machine, when and for how long, whom the caller said it acted for, and every stop and release, with who and why. Ids, addresses, names, times and byte counts only: what a session carries is encrypted, and the relay never has it.
+- **It answers only admins and operators** about any of this. An operator is a caller certificate the configuration gives a role (`operators`), such as the IT app's; every other caller certificate opens tunnels and nothing more (under Management and operators, below).
 
 ### What a compromised relay can do
 
@@ -96,6 +97,11 @@ audit_max_mb: 100                         # audit.jsonl is rotated at this size;
 admin_tokens:
   - name: dave                            # recorded with every stop and release
     hash: sha256:…                        # from `actp-relay token create`
+operators:                                # callers with a role at the relay; none by default
+  - caller: it-bridge                     # the caller's name, as caller_name reads it
+    may: [machines, audit, stop, release]
+  - caller: manager
+    may: [machines]
 ```
 
 ```bash
@@ -106,7 +112,7 @@ The relay must terminate TLS itself: a TLS proxy in front of it would hide the d
 
 A caller's name follows the same rules as a machine address (below); a caller certificate whose name does not is refused. `blocked_machines` and `blocked_callers` are compared exactly, case included.
 
-`SIGHUP` reloads the blocked machines and callers, the `issuer` section, the admin tokens, the rate limits, `max_connections_per_ip`, `max_connections_per_machine`, `machine_key_renewal_days`, `tunnel_idle_seconds` (for new tunnels), the device and caller roots and the revocation lists. The listen address, the folders, `audit_max_mb` and `max_connections` need a restart.
+`SIGHUP` reloads the blocked machines and callers, the `issuer` section, the admin tokens, the operators, the rate limits, `max_connections_per_ip`, `max_connections_per_machine`, `machine_key_renewal_days`, `tunnel_idle_seconds` (for new tunnels), the device and caller roots and the revocation lists. The listen address, the folders, `audit_max_mb` and `max_connections` need a restart.
 
 The connection limits count every connection from the moment it is accepted, before the TLS handshake (which may take 5 s), and for as long as it lives, sessions included. A connection that proves itself a machine, with a valid device certificate whose key is the one its name is pinned to (below), stops counting, so callers filling the limits do not keep laptops from reconnecting once their handshake is through. It counts against `max_connections_per_machine` instead until it becomes the machine's control connection or a stream, so one machine cannot hold thousands of idle connections. A certificate for the name with another key counts as anyone's, so it cannot fill the machine's places. A refused connection is closed at once and recorded as `connection_refused` (throttled), with the machine when it was the machine's limit.
 
@@ -224,9 +230,34 @@ The relay sees the questions and the answers, so only forward questions whose an
 
 A reload replaces the section and reads `file:` secrets again, so a secret can be rotated without a restart (`env:` values cannot change without one). The rate limits and in-flight counts carry over. A section that cannot be used (a missing file, an unset variable) leaves the old one in force, logs an error and records `issuer_reload_refused`.
 
-### Management
+### Management and operators
 
-All three need an admin token (`Authorization: Bearer …`), as does re-pinning (under Key pinning, above).
+Who is online, the audit, and the org-wide stop are answered only to:
+
+- **an admin**, with an admin token (`Authorization: Bearer …`), from anywhere that can reach the relay;
+- **an operator**: a caller whose certificate is valid now, not blocked, and named in `operators` with the permission the route needs. The IT app is the usual operator; a dashboard that only shows who is online gets `machines` alone.
+
+| Route | Admin | Operator needs |
+| --- | --- | --- |
+| `GET /relay/v1/machines` | yes | `machines` |
+| `GET /relay/v1/audit` | yes | `audit` |
+| `GET /relay/v1/stop` | yes | any permission |
+| `POST /relay/v1/stop` | yes | `stop` |
+| `POST /relay/v1/release` | yes | `release` |
+| `POST /relay/v1/repin` | yes | never: admins only |
+
+A request with an `Authorization` header is an admin's, judged by the token alone: a wrong token is refused even on an operator's certificate. Without one, the caller certificate decides. Everyone else is refused and gets nothing but the error:
+
+| Answer | Meaning |
+| --- | --- |
+| `401 unauthorized` | No certificate and no token, or a wrong token. Recorded as `admin_refused`. |
+| `403 bad_caller_certificate`, `403 caller_blocked` | A device certificate (a machine), or a caller certificate that is no longer valid or is blocked. Recorded as `caller_refused`. |
+| `403 not_an_operator` | A valid caller certificate the configuration gives no role: it may open tunnels, and nothing here. Recorded as `operator_refused`. |
+| `403 operator_not_permitted` | An operator without the permission this route needs. Recorded as `operator_refused`. |
+
+The operator role is org-wide: an operator sees every machine the relay knows and the whole audit. Which machines a person may operate is the IT app's to check (with the identity service) before it shows them, and the machine's to enforce (org mode); the relay knows programs by their certificates, not people.
+
+#### Who is online
 
 ```bash
 curl -H "Authorization: Bearer $ADMIN" https://relay.example.com/relay/v1/machines
@@ -234,7 +265,7 @@ curl -H "Authorization: Bearer $ADMIN" https://relay.example.com/relay/v1/machin
 
 ```json
 {
-  "stop": {"stopped": false, "by": "", "reason": "", "at": ""},
+  "stop": {"stopped": false, "by": "", "by_kind": "", "on_behalf_of": null, "reason": "", "at": ""},
   "machines": [
     {"machine": "C02XK1ABJG5H", "online": true, "connected_since": "2026-11-16T09:12:03.120Z",
      "first_seen": "2026-11-02T08:00:41.000Z", "last_seen": "2026-11-16T10:40:00.512Z", "sessions": 1,
@@ -243,21 +274,85 @@ curl -H "Authorization: Bearer $ADMIN" https://relay.example.com/relay/v1/machin
 }
 ```
 
+Every machine the relay has seen is listed. `last_seen` is now while a machine is online; once it goes, it is when the relay last heard from it (it is saved to `machines.json` about once a minute, so after a restart it can be up to a minute early). `sessions` counts the callers connected to it now.
+
+`?machine=<address>` (repeatable, up to 1000) lists only those machines, and `?online=true` or `?online=false` only those online or offline. Percent-encode values (`+` is a plus, not a space). Any other parameter, or a malformed one, is `400 bad_query`, never ignored.
+
+#### The audit
+
+```bash
+curl --cert it-bridge.pem --key it-bridge.key "https://relay.example.com/relay/v1/audit?kind=sessions&machine=C02XK1ABJG5H&limit=50"
+```
+
+```json
+{
+  "events": [
+    {"event": "session_closed", "time": "2026-11-18T10:41:07.512331Z", "session": 42, "machine": "C02XK1ABJG5H",
+     "caller": "it-bridge", "on_behalf_of": "dave@example.com", "opened_at": "2026-11-18T10:32:15.003Z",
+     "seconds": 532, "bytes_to_machine": 18320, "bytes_to_caller": 90211, "reason": "org_stop"},
+    {"event": "session_open", "time": "2026-11-18T10:32:15.004102Z", "session": 42, "machine": "C02XK1ABJG5H",
+     "caller": "it-bridge", "caller_certificate": "3b1f…", "on_behalf_of": "dave@example.com"}
+  ],
+  "more": false,
+  "next_before": null
+}
+```
+
+The relay's half of the audit, newest first, from `audit.jsonl` and its rotated files. Only these events, with only these fields (the file has more, such as remote addresses, refusals and errors, for the relay's admins):
+
+- `sessions`: `session_open` and `session_closed` (fields as in the table below, without `remote`): who connected to which machine, for whom, when and for how long, and how it ended.
+- `stops`: `org_stop`, `org_release` (who, as what, for whom, why), `org_stop_not_saved` and `org_stop_saved`.
+- `machines`: `machine_online` (without `remote`), `machine_offline`, `machine_replaced`, and every change to a pinned key: `machine_repinned` (an admin's override), `machine_key_continued`, `machine_key_renewed`, `machine_key_refused`.
+
+Parameters, each at most once (`kind` may repeat):
+
+| Parameter | Meaning |
+| --- | --- |
+| `kind` | `sessions`, `stops`, `machines`, or several (`kind=sessions,stops`). Default: all. |
+| `machine`, `caller`, `on_behalf_of` | Only events naming exactly this machine, caller or person. Events without the field are left out: `machine=…` shows that machine's sessions, and a stop's effect on it as `session_closed` with reason `org_stop`, not the stop itself. |
+| `since` | RFC 3339 in UTC (`Z`): events at or after it. |
+| `before` | RFC 3339 in UTC: events before it. |
+| `limit` | 1 to 1000; default 100. |
+
+Every line's `time` is in microseconds and later than the line before it, also across rotations and restarts, so it names one event. When `more` is true, ask again with `before` set to `next_before` for the next page: no event is shown twice or skipped. The audit keeps `audit_max_mb` times eleven at most, so the oldest events go first. A query reads the files back, newest first, until the page is full or it reaches `since`: give `since` for a narrow filter over a large log. Two queries run at once; a third gets `503 audit_busy` with `Retry-After`.
+
+What a caller did on a machine (which runbook, consent, the result) is inside the end-to-end encryption: the machine's own audit records it. The two halves meet on the session: the machine's `link_opened` carries `relay_caller`, `relay_caller_certificate` and `relay_on_behalf_of`, the same as the relay's `session_open`.
+
+#### The org-wide stop
+
 ```bash
 curl -X POST -H "Authorization: Bearer $ADMIN" -d '{"reason": "suspicious activity on the IT account"}' https://relay.example.com/relay/v1/stop
 ```
 
 ```bash
-curl -X POST -H "Authorization: Bearer $ADMIN" -d '{"reason": "account secured"}' https://relay.example.com/relay/v1/release
+curl -X POST --cert it-bridge.pem --key it-bridge.key -H "X-Actp-On-Behalf-Of: dana@example.com" \
+  -d '{"reason": "account secured"}' https://relay.example.com/relay/v1/release
 ```
 
-`GET /relay/v1/stop` shows the stop. A reason is required for both. The stop takes effect at once and is written to `state_dir/stop.json`, so it survives a restart; if that file cannot be read, the relay starts with the stop on. If the stop cannot be written, the answer is `500 stop_not_saved` (the stop still holds) and the relay keeps trying every few seconds. A release is written before it takes effect, so a release that cannot be recorded does not happen (`500 not_released`).
+`GET /relay/v1/stop` shows the stop. A reason (1 to 1000 bytes) is required for both. An operator must also say whom it acts for, with `X-Actp-On-Behalf-Of` (as on a tunnel request); without it the answer is `400 on_behalf_of_required`, since a caller certificate names a program, not a person. An admin may send it too. The stop records:
+
+```json
+{"stop": {"stopped": true, "by": "it-bridge", "by_kind": "operator", "on_behalf_of": "dana@example.com",
+          "reason": "suspicious activity on the IT account", "at": "2026-11-18T10:41:07.511Z"}}
+```
+
+`by` is the admin token's name or the operator's caller name, and `by_kind` says which (`admin`, `operator`, or `relay` when the relay turned the stop on itself because `stop.json` could not be read). Nobody checks `on_behalf_of`; the relay records it as the IT app said it, and the IT app is what vouches for the person. Pressing the stop while it is on keeps the first record. A release is recorded with its own `by`, `by_kind` and `on_behalf_of`.
+
+The stop takes effect at once: every session ends (`session_closed`, reason `org_stop`), every machine is told and ends its own links, and every new tunnel is refused with `503 org_stopped` until the release. It is written to `state_dir/stop.json`, so it survives a restart; if that file cannot be read, the relay starts with the stop on. If the stop cannot be written, the answer is `500 stop_not_saved` (the stop still holds) and the relay keeps trying every few seconds. A release is written before it takes effect, so a release that cannot be recorded does not happen (`500 not_released`).
 
 Keep `state_dir` with the relay: a relay that starts without its `stop.json` knows of no stop, and its hello releases the stop on every machine that connects.
 
+#### Re-pinning
+
+Admins only; see Key pinning, above.
+
+#### For programs
+
+`actp_client::ops::RelayOps` (Rust) calls all of this with a caller certificate or an admin token: `machines`, `audit`, `stop_state`, `stop` and `release`, with `on_behalf_of` for the person.
+
 ### Audit
 
-`log_dir/audit.jsonl`, one JSON object per line:
+`log_dir/audit.jsonl`, one JSON object per line, each with `event` and `time` (RFC 3339 in UTC, microseconds, later than the line before it). Session ids are unique only while the relay runs (they start again after a restart); `session_closed` carries `opened_at`, so it answers who, which machine, when and how long on its own:
 
 | Event | Fields |
 | --- | --- |
@@ -266,7 +361,7 @@ Keep `state_dir` with the relay: a relay that starts without its `stop.json` kno
 | `machine_offline` | `machine`, `seconds`, `reason` (`closed`, `silent`, `blocked`, `certificate_invalid`, `key_changed`, `key_renewed`, `repinned`, `relay stopping`, …) |
 | `machine_refused` | `remote`, `route`, `reason`, and `machine` when the certificate named one |
 | `session_open` | `session`, `machine`, `caller`, `caller_certificate` (SHA-256), `on_behalf_of` (when the caller named one), `remote` |
-| `session_closed` | `session`, `machine`, `caller`, `seconds`, `bytes_to_machine`, `bytes_to_caller`, `reason` (`closed`, `idle`, `org_stop`, `machine_offline`, `blocked`, `certificate_invalid`, `caller_blocked`, `caller_certificate_invalid`, `relay_stopping`, `error`, `upgrade_failed`) |
+| `session_closed` | `session`, `machine`, `caller`, `on_behalf_of` (when the caller named one), `opened_at`, `seconds`, `bytes_to_machine`, `bytes_to_caller`, `reason` (`closed`, `idle`, `org_stop`, `machine_offline`, `blocked`, `certificate_invalid`, `caller_blocked`, `caller_certificate_invalid`, `relay_stopping`, `error`, `upgrade_failed`) |
 | `connection_refused` | `remote` (the address, or the IPv6 /64, at its limit), and `machine` when it was the machine's limit |
 | `machine_key_continued` | `machine`, `old_key`, `new_key` (SHA-256 of the public keys): the pin moved with the old key's proof |
 | `machine_key_renewed` | `machine`, `old_key`, `new_key`: the pin moved by the renewal window |
@@ -277,14 +372,15 @@ Keep `state_dir` with the relay: a relay that starts without its `stop.json` kno
 | `issuer_asked` | `machine`, `path`, `status` |
 | `issuer_refused` | `machine`, `reason` |
 | `issuer_reload_refused` | `error` |
-| `org_stop` | `by`, `reason`, `sessions_dropped` |
+| `org_stop` | `by`, `by_kind` (`admin` or `operator`), `caller_certificate` (an operator's, SHA-256), `on_behalf_of` (when given), `reason`, `sessions_dropped` |
 | `org_stop_not_saved`, `org_stop_saved` | `error` / nothing |
-| `org_release` | `by`, `reason` |
+| `org_release` | `by`, `by_kind`, `caller_certificate`, `on_behalf_of`, `reason` |
 | `admin_refused` | `remote`, `route` |
+| `operator_refused` | `caller`, `remote`, `route`, `reason` (`not_an_operator`, `operator_not_permitted`) |
 | `config_reloaded` | `blocked_machines`, `blocked_callers` |
 | `refusals_not_logged` | `kind`, `count` |
 
-Of each refusal kind (`caller_refused`, `caller_rate_limited`, `connection_refused`, `machine_refused`, `admin_refused`, `issuer_refused`), at most 20 a minute are written, across all callers; the rest are counted in `refusals_not_logged`. A flood of refusals therefore leaves only a count of everyone's refusals for that minute; sessions, machines and the stop are always recorded. `machine_key_refused` has its own limit, once a minute per machine, so a second key for a name cannot be hidden in a flood of other refusals.
+Of each refusal kind (`caller_refused`, `caller_rate_limited`, `connection_refused`, `machine_refused`, `admin_refused`, `operator_refused`, `issuer_refused`), at most 20 a minute are written, across all callers; the rest are counted in `refusals_not_logged`. A flood of refusals therefore leaves only a count of everyone's refusals for that minute; sessions, machines and the stop are always recorded. `machine_key_refused` has its own limit, once a minute per machine, so a second key for a name cannot be hidden in a flood of other refusals.
 
 The stop's own events (`org_stop`, `org_release`, `org_stop_not_saved`, `org_stop_saved`) are also written to `log_dir/org_stops.jsonl`, which is never rotated, so no flood of other events can push them out.
 

@@ -14,6 +14,9 @@
 //!   released; machines are told, and end their sessions themselves too.
 //! - The relay's half of the audit: who connected to which machine, when and
 //!   for how long, and every stop and release with who and why.
+//! - Who may ask it: admin tokens, and operators, callers whose
+//!   certificates the configuration gives a role (`operators`). Any other
+//!   caller certificate opens tunnels and nothing else.
 
 pub mod audit;
 pub mod config;
@@ -122,6 +125,8 @@ struct Inner {
     /// When machines.json was last written on the timer.
     seen_written: Mutex<std::time::Instant>,
     callers: RateLimiter,
+    /// Audit queries running (each reads the audit files back).
+    audit_queries: Arc<tokio::sync::Semaphore>,
     /// The issuer pass-through, when configured.
     issuer: RwLock<Option<Arc<issuer::Issuer>>>,
     /// Its limits, kept across reloads.
@@ -191,6 +196,65 @@ pub struct MachineInfo {
     /// when that certificate expires, when known.
     pub key: Option<String>,
     pub key_until: Option<SystemTime>,
+}
+
+/// Who pressed or released the org-wide stop.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Actor {
+    /// The admin token's name, or the operator's caller name.
+    pub name: String,
+    pub kind: ActorKind,
+    /// The operator's caller certificate (SHA-256 fingerprint).
+    pub certificate: Option<String>,
+    /// The person the operator acts for, as it said.
+    pub on_behalf_of: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActorKind {
+    Admin,
+    Operator,
+}
+
+impl ActorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ActorKind::Admin => "admin",
+            ActorKind::Operator => "operator",
+        }
+    }
+}
+
+impl Actor {
+    /// An admin token, by its name.
+    pub fn admin(name: &str) -> Actor {
+        Actor {
+            name: name.to_string(),
+            kind: ActorKind::Admin,
+            certificate: None,
+            on_behalf_of: None,
+        }
+    }
+
+    fn fields(&self) -> [(&'static str, Value); 4] {
+        [
+            ("by", json!(self.name)),
+            ("by_kind", json!(self.kind.as_str())),
+            ("caller_certificate", json!(self.certificate)),
+            ("on_behalf_of", json!(self.on_behalf_of)),
+        ]
+    }
+
+    fn stop(&self, stopped: bool, reason: &str) -> Stop {
+        Stop {
+            stopped,
+            by: self.name.clone(),
+            by_kind: self.kind.as_str().to_string(),
+            on_behalf_of: self.on_behalf_of.clone(),
+            reason: reason.to_string(),
+            at: rfc3339(SystemTime::now()),
+        }
+    }
 }
 
 /// What pressing the stop did.
@@ -272,6 +336,7 @@ impl Relay {
                 writing: Mutex::new(()),
                 seen_written: Mutex::new(std::time::Instant::now()),
                 callers,
+                audit_queries: Arc::new(tokio::sync::Semaphore::new(2)),
                 issuer: RwLock::new(issuer),
                 issuer_limits,
                 refusals: Throttle::new(20, Duration::from_secs(60)),
@@ -817,6 +882,21 @@ impl Relay {
             .collect()
     }
 
+    /// One page of the relay's audit, newest first ([`audit::query`]): the
+    /// sessions, stops and machine events, without addresses. `None` while
+    /// two queries are already running.
+    pub async fn audit_page(&self, q: audit::Query) -> Option<std::io::Result<audit::Page>> {
+        let permit = self.inner.audit_queries.clone().try_acquire_owned().ok()?;
+        let files = self.inner.audit.snapshot();
+        let r = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            audit::query(files, &q)
+        })
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
+        Some(r)
+    }
+
     /// The org-wide stop as it is now.
     pub fn stop_state(&self) -> Stop {
         self.st().stop.clone()
@@ -826,18 +906,18 @@ impl Relay {
     /// told, and no caller gets through until [`Relay::release`]. Pressing it
     /// again while it is on keeps the first record.
     pub fn stop(&self, by: &str, reason: &str) -> Stopped {
+        self.stop_as(&Actor::admin(by), reason)
+    }
+
+    /// [`Relay::stop`], pressed by `who`.
+    pub fn stop_as(&self, who: &Actor, reason: &str) -> Stopped {
         // Everything is cut before anything is written: a slow disk must not
         // delay the stop.
         let (stop, sessions, conns, fresh) = {
             let mut st = self.st();
             let fresh = !st.stop.stopped;
             if fresh {
-                st.stop = Stop {
-                    stopped: true,
-                    by: by.to_string(),
-                    reason: reason.to_string(),
-                    at: rfc3339(SystemTime::now()),
-                };
+                st.stop = who.stop(true, reason);
             }
             st.pending.clear();
             let sessions: Vec<Cut> = st.sessions.values().map(|s| s.cut.clone()).collect();
@@ -859,15 +939,19 @@ impl Relay {
             }
         }
         if fresh {
+            let [a, b, c, d] = who.fields();
             self.inner.audit.kept(
                 "org_stop",
                 [
-                    ("by", json!(by)),
+                    a,
+                    b,
+                    c,
+                    d,
                     ("reason", json!(reason)),
                     ("sessions_dropped", json!(sessions.len())),
                 ],
             );
-            tracing::warn!(by, reason, "org-wide stop pressed");
+            tracing::warn!(by = who.name, on_behalf_of = ?who.on_behalf_of, reason, "org-wide stop pressed");
         }
         let saved = {
             let _w = self.inner.writing.lock().unwrap_or_else(|p| p.into_inner());
@@ -902,12 +986,12 @@ impl Relay {
     /// Releases the org-wide stop. It is recorded first: if that fails the
     /// stop stays on.
     pub fn release(&self, by: &str, reason: &str) -> Result<Stop, String> {
-        let next = Stop {
-            stopped: false,
-            by: by.to_string(),
-            reason: reason.to_string(),
-            at: rfc3339(SystemTime::now()),
-        };
+        self.release_as(&Actor::admin(by), reason)
+    }
+
+    /// [`Relay::release`], by `who`.
+    pub fn release_as(&self, who: &Actor, reason: &str) -> Result<Stop, String> {
+        let next = who.stop(false, reason);
         let conns = {
             let _w = self.inner.writing.lock().unwrap_or_else(|p| p.into_inner());
             if !self.st().stop.stopped {
@@ -933,11 +1017,11 @@ impl Relay {
                 cut.cut("could not deliver the release");
             }
         }
-        self.inner.audit.kept(
-            "org_release",
-            [("by", json!(by)), ("reason", json!(reason))],
-        );
-        tracing::warn!(by, reason, "org-wide stop released");
+        let [a, b, c, d] = who.fields();
+        self.inner
+            .audit
+            .kept("org_release", [a, b, c, d, ("reason", json!(reason))]);
+        tracing::warn!(by = who.name, on_behalf_of = ?who.on_behalf_of, reason, "org-wide stop released");
         Ok(next)
     }
 
@@ -1532,10 +1616,12 @@ impl Relay {
         found
     }
 
-    fn machines_json(&self) -> Value {
+    /// `GET /relay/v1/machines`: the stop, and the machines `keep` keeps.
+    fn machines_json(&self, keep: impl Fn(&MachineInfo) -> bool) -> Value {
         let list: Vec<Value> = self
             .machines()
             .into_iter()
+            .filter(|m| keep(m))
             .map(|m| {
                 json!({
                     "machine": m.machine,

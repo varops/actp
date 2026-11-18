@@ -7,11 +7,16 @@
 //! | `GET /relay/v1/stream/<id>` | the machine asked for it | a caller's stream |
 //! | `GET /relay/v1/tunnel/<address>` | a caller (caller certificate) | a byte tunnel to the machine, carrying the caller's TLS to it |
 //! | `GET /relay/v1/issuer/<path>` | a machine (device certificate) | a configured question to the identity service ([`crate::issuer`]) |
-//! | `GET /relay/v1/machines` | admin token | who is online, last seen |
-//! | `GET /relay/v1/stop` | admin token | the org-wide stop |
-//! | `POST /relay/v1/stop`, `POST /relay/v1/release` | admin token | press, release (`{"reason": …}`) |
+//! | `GET /relay/v1/machines` | admin token, operator (`machines`) | who is online, last seen |
+//! | `GET /relay/v1/audit` | admin token, operator (`audit`) | the relay's half of the audit, newest first ([`crate::audit::query`]) |
+//! | `GET /relay/v1/stop` | admin token, any operator | the org-wide stop |
+//! | `POST /relay/v1/stop`, `POST /relay/v1/release` | admin token, operator (`stop`, `release`) | press, release (`{"reason": …}`; an operator names the person in `X-Actp-On-Behalf-Of`) |
 //! | `POST /relay/v1/rekey/challenge`, `POST /relay/v1/rekey` | a machine, on its pinned key | key continuity: a nonce, then the next certificate with the pinned key's signature ([`crate::Relay::rekey`]) |
 //! | `POST /relay/v1/repin` | admin token | forget or set a machine's pinned key (`{"machine": …, "reason": …, "key"?: …}`) |
+//!
+//! An operator is a caller certificate the configuration gives a role
+//! (`operators`); a request with an `Authorization` header is an admin's
+//! and is judged by its token alone.
 //!
 //! Caller and management routes are rate limited per IP address. The relay
 //! never reads what a tunnel carries: the caller's TLS ends at the machine
@@ -52,6 +57,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Role, WebSocketConfig};
 use tokio_util::sync::CancellationToken;
 
+use crate::config::Permission;
 use crate::{Refusal, Relay};
 
 /// A caller's stream, opened by a machine.
@@ -153,12 +159,16 @@ async fn handle(
     if path == "/health" {
         return json_resp(StatusCode::OK, api::health());
     }
-    let admin_route = matches!(
+    let management_route = matches!(
         path.as_str(),
-        "/relay/v1/machines" | "/relay/v1/stop" | "/relay/v1/release" | "/relay/v1/repin"
+        "/relay/v1/machines"
+            | "/relay/v1/audit"
+            | "/relay/v1/stop"
+            | "/relay/v1/release"
+            | "/relay/v1/repin"
     );
-    if admin_route {
-        return admin(relay, peer, req, &path).await;
+    if management_route {
+        return management(relay, peer, req, &path).await;
     }
     match path.strip_prefix(PATH_TUNNEL) {
         Some(machine) => tunnel(relay, peer, req, machine).await,
@@ -673,6 +683,27 @@ fn caller_of(relay: &Relay, peer: &Peer) -> Result<String, Box<Resp>> {
     }
 }
 
+/// `X-Actp-On-Behalf-Of`, when sent: whom a caller says it acts for.
+fn on_behalf_of(req: &Request<Incoming>) -> Result<Option<String>, Box<Resp>> {
+    let mut values = req.headers().get_all(HEADER_ON_BEHALF_OF).iter();
+    match (values.next(), values.next()) {
+        (None, _) => Ok(None),
+        (Some(v), None) => match std::str::from_utf8(v.as_bytes()) {
+            Ok(v) if valid_on_behalf_of(v) => Ok(Some(v.to_string())),
+            _ => Err(Box::new(error(
+                StatusCode::BAD_REQUEST,
+                "bad_on_behalf_of",
+                "X-Actp-On-Behalf-Of must be 1 to 256 bytes of UTF-8, without control, invisible or direction-changing characters or surrounding space",
+            ))),
+        },
+        (Some(_), Some(_)) => Err(Box::new(error(
+            StatusCode::BAD_REQUEST,
+            "bad_on_behalf_of",
+            "X-Actp-On-Behalf-Of may be sent once",
+        ))),
+    }
+}
+
 /// Ends a session in the relay's table when dropped, however the tunnel ends.
 struct SessionEnd {
     relay: Relay,
@@ -706,26 +737,9 @@ async fn tunnel(relay: &Relay, peer: &Peer, mut req: Request<Incoming>, raw_mach
         }
     };
     // Whom the caller says it acts for: recorded and passed on, not checked.
-    let mut values = req.headers().get_all(HEADER_ON_BEHALF_OF).iter();
-    let on_behalf_of = match (values.next(), values.next()) {
-        (None, _) => None,
-        (Some(v), None) => match std::str::from_utf8(v.as_bytes()) {
-            Ok(v) if valid_on_behalf_of(v) => Some(v.to_string()),
-            _ => {
-                return error(
-                    StatusCode::BAD_REQUEST,
-                    "bad_on_behalf_of",
-                    "X-Actp-On-Behalf-Of must be 1 to 256 bytes of UTF-8, without control, invisible or direction-changing characters or surrounding space",
-                );
-            }
-        },
-        (Some(_), Some(_)) => {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "bad_on_behalf_of",
-                "X-Actp-On-Behalf-Of may be sent once",
-            );
-        }
+    let on_behalf_of = match on_behalf_of(&req) {
+        Ok(v) => v,
+        Err(r) => return *r,
     };
     let resp = match ws_accept(&req, PROTOCOL_TUNNEL) {
         Ok(r) => r,
@@ -843,6 +857,7 @@ async fn tunnel(relay: &Relay, peer: &Peer, mut req: Request<Incoming>, raw_mach
             ],
         ),
     }
+    let opened_at = crate::audit::rfc3339(std::time::SystemTime::now());
     let on_upgrade = hyper::upgrade::on(&mut req);
     let relay = relay.clone();
     let held = peer.held.clone();
@@ -888,6 +903,8 @@ async fn tunnel(relay: &Relay, peer: &Peer, mut req: Request<Incoming>, raw_mach
                 ("session", json!(session)),
                 ("machine", json!(machine)),
                 ("caller", json!(caller)),
+                ("on_behalf_of", json!(on_behalf_of)),
+                ("opened_at", json!(opened_at)),
                 ("seconds", json!(started.elapsed().as_secs())),
                 (
                     "bytes_to_machine",
@@ -955,17 +972,35 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Counting<T> {
     }
 }
 
-// ---- admin ----
+// ---- management ----
 
-async fn admin(relay: &Relay, peer: &Peer, req: Request<Incoming>, path: &str) -> Resp {
-    let presented = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::trim)
-        .unwrap_or("");
-    let Some(by) = relay.admin(presented) else {
+/// Who is asking the management API.
+enum Who {
+    /// An admin token, by its name.
+    Admin(String),
+    /// An operator, by its caller certificate.
+    Operator {
+        caller: String,
+        certificate: String,
+        may: Vec<Permission>,
+    },
+}
+
+/// What a management route needs of an operator.
+enum Need {
+    /// One permission.
+    One(Permission),
+    /// Any operator.
+    Any,
+    /// Only an admin token.
+    Admin,
+}
+
+/// Who is asking: an admin token when an `Authorization` header is sent
+/// (and nothing else is then considered), otherwise an operator's caller
+/// certificate. Everyone else, a machine included, is refused.
+fn who(relay: &Relay, peer: &Peer, req: &Request<Incoming>, path: &str) -> Result<Who, Box<Resp>> {
+    let unauthorized = |message: &str| {
         relay.refusal(
             "admin_refused",
             [
@@ -973,140 +1008,397 @@ async fn admin(relay: &Relay, peer: &Peer, req: Request<Incoming>, path: &str) -
                 ("route", json!(path)),
             ],
         );
-        let mut r = error(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "missing or invalid admin token",
-        );
+        let mut r = error(StatusCode::UNAUTHORIZED, "unauthorized", message);
         r.headers_mut().insert(
             header::WWW_AUTHENTICATE,
             HeaderValue::from_static("Bearer realm=\"actp-relay\""),
         );
-        return r;
+        Box::new(r)
     };
-    match (req.method().clone(), path) {
-        (Method::GET, "/relay/v1/machines") => {
-            json_resp(StatusCode::OK, relay.machines_json().to_string())
-        }
-        (Method::GET, "/relay/v1/stop") => json_resp(
-            StatusCode::OK,
-            json!({ "stop": relay.stop_state() }).to_string(),
-        ),
-        (Method::POST, "/relay/v1/repin") => {
-            let body = match Limited::new(req.into_body(), 16 << 10).collect().await {
-                Ok(b) => b.to_bytes(),
-                Err(_) => {
-                    return error(
-                        StatusCode::BAD_REQUEST,
-                        "bad_request",
-                        "the body is too large",
-                    );
-                }
-            };
-            let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
-            let field = |k: &str| {
-                v.get(k)
-                    .and_then(|x| x.as_str())
-                    .map(|s| s.trim().to_string())
-                    .unwrap_or_default()
-            };
-            let (machine, reason) = (field("machine"), field("reason"));
-            if !valid_machine_name(&machine) || reason.is_empty() || reason.len() > 1000 {
-                return error(
-                    StatusCode::BAD_REQUEST,
-                    "machine_and_reason_required",
-                    "say which machine and why: {\"machine\": \"…\", \"reason\": \"…\"}",
-                );
-            }
-            // Optionally the new key itself, so nothing else can be pinned
-            // first: the SHA-256 of its public key, as lowercase hex.
-            let key = match v.get("key") {
-                None | Some(serde_json::Value::Null) => None,
-                Some(k) => match k.as_str() {
-                    Some(k)
-                        if k.len() == 64
-                            && k.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) =>
-                    {
-                        Some(k.to_string())
-                    }
-                    _ => {
-                        return error(
-                            StatusCode::BAD_REQUEST,
-                            "bad_key",
-                            "key is the SHA-256 of the certificate's public key, 64 lowercase hex characters",
-                        );
-                    }
-                },
-            };
-            let was = relay.repin(&by, &machine, key.as_deref(), &reason);
-            json_resp(
-                StatusCode::OK,
-                json!({ "machine": machine, "was_pinned": was }).to_string(),
-            )
-        }
-        (Method::POST, "/relay/v1/stop" | "/relay/v1/release") => {
-            let body = match Limited::new(req.into_body(), 16 << 10).collect().await {
-                Ok(b) => b.to_bytes(),
-                Err(_) => {
-                    return error(
-                        StatusCode::BAD_REQUEST,
-                        "bad_request",
-                        "the body is too large",
-                    );
-                }
-            };
-            let reason = serde_json::from_slice::<serde_json::Value>(&body)
-                .ok()
-                .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(str::to_string))
-                .map(|r| r.trim().to_string())
-                .unwrap_or_default();
-            if reason.is_empty() || reason.len() > 1000 {
-                return error(
-                    StatusCode::BAD_REQUEST,
-                    "reason_required",
-                    "say why: {\"reason\": \"…\"} (up to 1000 bytes)",
-                );
-            }
-            if path == "/relay/v1/stop" {
-                let s = relay.stop(&by, &reason);
-                if s.saved {
-                    json_resp(StatusCode::OK, json!({ "stop": s.stop }).to_string())
-                } else {
-                    // The stop holds now, but a restart would lose it.
-                    json_resp(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        json!({
-                            "error": "stop_not_saved",
-                            "message": "the stop is on, but stop.json could not be written: a restart before the relay manages to write it would lose the stop",
-                            "stop": s.stop,
-                        })
-                        .to_string(),
-                    )
-                }
-            } else {
-                match relay.release(&by, &reason) {
-                    Ok(s) => json_resp(StatusCode::OK, json!({ "stop": s }).to_string()),
-                    Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, "not_released", &e),
-                }
-            }
-        }
+    if let Some(v) = req.headers().get(header::AUTHORIZATION) {
+        let presented = v
+            .to_str()
+            .ok()
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(str::trim)
+            .unwrap_or("");
+        return match relay.admin(presented) {
+            Some(name) => Ok(Who::Admin(name)),
+            None => Err(unauthorized("missing or invalid admin token")),
+        };
+    }
+    if peer.caller.is_none() {
+        return Err(unauthorized(
+            "an admin token or an operator's caller certificate is required",
+        ));
+    }
+    // The certificate is checked as for a tunnel: valid now, not blocked.
+    let caller = caller_of(relay, peer)?;
+    let may = relay.config().operator(&caller).to_vec();
+    if may.is_empty() {
+        return Err(operator_refused(
+            relay,
+            peer,
+            path,
+            &caller,
+            "not_an_operator",
+            "this caller has no role at the relay",
+        ));
+    }
+    Ok(Who::Operator {
+        caller,
+        certificate: crate::fingerprint(&peer.chain[0]),
+        may,
+    })
+}
+
+fn operator_refused(
+    relay: &Relay,
+    peer: &Peer,
+    path: &str,
+    caller: &str,
+    code: &str,
+    message: &str,
+) -> Box<Resp> {
+    relay.refusal(
+        "operator_refused",
+        [
+            ("caller", json!(caller)),
+            ("remote", json!(peer.remote.to_string())),
+            ("route", json!(path)),
+            ("reason", json!(code)),
+        ],
+    );
+    Box::new(error(StatusCode::FORBIDDEN, code, message))
+}
+
+/// The query string's `name=value` pairs, percent-decoded (`+` is a plus).
+fn query_pairs(req: &Request<Incoming>) -> Result<Vec<(String, String)>, Box<Resp>> {
+    let bad = |m: &str| Box::new(error(StatusCode::BAD_REQUEST, "bad_query", m));
+    let q = req.uri().query().unwrap_or("");
+    if q.len() > 16 << 10 {
+        return Err(bad("the query is too long"));
+    }
+    let mut out = Vec::new();
+    for pair in q.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        let dec = |x: &str| {
+            percent_encoding::percent_decode_str(x)
+                .decode_utf8()
+                .map(|c| c.into_owned())
+                .map_err(|_| bad("the query is not UTF-8"))
+        };
+        out.push((dec(k)?, dec(v)?));
+    }
+    Ok(out)
+}
+
+async fn management(relay: &Relay, peer: &Peer, req: Request<Incoming>, path: &str) -> Resp {
+    let who = match who(relay, peer, &req, path) {
+        Ok(w) => w,
+        Err(r) => return *r,
+    };
+    let method = req.method().clone();
+    let need = match (&method, path) {
+        (&Method::GET, "/relay/v1/machines") => Need::One(Permission::Machines),
+        (&Method::GET, "/relay/v1/audit") => Need::One(Permission::Audit),
+        (&Method::GET, "/relay/v1/stop") => Need::Any,
+        (&Method::POST, "/relay/v1/stop") => Need::One(Permission::Stop),
+        (&Method::POST, "/relay/v1/release") => Need::One(Permission::Release),
+        (&Method::POST, "/relay/v1/repin") => Need::Admin,
         _ => {
             let mut r = error(
                 StatusCode::METHOD_NOT_ALLOWED,
                 "method_not_allowed",
                 "method not allowed",
             );
-            let allow = if path == "/relay/v1/machines" {
-                "GET"
-            } else if path == "/relay/v1/stop" {
-                "GET, POST"
-            } else {
-                // release, repin
-                "POST"
+            let allow = match path {
+                "/relay/v1/machines" | "/relay/v1/audit" => "GET",
+                "/relay/v1/stop" => "GET, POST",
+                _ => "POST", // release, repin
             };
             r.headers_mut()
                 .insert(header::ALLOW, HeaderValue::from_static(allow));
+            return r;
+        }
+    };
+    if let Who::Operator { caller, may, .. } = &who {
+        let ok = match need {
+            Need::One(p) => may.contains(&p),
+            Need::Any => true,
+            Need::Admin => false,
+        };
+        if !ok {
+            return *operator_refused(
+                relay,
+                peer,
+                path,
+                caller,
+                "operator_not_permitted",
+                "this operator may not do that here",
+            );
+        }
+    }
+    let obo = match on_behalf_of(&req) {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    match (method, path) {
+        (Method::GET, "/relay/v1/machines") => machines(relay, &req),
+        (Method::GET, "/relay/v1/audit") => audit(relay, &req).await,
+        (Method::GET, "/relay/v1/stop") => json_resp(
+            StatusCode::OK,
+            json!({ "stop": relay.stop_state() }).to_string(),
+        ),
+        (Method::POST, "/relay/v1/repin") => {
+            let Who::Admin(by) = who else {
+                unreachable!("repin is for admins only, checked above")
+            };
+            repin(relay, req, &by).await
+        }
+        (Method::POST, _) => {
+            let actor = match who {
+                Who::Admin(name) => crate::Actor {
+                    on_behalf_of: obo,
+                    ..crate::Actor::admin(&name)
+                },
+                Who::Operator {
+                    caller,
+                    certificate,
+                    ..
+                } => {
+                    // A caller certificate names a program (the IT app),
+                    // not a person: who pressed it must be said.
+                    let Some(person) = obo else {
+                        return error(
+                            StatusCode::BAD_REQUEST,
+                            "on_behalf_of_required",
+                            "say whom you press or release the stop for: X-Actp-On-Behalf-Of",
+                        );
+                    };
+                    crate::Actor {
+                        name: caller,
+                        kind: crate::ActorKind::Operator,
+                        certificate: Some(certificate),
+                        on_behalf_of: Some(person),
+                    }
+                }
+            };
+            stop_or_release(relay, req, path, &actor).await
+        }
+        _ => unreachable!("every other method was answered above"),
+    }
+}
+
+/// `GET /relay/v1/machines[?machine=…][&online=true|false]`.
+fn machines(relay: &Relay, req: &Request<Incoming>) -> Resp {
+    let pairs = match query_pairs(req) {
+        Ok(p) => p,
+        Err(r) => return *r,
+    };
+    let mut names = std::collections::HashSet::new();
+    let mut online = None;
+    for (k, v) in pairs {
+        match (k.as_str(), v.as_str()) {
+            ("machine", m) if valid_machine_name(m) && names.len() < 1000 => {
+                names.insert(m.to_string());
+            }
+            ("online", "true") => online = Some(true),
+            ("online", "false") => online = Some(false),
+            _ => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "bad_query",
+                    "the query takes machine=<address> (up to 1000) and online=true|false",
+                );
+            }
+        }
+    }
+    json_resp(
+        StatusCode::OK,
+        relay
+            .machines_json(|m| {
+                (names.is_empty() || names.contains(&m.machine))
+                    && online.is_none_or(|o| o == m.online)
+            })
+            .to_string(),
+    )
+}
+
+/// `GET /relay/v1/audit?kind=…&machine=…&caller=…&on_behalf_of=…&since=…&before=…&limit=…`.
+async fn audit(relay: &Relay, req: &Request<Incoming>) -> Resp {
+    let pairs = match query_pairs(req) {
+        Ok(p) => p,
+        Err(r) => return *r,
+    };
+    let bad = |m: &str| error(StatusCode::BAD_REQUEST, "bad_query", m);
+    let mut q = crate::audit::Query {
+        limit: 100,
+        ..Default::default()
+    };
+    let mut seen = std::collections::HashSet::new();
+    for (k, v) in pairs {
+        if k != "kind" && !seen.insert(k.clone()) {
+            return bad(&format!("{k} may be given once"));
+        }
+        match k.as_str() {
+            "kind" => {
+                for part in v.split(',') {
+                    match crate::audit::Kind::parse(part) {
+                        Some(kind) if !q.kinds.contains(&kind) => q.kinds.push(kind),
+                        Some(_) => {}
+                        None => return bad("kind is sessions, stops or machines"),
+                    }
+                }
+            }
+            "machine" if valid_machine_name(&v) => q.machine = Some(v),
+            "caller" if valid_machine_name(&v) => q.caller = Some(v),
+            "on_behalf_of" if valid_on_behalf_of(&v) => q.on_behalf_of = Some(v),
+            "since" | "before" => match crate::audit::parse_rfc3339(&v) {
+                Some(t) if k == "since" => q.since = Some(t),
+                Some(t) => q.before = Some(t),
+                None => return bad(&format!("{k} is an RFC 3339 time in UTC")),
+            },
+            "limit" => match v.parse::<usize>() {
+                Ok(n) if (1..=1000).contains(&n) => q.limit = n,
+                _ => return bad("limit is 1 to 1000"),
+            },
+            "machine" | "caller" | "on_behalf_of" => {
+                return bad(&format!("{k} is not a valid name"));
+            }
+            _ => {
+                return bad(
+                    "the query takes kind, machine, caller, on_behalf_of, since, before and limit",
+                );
+            }
+        }
+    }
+    match relay.audit_page(q).await {
+        None => {
+            let mut r = error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "audit_busy",
+                "other audit queries are running; try again shortly",
+            );
+            r.headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
             r
+        }
+        Some(Err(e)) => {
+            tracing::error!(error = %e, "could not read the audit log");
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "audit_unreadable",
+                "the audit log could not be read",
+            )
+        }
+        Some(Ok(p)) => json_resp(
+            StatusCode::OK,
+            json!({ "events": p.events, "more": p.more, "next_before": p.next_before }).to_string(),
+        ),
+    }
+}
+
+async fn repin(relay: &Relay, req: Request<Incoming>, by: &str) -> Resp {
+    let body = match Limited::new(req.into_body(), 16 << 10).collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(_) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "the body is too large",
+            );
+        }
+    };
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+    let field = |k: &str| {
+        v.get(k)
+            .and_then(|x| x.as_str())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    };
+    let (machine, reason) = (field("machine"), field("reason"));
+    if !valid_machine_name(&machine) || reason.is_empty() || reason.len() > 1000 {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "machine_and_reason_required",
+            "say which machine and why: {\"machine\": \"…\", \"reason\": \"…\"}",
+        );
+    }
+    // Optionally the new key itself, so nothing else can be pinned
+    // first: the SHA-256 of its public key, as lowercase hex.
+    let key = match v.get("key") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(k) => match k.as_str() {
+            Some(k)
+                if k.len() == 64 && k.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) =>
+            {
+                Some(k.to_string())
+            }
+            _ => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "bad_key",
+                    "key is the SHA-256 of the certificate's public key, 64 lowercase hex characters",
+                );
+            }
+        },
+    };
+    let was = relay.repin(by, &machine, key.as_deref(), &reason);
+    json_resp(
+        StatusCode::OK,
+        json!({ "machine": machine, "was_pinned": was }).to_string(),
+    )
+}
+
+async fn stop_or_release(
+    relay: &Relay,
+    req: Request<Incoming>,
+    path: &str,
+    who: &crate::Actor,
+) -> Resp {
+    let body = match Limited::new(req.into_body(), 16 << 10).collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(_) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "the body is too large",
+            );
+        }
+    };
+    let reason = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(str::to_string))
+        .map(|r| r.trim().to_string())
+        .unwrap_or_default();
+    if reason.is_empty() || reason.len() > 1000 {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "reason_required",
+            "say why: {\"reason\": \"…\"} (up to 1000 bytes)",
+        );
+    }
+    if path == "/relay/v1/stop" {
+        let s = relay.stop_as(who, &reason);
+        if s.saved {
+            json_resp(StatusCode::OK, json!({ "stop": s.stop }).to_string())
+        } else {
+            // The stop holds now, but a restart would lose it.
+            json_resp(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({
+                    "error": "stop_not_saved",
+                    "message": "the stop is on, but stop.json could not be written: a restart before the relay manages to write it would lose the stop",
+                    "stop": s.stop,
+                })
+                .to_string(),
+            )
+        }
+    } else {
+        match relay.release_as(who, &reason) {
+            Ok(s) => json_resp(StatusCode::OK, json!({ "stop": s }).to_string()),
+            Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, "not_released", &e),
         }
     }
 }

@@ -9,6 +9,11 @@ repository.workspace = true
 
 [dependencies]
 actp-proto.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client"] }
+hyper-util.workspace = true
+serde.workspace = true
 rand.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true

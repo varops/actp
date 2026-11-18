@@ -27,9 +27,14 @@ name = "actp-client"
 version = "0.1.0"
 dependencies = [
  "actp-proto",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "rand 0.9.5",
  "rustls",
  "rustls-native-certs",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-rustls",

@@ -3,6 +3,8 @@
 //! catches up without losing or repeating a message. A port of Go's
 //! `internal/bridge`.
 
+pub mod ops;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
