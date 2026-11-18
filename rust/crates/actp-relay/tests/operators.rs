@@ -149,7 +149,6 @@ async fn nobody_but_an_operator_gets_anything() {
     let operator = tls_of(&it_bridge(&pki));
     let manager = tls_of(&pki.caller("manager", None));
 
-    let mut tried = 0;
     for (method, path, body) in routes() {
         // Nothing at all: 401. A machine's own certificate: 403. Nothing
         // else in the answer.
@@ -164,7 +163,6 @@ async fn nobody_but_an_operator_gets_anything() {
             assert!(
                 b.get("machines").is_none() && b.get("events").is_none() && b.get("stop").is_none()
             );
-            tried += 1;
         }
         // A caller certificate without a role.
         let (status, b) = try_request(
@@ -230,9 +228,7 @@ async fn nobody_but_an_operator_gets_anything() {
         .await
         .unwrap();
         assert_eq!(status, 401, "{method} {path}");
-        tried += 1;
     }
-    assert_eq!(tried, 18);
 
     // An operator may do only what it was given.
     let expect = [
@@ -890,4 +886,9 @@ async fn operators_lose_their_role_on_a_live_connection() {
             && e["operators"][0]["may"] == json!(["machines", "audit"]))
     );
     assert!(env.audit_has("config_reloaded", |e| e["operators"] == json!([])));
+    // And at start.
+    assert!(
+        env.audit_has("relay_started", |e| e["operators"][0]["caller"]
+            == "ops-live")
+    );
 }

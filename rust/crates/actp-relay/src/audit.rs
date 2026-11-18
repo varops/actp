@@ -411,7 +411,7 @@ fn projection(event: &str) -> Option<(Kind, &'static [&'static str])> {
             ],
         ),
         "org_stop_not_saved" | "org_stop_saved" => (Kind::Stops, &[]),
-        "config_reloaded" => (Kind::Config, &["operators"]),
+        "config_reloaded" | "relay_started" => (Kind::Config, &["operators"]),
         "machine_online" => (Kind::Machines, &["machine"]),
         "machine_offline" => (Kind::Machines, &["machine", "seconds", "reason"]),
         "machine_replaced" => (
@@ -466,14 +466,11 @@ pub struct Page {
     pub next: Option<String>,
 }
 
-/// Lines written before times were unique and in order (millisecond
-/// times, taken before the writer's lock) can be out of order by this
-/// much; `since` stops the scan only this far past it.
-const DISORDER_US: u64 = 2_000_000;
-
 /// A file's identity across renames: the hash of its first line (the
-/// files are only ever appended to).
-fn file_id(f: &mut File) -> io::Result<Option<String>> {
+/// files are only ever appended to); and whether that line has a
+/// microsecond time, as this relay writes them. Older relays wrote
+/// millisecond times, not always in order.
+fn file_id(f: &mut File) -> io::Result<Option<(String, bool)>> {
     use sha2::Digest;
     f.seek(SeekFrom::Start(0))?;
     let mut first = Vec::new();
@@ -494,7 +491,13 @@ fn file_id(f: &mut File) -> io::Result<Option<String>> {
             return Ok(None);
         }
     }
-    Ok(Some(hex::encode(&sha2::Sha256::digest(&first)[..12])))
+    let ordered = field(&first, "time")
+        .and_then(|t| t.rsplit_once('.'))
+        .is_some_and(|(_, frac)| frac.len() == 7 && frac.ends_with('Z'));
+    Ok(Some((
+        hex::encode(&sha2::Sha256::digest(&first)[..12]),
+        ordered,
+    )))
 }
 
 fn cursor(file: &str, offset: u64) -> String {
@@ -541,7 +544,7 @@ pub(crate) fn query(files: Vec<(File, u64)>, q: &Query) -> io::Result<Page> {
     let mut found = from.is_none();
     let mut last: Option<String> = None;
     'files: for (mut f, len) in files {
-        let Some(id) = file_id(&mut f)? else {
+        let Some((id, ordered)) = file_id(&mut f)? else {
             continue;
         };
         let end = match &from {
@@ -571,8 +574,12 @@ pub(crate) fn query(files: Vec<(File, u64)>, q: &Query) -> io::Result<Page> {
             let Some(t) = parse_rfc3339(time) else {
                 continue;
             };
-            if q.since.is_some_and(|s| t.saturating_add(DISORDER_US) < s) {
-                break 'files;
+            if ordered && q.since.is_some_and(|s| t < s) {
+                // This file's lines are in the order of their times: the
+                // rest of it is older. An older file is checked from its
+                // newest line again (one line, for files this relay wrote;
+                // older relays' files are read through).
+                continue 'files;
             }
             if q.since.is_some_and(|s| t < s) || q.before.is_some_and(|b| t >= b) {
                 continue;

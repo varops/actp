@@ -258,7 +258,7 @@ A request with an `Authorization` header is an admin's, judged by the token alon
 | TLS handshake fails | A caller certificate that is expired, revoked, or not from `caller_ca` is refused before any HTTP, so the client sees a TLS or connection error, not a status. |
 | `403 operator_not_permitted` | An operator without the permission this route needs. Recorded as `operator_refused`. |
 
-Roles are checked on every request against the configuration in force, so a reload that removes an operator, blocks it or revokes its certificate takes effect on connections already open. Every `config_reloaded` records the operators and what each may do.
+Roles are checked on every request against the configuration in force, so a reload that removes an operator, blocks it or revokes its certificate takes effect on connections already open. `relay_started` and every `config_reloaded` record the operators and what each may do.
 
 An operator is matched by the name in its caller certificate. Any root in `caller_ca` can issue a certificate with that name, so either keep `caller_ca` to roots that control the names they issue, or list the operator's `certificates` (SHA-256 of the DER, `sha256:<hex>`; renewed certificates must be added before the old ones expire).
 
@@ -311,7 +311,7 @@ The relay's half of the audit, newest first, from `audit.jsonl` and its rotated 
 - `stops`: `org_stop`, `org_release` (who, as what, for whom, why), `org_stop_not_saved` and `org_stop_saved`.
 - `stops` also has `org_stop_repeated`: the stop pressed again while on (the first record stays).
 - `machines`: `machine_online` (without `remote`), `machine_offline`, `machine_replaced`, and every change to a pinned key: `machine_repinned` (an admin's override), `machine_key_continued`, `machine_key_renewed`, `machine_key_refused`.
-- `config`: `config_reloaded`, with the operators and what each may do.
+- `config`: `relay_started` and `config_reloaded`, with the operators and what each may do.
 
 Parameters, each at most once (`kind` may repeat):
 
@@ -326,7 +326,7 @@ Parameters, each at most once (`kind` may repeat):
 
 When `more` is true, ask again with the same parameters and `cursor` set to `next`. The cursor is a position in the log (which file, by its first line, and where in it), so pages neither repeat nor skip an event, also while the relay writes and rotates, and also over lines written by older relays, whose times are in milliseconds and not always in order. A cursor whose file has been rotated away gives an empty last page: everything older went with it. The audit keeps `audit_max_mb` times eleven at most, so the oldest events go first.
 
-A page reads at most 64 MB of the log; one that reaches that ends early, possibly with no events, with `more` and a `next` to go on from. So a narrow filter over a large log takes several requests; `since` ends the reading early (two seconds past it, for older relays' lines). Two queries run at once; a third gets `503 audit_busy` with `Retry-After`. New lines' `time` is in microseconds and later than the line before it, also across rotations and restarts.
+A page reads at most 64 MB of the log; one that reaches that ends early, possibly with no events, with `more` and a `next` to go on from. So a narrow filter over a large log takes several requests; `since` ends the reading of each file this relay wrote early (older relays' files, whose times are not always in order, are read through). Two queries run at once; a third gets `503 audit_busy` with `Retry-After`. New lines' `time` is in microseconds and later than the line before it, also across rotations and restarts.
 
 What a caller did on a machine (which runbook, consent, the result) is inside the end-to-end encryption: the machine's own audit records it. The two halves meet on the session: the machine's `link_opened` carries `relay_caller`, `relay_caller_certificate` and `relay_on_behalf_of`, the same as the relay's `session_open`.
 
@@ -348,7 +348,7 @@ curl -X POST --cert it-bridge.pem --key it-bridge.key -H "X-Actp-On-Behalf-Of: d
           "reason": "suspicious activity on the IT account", "at": "2026-11-18T10:41:07.511Z"}}
 ```
 
-`by` is the admin token's name or the operator's caller name, and `by_kind` says which (`admin`, `operator`, or `relay` when the relay turned the stop on itself because `stop.json` could not be read). Nobody checks `on_behalf_of`; the relay records it as the IT app said it, and the IT app is what vouches for the person. Pressing the stop while it is on keeps the first record and answers with it; the second press is recorded as `org_stop_repeated`. A release is recorded with its own `by`, `by_kind` and `on_behalf_of`. Stops and releases are written to the audit in the order they took effect.
+`by` is the admin token's name or the operator's caller name, and `by_kind` says which (`admin`, `operator`, or `relay` when the relay turned the stop on itself because `stop.json` could not be read). Nobody checks `on_behalf_of`; the relay records it as the IT app said it, and the IT app is what vouches for the person. Pressing the stop while it is on keeps the first record and answers with it; the second press is recorded as `org_stop_repeated`. A release is recorded with its own `by`, `by_kind` and `on_behalf_of`. Stops and releases are written to the audit in the order they took effect; the stop cuts every session before anything is written, so a slow disk does not delay it.
 
 The stop takes effect at once: every session ends (`session_closed`, reason `org_stop`), every machine is told and ends its own links, and every new tunnel is refused with `503 org_stopped` until the release. It is written to `state_dir/stop.json`, so it survives a restart; if that file cannot be read, the relay starts with the stop on. If the stop cannot be written, the answer is `500 stop_not_saved` (the stop still holds) and the relay keeps trying every few seconds. A release is written before it takes effect, so a release that cannot be recorded does not happen (`500 not_released`).
 
@@ -390,7 +390,8 @@ Admins only; see Key pinning, above.
 | `org_stop_repeated` | as `org_stop`: the stop pressed again while on |
 | `admin_refused` | `remote`, `route` |
 | `operator_refused` | `caller`, `remote`, `route`, `reason` (`not_an_operator`, `operator_certificate_not_listed`, `operator_not_permitted`) |
-| `config_reloaded` | `blocked_machines`, `blocked_callers` (counts), `operators` (each `caller`, `may`, and how many `certificates`) |
+| `relay_started` | `operators` (each `caller`, `may`, and how many `certificates`) |
+| `config_reloaded` | `blocked_machines`, `blocked_callers` (counts), `operators` (as in `relay_started`) |
 | `refusals_not_logged` | `kind`, `count` |
 
 Of each refusal kind (`caller_refused`, `caller_rate_limited`, `connection_refused`, `machine_refused`, `admin_refused`, `operator_refused`, `issuer_refused`), at most 20 a minute are written, across all callers; the rest are counted in `refusals_not_logged`. A flood of refusals therefore leaves only a count of everyone's refusals for that minute; sessions, machines and the stop are always recorded. `machine_key_refused` has its own limit, once a minute per machine, so a second key for a name cannot be hidden in a flood of other refusals.
