@@ -2,7 +2,7 @@
 # actp with no agents inside: install them from the dashboard or with ACTP_AGENTS.
 # See docs/docker.md.
 
-FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-bookworm AS build
 ARG TARGETOS TARGETARCH VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum ./
